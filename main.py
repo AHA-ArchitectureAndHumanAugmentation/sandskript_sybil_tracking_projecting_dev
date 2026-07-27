@@ -20,6 +20,7 @@ from config import (
     DEPTH_WIDTH, DEPTH_HEIGHT, DEPTH_FPS, DEPTH_AVERAGE_FRAMES, SURFACE_DIR,
     DRAW_Z, DRAW_SPEED, TRAVEL_Z, MAX_TCP_SPEED,
     RESAMPLE_SPACING_MM, RESAMPLE_SPACING_MIN_MM, RESAMPLE_SPACING_MAX_MM,
+    JOIN_DISTANCE_MM, JOIN_DISTANCE_MIN_MM, JOIN_DISTANCE_MAX_MM,
     UR_REACH_M, UR_MIN_REACH_M, MOVEP_BLEND_M,
     PARTICIPANT_TICK_S, PARTICIPANT_CLEAR_S,
 )
@@ -489,10 +490,18 @@ async def on_generate_path(ws, params: dict) -> None:
         spacing_mm = RESAMPLE_SPACING_MM
     spacing_mm = min(max(spacing_mm, RESAMPLE_SPACING_MIN_MM), RESAMPLE_SPACING_MAX_MM)
 
+    # Endpoint-join distance in mm (Path Preview "Distance Threshold" box);
+    # 0 = off. Strokes whose ends fall within it merge into one toolpath.
+    try:
+        join_mm = float(params.get("join_mm", JOIN_DISTANCE_MM))
+    except (TypeError, ValueError):
+        join_mm = JOIN_DISTANCE_MM
+    join_mm = min(max(join_mm, JOIN_DISTANCE_MIN_MM), JOIN_DISTANCE_MAX_MM)
+
     with state_lock:
         shared_state["participant_gen_params"].update(
             {"crop": params.get("crop"), "adjustments": params.get("adjustments"),
-             "spacing_mm": spacing_mm})
+             "spacing_mm": spacing_mm, "join_mm": join_mm})
 
     loop = asyncio.get_running_loop()
     try:
@@ -501,7 +510,7 @@ async def on_generate_path(ws, params: dict) -> None:
         )
         extracted = await loop.run_in_executor(
             None, extract_from_edges, processed.grooves, CONTOUR_MIN_PIXELS,
-            processed.origin, spacing_mm, mmpp,
+            processed.origin, spacing_mm, mmpp, join_mm,
         )
     except Exception as exc:
         await server.send_capture_result(ws, False, error=str(exc))
@@ -571,6 +580,7 @@ async def on_generate_path(ws, params: dict) -> None:
             "reach_m": UR_REACH_M,
             "min_reach_m": UR_MIN_REACH_M,
             "spacing_mm": spacing_mm,
+            "join_mm": join_mm,
         },
     )
     print(f"Generated path: {extracted.total_strokes} strokes, {extracted.total_points} points"
@@ -787,11 +797,14 @@ async def on_set_exec_params(params: dict) -> None:
     blend_mm  = _num("blend_mm", MOVEP_BLEND_M * 1000.0, 0.0, 5.0)
     spacing_mm = _num("spacing_mm", RESAMPLE_SPACING_MM,
                       RESAMPLE_SPACING_MIN_MM, RESAMPLE_SPACING_MAX_MM)
+    join_mm    = _num("join_mm", JOIN_DISTANCE_MM,
+                      JOIN_DISTANCE_MIN_MM, JOIN_DISTANCE_MAX_MM)
     with state_lock:
         shared_state["participant_exec_params"] = {
             "speed_pct": speed_pct, "offset_mm": offset_mm,
             "safety_mm": safety_mm, "blend_mm": blend_mm}
         shared_state["participant_gen_params"]["spacing_mm"] = spacing_mm
+        shared_state["participant_gen_params"]["join_mm"]    = join_mm
 
 
 async def on_set_trigger(params: dict) -> None:

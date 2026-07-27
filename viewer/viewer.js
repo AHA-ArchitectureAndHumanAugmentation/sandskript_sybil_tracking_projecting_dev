@@ -532,6 +532,7 @@ function restoreSessionSettings(data) {
     document.getElementById("exec-spacing-val").textContent =
       document.getElementById("exec-spacing").value + " mm";
   }
+  if (Number.isFinite(d.join_mm)) document.getElementById("exec-join").value = d.join_mm;
   const e = data.exec || {};
   if (Number.isFinite(e.speed_pct)) {
     document.getElementById("exec-speed").value = e.speed_pct;
@@ -878,13 +879,19 @@ document.getElementById("btn-generate").addEventListener("click", () => {
   setHeaderStatus("robot", true, "Generating tool path…");
 });
 
-/* Path generation params = detection params + crop + waypoint spacing (mm). */
+/* Path generation params = detection params + crop + waypoint spacing (mm)
+   + the endpoint-join Distance Threshold (mm, 0 = off). */
 function readSpacing() {
   return parseFloat(document.getElementById("exec-spacing").value) || 10;
 }
 
+function readJoinMm() {
+  const v = parseFloat(document.getElementById("exec-join").value);
+  return Number.isFinite(v) ? Math.min(Math.max(v, 0), 200) : 0;
+}
+
 function buildGenerateParams() {
-  return { ...buildParams(), spacing_mm: readSpacing() };
+  return { ...buildParams(), spacing_mm: readSpacing(), join_mm: readJoinMm() };
 }
 
 /* Spacing lives in the Path Preview bar. Update the label live; re-generate on
@@ -897,6 +904,19 @@ spacingSlider.addEventListener("change", () => {
   if (stillLoaded && lastStrokes) {
     sendWS({ type: "generate_path", params: buildGenerateParams() });
     setHeaderStatus("robot", true, "Re-generating tool path at " + readSpacing() + " mm spacing…");
+  }
+});
+
+/* Distance Threshold changes which strokes are connected, so — like Spacing,
+   and unlike Offset/Safety/Radius — the path must be rebuilt server-side. */
+const joinBox = document.getElementById("exec-join");
+joinBox.addEventListener("change", () => {
+  if (stillLoaded && lastStrokes) {
+    const mm = readJoinMm();
+    sendWS({ type: "generate_path", params: buildGenerateParams() });
+    setHeaderStatus("robot", true, mm > 0
+      ? "Re-generating tool path, joining ends within " + mm + " mm…"
+      : "Re-generating tool path with stroke joining off…");
   }
 });
 
@@ -1570,11 +1590,13 @@ function syncExecParams() {
     safety_mm: parseFloat(document.getElementById("exec-safety").value) || 50,
     blend_mm: readBlendMm(),
     spacing_mm: readSpacing(),
+    join_mm: readJoinMm(),
   }}), 300);
 }
 ["exec-speed", "exec-offset", "exec-safety", "exec-blend"].forEach((id) =>
   document.getElementById(id).addEventListener("input", syncExecParams));
 spacingSlider.addEventListener("change", syncExecParams);
+joinBox.addEventListener("change", syncExecParams);
 
 /* ── Save toolpath (URScript + JSON + preview image) ────────────────────── */
 document.getElementById("btn-save-path").addEventListener("click", () => {

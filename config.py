@@ -93,6 +93,17 @@ RESAMPLE_SPACING_MM = 10.0  # default spacing between robot waypoints in mm (the
 RESAMPLE_SPACING_MIN_MM = 10.0   # slider lower bound
 RESAMPLE_SPACING_MAX_MM = 100.0  # slider upper bound
 
+# Stroke joining — the Path Preview "Distance Threshold" box. Two endpoints
+# belonging to different strokes are connected (the strokes merge into one
+# continuous toolpath) when the gap between them is below this distance.
+JOIN_DISTANCE_MM     = 0.0    # default; 0 = off, every stroke stays separate
+JOIN_DISTANCE_MIN_MM = 0.0    # box lower bound (0 disables joining)
+JOIN_DISTANCE_MAX_MM = 200.0  # box upper bound
+# When the straight line closing a gap is crossed by a THIRD stroke, that
+# crossing is evidence the two ends are one gesture interrupted by another
+# groove — so the threshold is multiplied by this before the pair is judged.
+JOIN_CROSSING_FACTOR = 2.0
+
 # ── Robot drawing ─────────────────────────────────────────────────────────────
 DRAW_Z           = -0.010  # m — pen contact (negative = below workspace surface origin)
 TRAVEL_Z         =  0.050  # m — pen-up travel height above workspace surface origin

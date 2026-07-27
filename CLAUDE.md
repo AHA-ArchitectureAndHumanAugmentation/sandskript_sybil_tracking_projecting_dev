@@ -26,8 +26,12 @@ trigger run the whole pipeline automatically and lock the manual buttons.
   last browser tab kills the server (deliberate, via SIGINT).
 - Python env = the **`sandskript` conda env** (recipe: `environment.yml`;
   recreate with `conda env create -f environment.yml`). On this machine
-  ENVPY = `C:\Users\linfo\miniconda3\envs\sandskript\python.exe` — the .bat
+  ENVPY = `C:\Users\staff\miniconda3\envs\sandskript\python.exe` — the .bat
   files and `.mcp.json` hardcode it; update those paths on a new machine.
+  The recipe pulls python/pip from **conda-forge** (not `defaults`) so newer
+  conda's Anaconda-ToS gate doesn't block env creation; keep the base/user
+  `.condarc` on conda-forge too. If `conda` isn't found in PowerShell, run
+  `conda init powershell` once (conda lives at `C:\Users\staff\miniconda3`).
   Never bare `pip` (broken launcher risk — use `<ENVPY> -m pip`). The Intel
   RealSense USB driver is an OS-level install, outside the env. The old
   `.venv` is retired.
@@ -55,10 +59,22 @@ trigger run the whole pipeline automatically and lock the manual buttons.
    (reference subtraction, min mean depth, min/max width, min length) →
    (thick mask, 1-px skeleton). `process_depth` adds crop; coords stay full-frame.
 3. **Stroke extraction** `path_extractor.extract_from_edges` — 8-conn chain follow
-   → Chaikin smooth → resample at `spacing_mm` (UI Spacing slider 10–100 mm,
+   → Chaikin smooth → **endpoint join** (`join_strokes`, `join_mm` = exec-bar
+   "Distance Threshold" box 0–200 mm, default JOIN_DISTANCE_MM=0 = off) →
+   resample at `spacing_mm` (UI Spacing slider 10–100 mm,
    default RESAMPLE_SPACING_MM=10; falls back to 10 px w/o a mm scale) →
    nearest-neighbour TSP ordering → pixel strokes. Also returns `strokes_dense`
    (~2 mm) for the white on-surface skeleton line in the 3D preview.
+   Joining merges two strokes when the gap between an endpoint of one and an
+   endpoint of the other (start or end, direction irrelevant) is under
+   `join_mm` — or under JOIN_CROSSING_FACTOR×`join_mm` (2×) when a THIRD stroke
+   properly crosses the straight line closing that gap (an interruption implies
+   one gesture). Each endpoint takes at most one partner, accepted
+   shortest-gap-first so it lands on its nearest eligible neighbour; joins that
+   would close a loop are refused, so the output is always open polylines.
+   Order matters: joining runs on the smoothed chains BEFORE resample/TSP, so a
+   merged stroke is resampled continuously across the seam and `strokes_dense`
+   (the white line) shows the same merges as the waypoints — keep it there.
 4. **Mapping** `surface.SurfaceModel.project_strokes` — STL/OBJ (Rhino, mm→m) via
    trimesh; camera frame fitted centred (aspect kept) onto the footprint ⟂ the
    mesh's dominant normal; ray-cast; TCP ⟂ surface with minimal twist; offset
@@ -186,7 +202,8 @@ never import `main` from these modules.
 
 ## Key WS messages (browser ↔ server; external tools may use these)
 - in: `connect{ip}`, `disconnect`, `simulate_workspace`, `capture_image`,
-  `preview_adjust{params}`, `generate_path{params:{crop,adjustments,spacing_mm}}`,
+  `preview_adjust{params}`,
+  `generate_path{params:{crop,adjustments,spacing_mm,join_mm}}`,
   `run{params:{speed_pct,offset_mm,safety_mm,blend_mm}}`, `cancel`,
   `save_path{params:{speed_pct,offset_mm,safety_mm,blend_mm,image}}`,
   `set_groove_params{params}`, `set_reference`/`clear_reference`,
@@ -197,15 +214,16 @@ never import `main` from these modules.
   `set_trigger{params:{threshold_mm|null}}` (trigger distance; null/empty clears),
   `set_automation{params:{on}}` (Participant Auto toggle; ON locks manual
   capture/generate/run for every other client incl. MCP tools),
-  `set_exec_params{params:{speed_pct,offset_mm,safety_mm,blend_mm,spacing_mm}}`
-  (live, debounced sync of the exec bar so Participant Mode + reopened windows
-  match; blend_mm = movep corner Radius slider, 0–5).
+  `set_exec_params{params:{speed_pct,offset_mm,safety_mm,blend_mm,spacing_mm,
+  join_mm}}` (live, debounced sync of the exec bar so Participant Mode +
+  reopened windows match; blend_mm = movep corner Radius slider, 0–5;
+  join_mm = Distance Threshold box, 0–200).
 - out: `state` (20 Hz, incl. `participant{auto,status,message,trigger_mm,below}`;
-  `init` carries the same block plus `detect{crop,adjustments,spacing_mm}` +
-  `exec{speed_pct,offset_mm,safety_mm,blend_mm}` — the browser restores its
+  `init` carries the same block plus `detect{crop,adjustments,spacing_mm,join_mm}`
+  + `exec{speed_pct,offset_mm,safety_mm,blend_mm}` — the browser restores its
   controls from these on (re)open), `capture_result{stroke_count,point_count,strokes,
   reach_flags,reach_out,skeleton,exec_viz:{blend_m,reach_m,min_reach_m,
-  spacing_mm}}`, `still`, `preview`, `surface_status`, `save_result`,
+  spacing_mm,join_mm}}`, `still`, `preview`, `surface_status`, `save_result`,
   `reference_status`, `execution_update`, `connection_result`,
   `register_result{success,message,pose,error}`,
   `depth_labels{labels:[[u,v,mm],...],size:[w,h]}` (only to /depths popups,
@@ -239,4 +257,12 @@ never import `main` from these modules.
 - The browser preview reads the Radius slider directly (`readBlendMm()` →
   `rebuildToolpathViz`); `exec_viz.blend_m` from capture_result is only the
   session echo.
-- Test count reference: 233 unit (+6 hardware-gated). Keep green.
+- Exec-bar controls split two ways: Spacing and **Distance Threshold** change
+  the path GEOMETRY, so they re-send `generate_path` (server-side rebuild);
+  Offset/Safety/Radius only re-draw client-side via `rebuildToolpathViz`. Don't
+  wire Distance Threshold into the client-side path — the browser has no copy
+  of the pre-join chains.
+- `_segments_cross` deliberately requires strictly opposite orientation signs,
+  so a stroke that merely touches or ends ON the connecting line (a T junction)
+  does NOT earn the doubled join threshold — only one that truly passes through.
+- Test count reference: 252 unit (+6 hardware-gated). Keep green.

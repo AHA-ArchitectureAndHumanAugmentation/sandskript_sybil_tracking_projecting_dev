@@ -242,7 +242,7 @@
         <label for="order-size">Size</label>
         <input type="range" id="order-size" min="0.05" max="3" step="0.05" value="1" />
       </div>
-      <div id="exec-bar" title="Spacing re-generates the path; Speed / Offset / Safety apply when Run is clicked">
+      <div id="exec-bar" title="Spacing and Distance Threshold re-generate the path; Speed / Offset / Safety apply when Run is clicked">
         <label for="exec-spacing" title="Distance between robot waypoints along each stroke — re-generates the path">Spacing</label>
         <input type="range" id="exec-spacing" min="10" max="100" step="1" value="10" />
         <span id="exec-spacing-val">10 mm</span>
@@ -260,6 +260,10 @@
         <span class="legend-sep"></span>
         <label for="exec-safety">Safety</label>
         <input type="number" id="exec-safety" value="50" step="5" min="5" max="300" /> mm
+        <span class="legend-sep"></span>
+
+        <label for="exec-join" title="Distance Threshold — when the endpoints of two different strokes are closer than this, they are connected and the strokes merge into one continuous toolpath. If another stroke crosses the line that would close the gap, the threshold doubles for that pair. Each endpoint joins only its nearest eligible neighbour. 0 = off; re-generates the path">Distance Threshold</label>
+        <input type="number" id="exec-join" value="0" step="1" min="0" max="200" /> mm
         <span class="legend-sep"></span>
         <button id="btn-save-path" title="Save this toolpath (URScript + JSON + preview image) to a dated folder under paths/">💾 Save Path</button>
       </div>

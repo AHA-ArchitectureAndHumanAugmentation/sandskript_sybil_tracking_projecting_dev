@@ -108,11 +108,14 @@ async def capture_image() -> dict:
 @mcp.tool()
 async def generate_path(adjustments: dict | None = None,
                         crop: dict | None = None,
-                        spacing_mm: float | None = None) -> dict:
-    """Generate the toolpath from the captured still; returns stroke/point counts + reach violations (never raw strokes). adjustments: groove params (groove_depth_mm, detect, min_length_mm, ...); crop: {x,y,w,h} normalized; spacing_mm: waypoint spacing in mm (10-100, default 10)."""
+                        spacing_mm: float | None = None,
+                        join_mm: float | None = None) -> dict:
+    """Generate the toolpath from the captured still; returns stroke/point counts + reach violations (never raw strokes). adjustments: groove params (groove_depth_mm, detect, min_length_mm, ...); crop: {x,y,w,h} normalized; spacing_mm: waypoint spacing in mm (10-100, default 10); join_mm: Distance Threshold in mm (0-200, default 0 = off) — endpoints of different strokes closer than this are connected so the strokes merge into one toolpath (threshold doubles when another stroke crosses the connecting line)."""
     params = {"adjustments": adjustments or {}, "crop": crop or {}}
     if spacing_mm is not None:
         params["spacing_mm"] = spacing_mm
+    if join_mm is not None:
+        params["join_mm"] = join_mm
     d = await _ws_call({"type": "generate_path", "params": params},
                        ("capture_result",), timeout=120.0)
     if "error" in d and not d.get("success", False):

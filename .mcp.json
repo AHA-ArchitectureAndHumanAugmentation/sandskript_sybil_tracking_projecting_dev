@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "depth-cam-pipeline": {
-      "command": "C:/Users/linfo/miniconda3/envs/sandskript/python.exe",
+      "command": "C:/Users/staff/miniconda3/envs/sandskript/python.exe",
       "args": ["mcp_server/server.py"]
     }
   }

@@ -11,6 +11,7 @@ from path_extractor import (
     ExtractedPath,
     _order_strokes,
     extract_from_edges,
+    join_strokes,
     pixels_to_robot_coords,
     resample_stroke,
 )
@@ -194,6 +195,152 @@ class TestExtractFromEdges:
                 assert len(pt) == 2
                 assert 0 <= pt[0] <= 640
                 assert 0 <= pt[1] <= 480
+
+# ─────────────────────────────────────────────────────────────────────────────
+# join_strokes (Distance Threshold — merge strokes whose endpoints nearly touch)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestJoinStrokes:
+
+    def test_zero_threshold_is_a_no_op(self):
+        strokes = [[(0, 0), (10, 0)], [(12, 0), (22, 0)]]
+        assert join_strokes(strokes, join_px=0) == strokes
+
+    def test_single_stroke_unchanged(self):
+        strokes = [[(0, 0), (10, 0)]]
+        assert join_strokes(strokes, join_px=50) == strokes
+
+    def test_gap_below_threshold_merges(self):
+        """End of A is 2 px from start of B → one stroke of all four points."""
+        merged = join_strokes([[(0, 0), (10, 0)], [(12, 0), (22, 0)]], join_px=5)
+        assert len(merged) == 1
+        assert merged[0] == [(0, 0), (10, 0), (12, 0), (22, 0)]
+
+    def test_gap_above_threshold_stays_separate(self):
+        strokes = [[(0, 0), (10, 0)], [(60, 0), (70, 0)]]
+        assert len(join_strokes(strokes, join_px=5)) == 2
+
+    def test_direction_ignored_end_to_end(self):
+        """B runs backwards; its END is the near endpoint, so B is flipped."""
+        merged = join_strokes([[(0, 0), (10, 0)], [(22, 0), (12, 0)]], join_px=5)
+        assert len(merged) == 1
+        assert merged[0] == [(0, 0), (10, 0), (12, 0), (22, 0)]
+
+    def test_start_to_start_join_flips_the_first(self):
+        """Both strokes start at the meeting point — one must be reversed."""
+        merged = join_strokes([[(10, 0), (0, 0)], [(12, 0), (22, 0)]], join_px=5)
+        assert len(merged) == 1
+        assert merged[0] == [(0, 0), (10, 0), (12, 0), (22, 0)]
+
+    def test_nearest_endpoint_wins(self):
+        """A's end has two candidates in range; only the nearer one connects."""
+        strokes = [
+            [(0, 0), (10, 0)],      # A — end at (10, 0)
+            [(14, 0), (24, 0)],     # B — 4 px away
+            [(12, 0), (12, 20)],    # C — 2 px away, the nearer one
+        ]
+        merged = join_strokes(strokes, join_px=8)
+        assert len(merged) == 2                      # A+C merged, B alone
+        joined = max(merged, key=len)
+        assert (0, 0) in joined and (12, 20) in joined
+        assert (24, 0) not in joined
+
+    def test_crossing_stroke_doubles_the_threshold(self):
+        """A 15 px gap is rejected at threshold 10, accepted when a third
+        stroke crosses the connecting line (10 → 20 effective)."""
+        a = [(0, 0), (10, 0)]
+        b = [(25, 0), (35, 0)]
+        crosser = [(17, -10), (17, 10)]              # cuts the A→B gap
+        assert len(join_strokes([a, b], join_px=10)) == 2
+        merged = join_strokes([a, b, crosser], join_px=10)
+        lengths = sorted(len(s) for s in merged)
+        assert lengths == [2, 4]                     # crosser alone + A joined to B
+
+    def test_crossing_does_not_extend_beyond_double(self):
+        """Even with a crossing stroke, a gap past 2x the threshold is refused."""
+        a = [(0, 0), (10, 0)]
+        b = [(45, 0), (55, 0)]                       # 35 px gap, 2x threshold = 20
+        crosser = [(27, -10), (27, 10)]
+        assert len(join_strokes([a, b, crosser], join_px=10)) == 3
+
+    def test_chain_of_three_merges_into_one(self):
+        strokes = [[(0, 0), (10, 0)], [(12, 0), (22, 0)], [(24, 0), (34, 0)]]
+        merged = join_strokes(strokes, join_px=5)
+        assert len(merged) == 1
+        assert len(merged[0]) == 6
+
+    def test_loop_is_refused(self):
+        """Three strokes in a triangle: two joins accepted, the closing one
+        refused, so the result is one open polyline (never a closed ring)."""
+        strokes = [
+            [(0, 0), (100, 0)],
+            [(102, 2), (50, 90)],
+            [(48, 88), (-2, 2)],
+        ]
+        merged = join_strokes(strokes, join_px=6)
+        assert len(merged) == 1
+        assert len(merged[0]) == 6                   # all points, no duplication
+
+    def test_every_point_survives(self):
+        strokes = [[(0, 0), (10, 0)], [(12, 0), (22, 0)], [(80, 80), (90, 80)]]
+        merged = join_strokes(strokes, join_px=5)
+        assert sum(len(s) for s in merged) == sum(len(s) for s in strokes)
+
+    def test_no_stroke_joins_to_itself(self):
+        """A stroke whose own two ends nearly meet must stay one stroke."""
+        strokes = [[(0, 0), (10, 0), (10, 10), (1, 1)]]
+        merged = join_strokes(strokes, join_px=5)
+        assert len(merged) == 1
+        assert len(merged[0]) == 4
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# extract_from_edges + join_mm (the wired-up Distance Threshold)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestExtractFromEdgesJoining:
+
+    @staticmethod
+    def _broken_line(mask_blank):
+        """Two collinear segments with an 8-px gap — one interrupted groove."""
+        mask = mask_blank.copy()
+        mask[100, 40:120] = 255
+        mask[100, 128:210] = 255
+        return mask
+
+    def test_join_off_by_default(self, mask_blank):
+        result = extract_from_edges(self._broken_line(mask_blank), mm_per_px=1.0)
+        assert result.total_strokes == 2
+
+    def test_join_mm_merges_the_broken_line(self, mask_blank):
+        result = extract_from_edges(self._broken_line(mask_blank),
+                                    mm_per_px=1.0, join_mm=20.0)
+        assert result.total_strokes == 1
+
+    def test_join_below_gap_leaves_it_split(self, mask_blank):
+        result = extract_from_edges(self._broken_line(mask_blank),
+                                    mm_per_px=1.0, join_mm=2.0)
+        assert result.total_strokes == 2
+
+    def test_dense_skeleton_reflects_the_join(self, mask_blank):
+        """The white preview line must show the same merge as the waypoints."""
+        result = extract_from_edges(self._broken_line(mask_blank),
+                                    mm_per_px=1.0, join_mm=20.0)
+        assert len(result.strokes_dense) == result.total_strokes == 1
+
+    def test_join_scales_with_mm_per_px(self, mask_blank):
+        """8 px gap at 4 mm/px = 32 mm — 20 mm is too small to bridge it."""
+        mask = self._broken_line(mask_blank)
+        assert extract_from_edges(mask, mm_per_px=4.0, join_mm=20.0).total_strokes == 2
+        assert extract_from_edges(mask, mm_per_px=4.0, join_mm=40.0).total_strokes == 1
+
+    def test_waypoints_are_continuous_across_the_join(self, mask_blank):
+        """Resampling runs after joining, so no oversized step at the seam."""
+        result = extract_from_edges(self._broken_line(mask_blank), spacing_mm=10.0,
+                                    mm_per_px=1.0, join_mm=20.0)
+        stroke = result.strokes[0]
+        gaps = [math.dist(stroke[i - 1], stroke[i]) for i in range(1, len(stroke))]
+        assert max(gaps) <= 15, f"seam step {max(gaps):.1f}px — resample ran before the join"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

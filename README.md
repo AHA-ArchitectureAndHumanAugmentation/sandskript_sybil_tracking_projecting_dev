@@ -79,6 +79,10 @@ groove regions       detect the mm-deep marks; tuned live with the parameters
 centrelines          thin each groove region to a 1-px-wide skeleton line
     │
     ▼
+joined strokes       connect stroke ends that nearly touch, so an interrupted
+    │                groove becomes one continuous path (Distance Threshold
+    │                box; default 0 mm = off)
+    ▼
 resampled strokes    drop a waypoint every 10–100 mm along each line
     │                (Spacing slider; default 10 mm)
     ▼
@@ -269,8 +273,39 @@ The Developer-Mode workflow, step by step.
 3. **Aim the RealSense** straight down so it covers the whole sandbox. The four viewports show **Depth** (near = blue → far = red), **RGB**, **Skeleton** (the 1-px centrelines that become the path) and **Mask** (the thick detected region — shows groove *width*, handy while tuning). The **⧉ Participant Mode** popup (Depth viewport) adds the live depth view with **absolute mm-from-camera** labels per iso-depth region (**Region interval** and **Text size** sliders; display-only, computed only while the popup is open) and holds the **Auto** toggle + **Trigger below** box that automate the pipeline — see *Participant Mode* below.
 4. **Tune detection live** — the **Detection Parameters** panel works *before* capturing: pick a **Mode** (Valley / Ridge / Band) and adjust **Groove depth**, **Surface scale**, **Denoise**, **Min blob**; the viewports update in real time. Drag a **crop** rectangle on the Depth view to limit the region. **Save** stores the sliders to a dated file under `presets/`, **Load** restores one, **Reset** returns to defaults.
 5. **Capture Image** — freezes a temporally averaged depth (+ aligned colour) still; the crop carries over (drag inside to move, corners to resize, **Reset Crop** for full frame). Detection — and the generated path — cover only the crop.
-6. **Generate Path** — the 3D viewer shows the surface, the detected skeleton as a **white** on-surface line, and the movep toolpath: **green** blended segments with waypoint dots (**red** = outside estimated reach), **amber** safety/retract points, **grey** pen-up travels. **Spacing** (10–100 mm) sets waypoint distance and regenerates on release; **Radius** (0–5 mm, default 0.5) is the movep corner blend — clamped per stroke to 45 % of the shortest segment so the controller never rejects the path; Offset/Safety edits update the preview live. **Path | Order** switches to a numbered stroke-order view; **⧉ Pop out** opens the preview in its own window. Re-tune and regenerate freely, or **Retake**.
+6. **Generate Path** — the 3D viewer shows the surface, the detected skeleton as a **white** on-surface line, and the movep toolpath: **green** blended segments with waypoint dots (**red** = outside estimated reach), **amber** safety/retract points, **grey** pen-up travels. **Spacing** (10–100 mm) sets waypoint distance and regenerates on release; **Distance Threshold** (0–200 mm, default 0 = off) merges strokes whose ends nearly touch — see below — and also regenerates; **Radius** (0–5 mm, default 0.5) is the movep corner blend — clamped per stroke to 45 % of the shortest segment so the controller never rejects the path; Offset/Safety edits update the preview live. **Path | Order** switches to a numbered stroke-order view; **⧉ Pop out** opens the preview in its own window. Re-tune and regenerate freely, or **Retake**.
 7. **Run** — set **Speed** (% of max TCP speed, governs the *entire* motion), **Offset** (mm off the surface along the local normal), **Safety** (retract mm) and **Radius**, then Run. The blue dot tracks the live TCP; a progress bar tracks execution; **Cancel** stops mid-stroke. Execution uses the same blended movep as the saved `path.script`, so live and saved runs trace identically. **💾 Save Path** writes the toolpath — current settings baked in — to a timestamped folder under `paths/` (see *Saving toolpaths*).
+
+### Distance Threshold — joining broken strokes
+
+A single raked gesture rarely survives detection as one stroke: a shallow patch,
+a crossing groove, or a fleck of shadow splits it into fragments, and the robot
+then lifts, travels and re-approaches in the middle of what should be one line.
+The **Distance Threshold** box (mm, in the Path Preview bar) stitches those
+fragments back together before the waypoints are laid down.
+
+- **What counts** — only stroke **endpoints**, and only across *different*
+  strokes. Direction is irrelevant: a start may join a start, an end an end.
+  A stroke can never join to itself, so a near-closed curve stays open.
+- **The doubling rule** — if drawing the straight line that would close a gap
+  means crossing *another* stroke, the threshold **doubles** for that pair. A
+  crossing groove is the most common reason a gesture got cut in two, so those
+  ends are given twice the benefit of the doubt. A stroke that merely touches or
+  ends on that line does not count — it has to genuinely pass through.
+- **One partner each** — when several ends qualify, the **nearest** wins.
+  Candidates are settled shortest-gap-first, so no end is claimed by a distant
+  neighbour just because it was checked first.
+- **Never a loop** — a join that would close a chain back on itself is refused,
+  so the output is always open polylines.
+
+Set it to **0 to switch joining off** (the default — every stroke stays as
+detected). Changing it re-generates the path, exactly like Spacing. What you see
+in the preview *is* what runs: the white skeleton line, the green toolpath, the
+stroke count and the saved bundle all come from the joined strokes.
+
+Joining happens **before** resampling, so waypoints are spaced evenly straight
+across a seam — a merged stroke is indistinguishable from one that was never
+broken.
 
 ---
 
@@ -446,6 +481,9 @@ All parameters live in `config.py`.
 | ------------------------------------ | --------------- | ---------------------------------------------------------------- |
 | `RESAMPLE_SPACING_MM`                | `10.0` mm       | Default waypoint spacing (Spacing slider overrides per generate) |
 | `RESAMPLE_SPACING_MIN_MM` / `MAX_MM` | `10` / `100` mm | Spacing slider range                                             |
+| `JOIN_DISTANCE_MM`                   | `0.0` mm        | Default endpoint-join distance; `0` = joining off (Distance Threshold box overrides per generate) |
+| `JOIN_DISTANCE_MIN_MM` / `MAX_MM`    | `0` / `200` mm  | Distance Threshold box range                                     |
+| `JOIN_CROSSING_FACTOR`               | `2.0`           | Threshold multiplier when another stroke crosses the connecting line |
 
 
 

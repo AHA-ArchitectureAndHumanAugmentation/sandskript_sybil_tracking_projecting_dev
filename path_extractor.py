@@ -7,12 +7,16 @@ from typing import Optional
 import numpy as np
 
 from config import (
-    CONTOUR_MIN_PIXELS, RESAMPLE_SPACING_MM, TOOL_ORIENTATION,
+    CONTOUR_MIN_PIXELS, JOIN_CROSSING_FACTOR, JOIN_DISTANCE_MM,
+    RESAMPLE_SPACING_MM, TOOL_ORIENTATION,
 )
 
 # Fallback spacing (pixels) used only when no mm-per-pixel scale is available
 # (e.g. Test Mode before a workspace/surface is set). Normally spacing is mm.
 _FALLBACK_SPACING_PX = 10.0
+# Same fallback applied to the join distance: keep it in the same px-per-mm
+# proportion as the spacing fallback so both scale together in Test Mode.
+_FALLBACK_PX_PER_MM = _FALLBACK_SPACING_PX / RESAMPLE_SPACING_MM
 
 # Dense resample spacing for the skeleton preview line (the white on-surface
 # curve in the 3D view). Much finer than the waypoint spacing so it hugs the
@@ -37,6 +41,7 @@ def extract_from_edges(
     offset: tuple[int, int] = (0, 0),
     spacing_mm: float = RESAMPLE_SPACING_MM,
     mm_per_px: Optional[float] = None,
+    join_mm: float = JOIN_DISTANCE_MM,
 ) -> ExtractedPath:
     """
     Turn a binary groove image (1-px-wide centrelines, white on black) into
@@ -51,6 +56,13 @@ def extract_from_edges(
     ``mm_per_px`` converts it into the pixel spacing used for resampling. When no
     scale is available (mm_per_px is None or non-positive) it falls back to a
     fixed pixel spacing so Test Mode still produces a path.
+
+    ``join_mm`` (0 = off) merges strokes whose endpoints nearly touch — see
+    ``join_strokes``. Joining runs on the smoothed chains BEFORE resampling and
+    ordering, so a merged stroke is resampled as one continuous run (waypoints
+    land evenly across the join) and the TSP sees the merged set. The dense
+    skeleton comes from the same merged chains, so the white preview line and
+    the waypoints always agree about what got connected.
     """
     strokes = _chains_from_edges(edges, min_contour_pixels)
 
@@ -63,10 +75,13 @@ def extract_from_edges(
     if mm_per_px and mm_per_px > 0:
         spacing_px = max(spacing_mm / mm_per_px, 1.0)
         dense_px   = max(_SKELETON_SPACING_MM / mm_per_px, 1.0)
+        join_px    = max(join_mm, 0.0) / mm_per_px
     else:
         spacing_px = _FALLBACK_SPACING_PX
         dense_px   = _SKELETON_FALLBACK_PX
+        join_px    = max(join_mm, 0.0) * _FALLBACK_PX_PER_MM
     strokes_smoothed  = [smooth_stroke(s) for s in strokes]
+    strokes_smoothed  = join_strokes(strokes_smoothed, join_px)
     strokes_resampled = [resample_stroke(s, spacing_px) for s in strokes_smoothed]
     strokes_ordered   = _order_strokes(strokes_resampled)
     strokes_dense     = [resample_stroke(s, dense_px) for s in strokes_smoothed]
@@ -241,6 +256,139 @@ def resample_stroke(
         result.append(stroke[-1])
 
     return result
+
+
+def join_strokes(
+    strokes: list[list[tuple[float, float]]],
+    join_px: float,
+    crossing_factor: float = JOIN_CROSSING_FACTOR,
+) -> list[list[tuple[float, float]]]:
+    """
+    Merge strokes whose endpoints nearly touch, so an interrupted groove becomes
+    one continuous toolpath instead of several short ones.
+
+    Rules (all distances in pixels; the caller converts the mm box value):
+      * Only endpoints count — the start or the end of a stroke, direction
+        irrelevant. A stroke never joins to itself.
+      * A pair qualifies when the gap between the two endpoints is below
+        ``join_px``, OR below ``crossing_factor * join_px`` when the straight
+        line closing that gap is crossed by a THIRD stroke. A crossing means the
+        two ends were interrupted by another groove, which is exactly the case
+        where they most likely belong together — so the threshold is relaxed.
+      * Each endpoint takes at most ONE partner. Candidates are accepted
+        shortest-gap-first, so every endpoint ends up joined to its nearest
+        eligible neighbour rather than to whichever was examined first.
+      * A join that would close a loop (both ends already in the same merged
+        chain) is refused, so the result is always a set of open polylines.
+
+    ``join_px <= 0`` disables joining and returns the strokes unchanged.
+    """
+    n = len(strokes)
+    if join_px <= 0 or n < 2:
+        return [list(s) for s in strokes]
+
+    near = float(join_px)
+    far  = near * max(crossing_factor, 1.0)
+
+    # Candidate endpoint pairs. Anything beyond the relaxed threshold can never
+    # qualify, so the crossing test only runs on the near..far band.
+    cands: list[tuple[float, int, int, int, int]] = []
+    for i in range(n):
+        for ei, a in ((0, strokes[i][0]), (1, strokes[i][-1])):
+            for j in range(i + 1, n):
+                for ej, b in ((0, strokes[j][0]), (1, strokes[j][-1])):
+                    d = math.hypot(a[0] - b[0], a[1] - b[1])
+                    if d >= far:
+                        continue
+                    if d >= near and not any(
+                        _crosses_gap(strokes[k], a, b)
+                        for k in range(n) if k != i and k != j
+                    ):
+                        continue
+                    cands.append((d, i, ei, j, ej))
+
+    cands.sort(key=lambda c: c[0])
+
+    # Greedy shortest-first matching. Union-find tracks which strokes are already
+    # in the same chain so a join can never close a loop.
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    link: dict[tuple[int, int], tuple[int, int]] = {}
+    for _d, i, ei, j, ej in cands:
+        if (i, ei) in link or (j, ej) in link:
+            continue                       # endpoint already took a nearer partner
+        ri, rj = find(i), find(j)
+        if ri == rj:
+            continue                       # same chain already — would close a loop
+        parent[ri] = rj
+        link[(i, ei)] = (j, ej)
+        link[(j, ej)] = (i, ei)
+
+    if not link:
+        return [list(s) for s in strokes]
+
+    # Walk each chain from a free end, flipping strokes so the joined endpoints
+    # meet. Loops are impossible (refused above), so every chain has two free ends.
+    merged: list[list[tuple[float, float]]] = []
+    visited: set[int] = set()
+    for s in range(n):
+        if s in visited or ((s, 0) in link and (s, 1) in link):
+            continue                       # mid-chain stroke; reached from an end
+        i, e_in = s, (1 if (s, 0) in link else 0)
+        pts: list[tuple[float, float]] = []
+        while True:
+            visited.add(i)
+            pts.extend(strokes[i] if e_in == 0 else reversed(strokes[i]))
+            nxt = link.get((i, 1 - e_in))
+            if nxt is None or nxt[0] in visited:
+                break
+            i, e_in = nxt
+        merged.append(pts)
+
+    # Defensive: anything not reached (cannot happen while loops are refused).
+    merged.extend(list(strokes[i]) for i in range(n) if i not in visited)
+    return merged
+
+
+def _crosses_gap(
+    stroke: list[tuple[float, float]],
+    a: tuple[float, float],
+    b: tuple[float, float],
+) -> bool:
+    """True when any segment of `stroke` crosses the straight line a→b."""
+    # Bounding-box reject first — most strokes are nowhere near the gap.
+    lo_x, hi_x = (a[0], b[0]) if a[0] <= b[0] else (b[0], a[0])
+    lo_y, hi_y = (a[1], b[1]) if a[1] <= b[1] else (b[1], a[1])
+    xs = [p[0] for p in stroke]
+    ys = [p[1] for p in stroke]
+    if max(xs) < lo_x or min(xs) > hi_x or max(ys) < lo_y or min(ys) > hi_y:
+        return False
+    for i in range(len(stroke) - 1):
+        if _segments_cross(a, b, stroke[i], stroke[i + 1]):
+            return True
+    return False
+
+
+def _segments_cross(a, b, c, d) -> bool:
+    """
+    True when segment a→b and segment c→d properly cross.
+
+    Both orientation products must be strictly negative, which requires all four
+    signs to be non-zero: a stroke that merely TOUCHES or ends on the line (a T
+    junction, or a groove running collinear with it) does not count as passing
+    through it, so it never earns the doubled threshold.
+    """
+    def orient(p, q, r) -> float:
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    return (orient(a, b, c) * orient(a, b, d) < 0
+            and orient(c, d, a) * orient(c, d, b) < 0)
 
 
 def _order_strokes(
