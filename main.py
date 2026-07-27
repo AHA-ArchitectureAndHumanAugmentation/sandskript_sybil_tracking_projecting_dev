@@ -23,7 +23,10 @@ from config import (
     JOIN_DISTANCE_MM, JOIN_DISTANCE_MIN_MM, JOIN_DISTANCE_MAX_MM,
     UR_REACH_M, UR_MIN_REACH_M, MOVEP_BLEND_M,
     PARTICIPANT_TICK_S, PARTICIPANT_CLEAR_S,
+    PROFANITY_CHECK_ENABLED,
 )
+import text_guard
+import module_trace
 from automation import ParticipantAutomation
 from reach import reach_flags as _compute_reach_flags
 from registration import register_pose
@@ -69,13 +72,14 @@ shared_state: dict = {
     "strokes_surface":     False,      # True when current strokes were surface-projected
     "still_dims":          None,       # (width, height) of the captured still
     "strokes":             [],         # robot-space strokes after Generate Path
+    "last_mask":           None,       # last groove mask — Participant profanity guard only
     "executing":           False,
     "progress":            0.0,
     # ── Participant Mode (automated pipeline) ──
     "auto_on":             False,      # Participant popup Auto toggle
     "trigger_mm":          None,       # trigger distance (mm from camera); None = off
     "trigger_below":       None,       # camera thread: something closer than trigger_mm?
-    "participant_status":  "Auto Off", # Auto Off|Auto On|Alerted|Sensing|Generating Paths|Actuating
+    "participant_status":  "Auto Off", # Auto Off|Auto On|Alerted|Sensing|Generating Paths|Actuating|Invalid
     "participant_msg":     "",         # last automation outcome/message
     "participant_gen_params":  {},     # last crop/adjustments/spacing from Developer Mode
     "participant_exec_params": {},     # last speed_pct/offset_mm/safety_mm from Developer Mode
@@ -106,7 +110,7 @@ async def on_robot_connect(ip: str, ws) -> None:
         await server.send_connection_result(
             ws, True, f"Connected to {ip} — load a 3D surface to start."
         )
-        print(f"Robot connected: {ip}")
+        module_trace.log("connect", f"Robot connected: {ip}")
 
     except asyncio.TimeoutError:
         with state_lock:
@@ -116,12 +120,12 @@ async def on_robot_connect(ip: str, ws) -> None:
             "Is the robot in Remote Control mode?"
         )
         await server.send_connection_result(ws, False, msg)
-        print(msg)
+        module_trace.log("connect", msg)
     except Exception as exc:
         with state_lock:
             shared_state["robot_connected"] = False
         await server.send_connection_result(ws, False, str(exc))
-        print(f"Robot connection failed: {exc}")
+        module_trace.log("connect", f"Robot connection failed: {exc}")
 
 
 async def on_robot_disconnect(ws) -> None:
@@ -138,7 +142,7 @@ async def on_robot_disconnect(ws) -> None:
         shared_state["phase"]           = "idle"
     if ws is not None:
         await server.send_connection_result(ws, False, "Disconnected")
-    print("Robot disconnected")
+    module_trace.log("disconnect", "Robot disconnected")
 
 
 async def on_last_client_disconnect() -> None:
@@ -173,9 +177,11 @@ async def on_simulate_workspace() -> None:
         shared_state["phase"]             = "previewing"
     if not camera_thread.running:
         camera_thread.start()
-    print(
+    module_trace.log(
+        "generate",
         f"Simulation workspace active (no robot): "
-        f"{ws_cfg.x_extent:.3f} m × {ws_cfg.y_extent:.3f} m — Capture enabled."
+        f"{ws_cfg.x_extent:.3f} m × {ws_cfg.y_extent:.3f} m — Capture enabled.",
+        extra=("workspace",),
     )
 
 
@@ -230,7 +236,7 @@ async def on_set_reference(ws) -> None:
         shared_state["reference_depth"] = depth_m
     camera_thread.set_reference(depth_m)
     await server.send_reference_status(ws, True, "Reference captured — natural grooves can be subtracted.")
-    print("Reference depth captured for background subtraction.")
+    module_trace.log("reference", "Reference depth captured for background subtraction.")
 
 
 async def on_clear_reference(ws) -> None:
@@ -238,7 +244,7 @@ async def on_clear_reference(ws) -> None:
         shared_state["reference_depth"] = None
     camera_thread.set_reference(None)
     await server.send_reference_status(ws, False, "Reference cleared.")
-    print("Reference depth cleared.")
+    module_trace.log("reference", "Reference depth cleared.")
 
 
 # ── Target surface (3D projection) callbacks ─────────────────────────────────
@@ -273,7 +279,7 @@ async def on_surface_upload(filename: str, blob: bytes) -> dict:
         message=f"Surface loaded: {info['name']} ({info['faces']} faces, "
                 f"{info['bbox']['size'][0]}×{info['bbox']['size'][1]} m)",
     )
-    print(f"[surface] loaded {info['name']}: {info['faces']} faces, bbox {info['bbox']['size']} m")
+    module_trace.log("surface", f"[surface] loaded {info['name']}: {info['faces']} faces, bbox {info['bbox']['size']} m")
     return {"info": info}
 
 
@@ -297,7 +303,7 @@ async def on_clear_surface() -> None:
         shared_state["surface_mesh_payload"] = None
         shared_state["strokes_surface"] = False
     await server.broadcast_surface_status(loaded=False, message="Surface cleared.")
-    print("[surface] cleared — paths map to the flat workspace again")
+    module_trace.log("surface", "[surface] cleared — paths map to the flat workspace again", extra=("workspace",))
 
 
 # ── Corner→TCP surface registration ──────────────────────────────────────────
@@ -322,7 +328,7 @@ async def on_register_freedrive(ws, params: dict) -> None:
         None, robot.start_freedrive if on else robot.end_freedrive)
     with state_lock:
         shared_state["freedrive"] = on
-    print(f"[register] freedrive {'ON — move the tool tip to the corner' if on else 'off'}")
+    module_trace.log("register", f"[register] freedrive {'ON — move the tool tip to the corner' if on else 'off'}")
 
 
 async def on_register_corner(ws, params: dict) -> None:
@@ -371,7 +377,7 @@ async def on_register_corner(ws, params: dict) -> None:
         loaded=True, info=info, pose=new_pose.to_dict(), offset_mm=offset,
         mesh=None, message=msg,
     )
-    print(f"[register] {msg}")
+    module_trace.log("register", f"[register] {msg}")
 
 
 async def on_capture_image(ws) -> None:
@@ -407,7 +413,7 @@ async def on_capture_image(ws) -> None:
         depth_jpg = await loop.run_in_executor(None, encode_jpeg, color)
         rgb_jpg = await loop.run_in_executor(None, encode_jpeg, rgb) if rgb is not None else None
         await server.send_still(ws, depth_jpg=depth_jpg, rgb_jpg=rgb_jpg, width=w, height=h)
-        print(f"Captured still: {w}×{h} (depth+colour) — ready for crop/adjust")
+        module_trace.log("capture", f"Captured still: {w}×{h} (depth+colour) — ready for crop/adjust")
     finally:
         if proj:
             await server.broadcast_projection_blank(False)
@@ -436,7 +442,7 @@ async def on_preview_adjust(ws, params: dict) -> None:
             None, process_depth, depth_m, valid, crop, gp, reference, mmpp
         )
     except Exception as exc:
-        print(f"[preview] processing error: {exc}")
+        module_trace.log("preview", f"[preview] processing error: {exc}")
         return
 
     depth_jpg   = await loop.run_in_executor(None, encode_jpeg, processed.color_full)
@@ -560,6 +566,9 @@ async def on_generate_path(ws, params: dict) -> None:
     with state_lock:
         shared_state["strokes"] = robot_strokes
         shared_state["strokes_surface"] = surface_mode
+        # Kept for the Participant-Mode profanity guard, which OCRs the mask
+        # rather than the skeleton. Developer Mode never reads this.
+        shared_state["last_mask"] = processed.mask
         shared_state["phase"]   = "captured" if robot_strokes else "editing"
         session_blend_mm = (shared_state.get("participant_exec_params") or {}).get(
             "blend_mm", MOVEP_BLEND_M * 1000.0)
@@ -583,9 +592,15 @@ async def on_generate_path(ws, params: dict) -> None:
             "join_mm": join_mm,
         },
     )
-    print(f"Generated path: {extracted.total_strokes} strokes, {extracted.total_points} points"
-          + (f" — WARNING: {reach_out}/{reach_total} waypoints outside estimated reach"
-             if reach_out else ""))
+    # Mapping owner depends on the run: a loaded mesh uses surface.py, Test Mode
+    # falls back to workspace.py — show whichever actually ran.
+    module_trace.log(
+        "generate",
+        f"Generated path: {extracted.total_strokes} strokes, {extracted.total_points} points"
+        + (f" — WARNING: {reach_out}/{reach_total} waypoints outside estimated reach"
+           if reach_out else ""),
+        extra=("surface" if surface_mode else "workspace", "reach"),
+    )
 
 
 async def on_retake(ws) -> None:
@@ -597,7 +612,7 @@ async def on_retake(ws) -> None:
         shared_state["phase"]          = "previewing"
     if not camera_thread.running:
         camera_thread.start()
-    print("Retake — back to live preview")
+    module_trace.log("capture", "Retake — back to live preview")
 
 
 async def on_run(ws, params: dict | None = None) -> None:
@@ -648,16 +663,18 @@ async def on_run(ws, params: dict | None = None) -> None:
         travel_dist=safety_mm / 1000.0,
         blend_m=blend_mm / 1000.0,
     )
-    print(f"[executor] starting path: {len(strokes)} strokes, "
-          f"{speed_pct:.0f}% speed ({draw_speed:.3f} m/s), "
-          f"offset {offset_mm:.1f} mm, safety {safety_mm:.0f} mm, "
-          f"blend {blend_mm:.1f} mm"
-          + (" (surface mode)" if surface_mode else ""))
+    module_trace.log(
+        "run",
+        f"[executor] starting path: {len(strokes)} strokes, "
+        f"{speed_pct:.0f}% speed ({draw_speed:.3f} m/s), "
+        f"offset {offset_mm:.1f} mm, safety {safety_mm:.0f} mm, "
+        f"blend {blend_mm:.1f} mm"
+        + (" (surface mode)" if surface_mode else ""))
 
 
 async def on_cancel(ws) -> None:
     path_executor.cancel()
-    print("[executor] cancel requested")
+    module_trace.log("cancel", "[executor] cancel requested")
 
 
 async def on_save_path(ws, params: dict) -> None:
@@ -722,7 +739,7 @@ async def on_save_path(ws, params: dict) -> None:
         return
 
     await server.send_save_result(ws, True, folder=str(folder))
-    print(f"[save] toolpath saved to {folder}")
+    module_trace.log("save", f"[save] toolpath saved to {folder}")
 
 
 # ── Participant Mode (automated pipeline) ────────────────────────────────────
@@ -774,7 +791,7 @@ async def on_set_automation(params: dict) -> None:
     automation.set_enabled(on)
     _update_trigger_hint()
     _sync_participant_state()
-    print(f"[participant] automation {'ON' if on else 'OFF'}")
+    module_trace.log("participant", f"[participant] automation {'ON' if on else 'OFF'}")
 
 
 async def on_set_exec_params(params: dict) -> None:
@@ -823,11 +840,13 @@ async def on_set_trigger(params: dict) -> None:
             shared_state["trigger_below"] = None
     _update_trigger_hint()
     _sync_participant_state()
-    print(f"[participant] trigger {'set to %.0f mm' % mm if mm is not None else 'off'}")
+    module_trace.log("participant", f"[participant] trigger {'set to %.0f mm' % mm if mm is not None else 'off'}", extra=("camera_thread",))
 
 
 async def _participant_pipeline() -> None:
-    """One automated run: Sensing → Generating Paths → Actuating (save + run)."""
+    """One automated run: Sensing → Generating Paths → profanity guard →
+    Actuating (save + run). A rejected drawing stops at the guard: status
+    "Invalid", nothing saved, nothing sent to the robot."""
     bws = server.broadcast_ws()
     try:
         with state_lock:
@@ -850,6 +869,7 @@ async def _participant_pipeline() -> None:
 
         # ── Generating Paths: latest Developer-Mode detection/spacing settings.
         automation.stage("Generating Paths")
+        module_trace.log("generate", "[participant] stage: Generating Paths")
         _sync_participant_state()
         with state_lock:
             gen_params = dict(shared_state.get("participant_gen_params") or {})
@@ -857,12 +877,33 @@ async def _participant_pipeline() -> None:
         with state_lock:
             strokes = shared_state.get("strokes", [])
             connected = shared_state.get("robot_connected", False)
+            mask = shared_state.get("last_mask")
         if not strokes:
             automation.finish("No grooves detected — nothing to draw.")
             return
 
+        # ── Profanity guard: OCR the mask and stop here if it reads as
+        # offensive text. Participant Mode only — in Developer Mode the
+        # operator is present and decides. Nothing is saved and nothing is
+        # sent to the robot, and the status stays "Invalid" so whoever drew
+        # it sees the verdict.
+        if PROFANITY_CHECK_ENABLED and mask is not None:
+            loop = asyncio.get_running_loop()
+            verdict = await loop.run_in_executor(None, text_guard.check_mask, mask)
+            if verdict.profane:
+                automation.reject("Drawing rejected — please rake it over and try again.")
+                module_trace.log(
+                    "guard",
+                    f"[participant] REJECTED: {verdict.reason} | OCR read {verdict.text!r}",
+                    extra=("automation",))
+                return
+            if not verdict.available:
+                module_trace.log("guard",
+                                 f"[participant] profanity guard skipped: {verdict.reason}")
+
         # ── Actuating: save the bundle first (always), then run on the robot.
         automation.stage("Actuating")
+        module_trace.log("run", "[participant] stage: Actuating", extra=("automation",))
         _sync_participant_state()
         with state_lock:
             exec_params = dict(shared_state.get("participant_exec_params") or {})
@@ -879,10 +920,12 @@ async def _participant_pipeline() -> None:
         automation.finish(f"Run failed: {err}" if err else "Done — path drawn and saved.")
     except Exception as exc:
         automation.finish(f"Automation error: {exc}")
-        print(f"[participant] pipeline error: {exc}")
+        module_trace.log("participant", f"[participant] pipeline error: {exc}")
     finally:
         _sync_participant_state()
-        print(f"[participant] {automation.message or 'pipeline finished'}")
+        module_trace.log(
+            "participant",
+            f"[participant] {automation.message or 'pipeline finished'}")
 
 
 async def _participant_loop() -> None:
@@ -963,6 +1006,8 @@ async def _open_browser() -> None:
 
 
 async def _main() -> None:
+    # Printed after every module has been imported, so the ✓/· marks are real.
+    module_trace.print_banner()
     asyncio.create_task(_open_browser())
     asyncio.create_task(_participant_loop())
     await server.start()

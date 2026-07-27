@@ -123,6 +123,8 @@
   const CHIP_CLASS = {
     "Auto Off": "off", "Auto On": "watching", "Alerted": "alerted",
     "Sensing": "sensing", "Generating Paths": "generating", "Actuating": "actuating",
+    // Sticky verdict from the profanity guard — nothing was saved or run.
+    "Invalid": "invalid",
   };
 
   function updateParticipant(p) {

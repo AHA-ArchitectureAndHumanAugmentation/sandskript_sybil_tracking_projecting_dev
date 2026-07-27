@@ -104,6 +104,26 @@ JOIN_DISTANCE_MAX_MM = 200.0  # box upper bound
 # groove — so the threshold is multiplied by this before the pair is judged.
 JOIN_CROSSING_FACTOR = 2.0
 
+# ── Profanity guard (Participant Mode only) ───────────────────────────────────
+# OCR the detected groove mask and refuse the drawing when it spells something
+# on a wordlist. Runs once per automated capture, between path generation and
+# actuation — never in Developer Mode, where the operator decides.
+PROFANITY_CHECK_ENABLED = True
+PROFANITY_LANGS = "eng+deu"   # Tesseract language packs (both ship with the env)
+PROFANITY_WORDLIST_DIR = "wordlists"
+# Entries at least this long also match inside a run-together word; shorter ones
+# must stand alone. Lower it and "ass" starts flagging "classic".
+PROFANITY_MIN_SUBSTRING_LEN = 4
+# Degrees to re-read the mask at — a participant on the far side of the sandbox
+# writes upside down relative to the camera.
+PROFANITY_OCR_ROTATIONS = (0, 180)
+
+# ── Console module attribution (module_trace.py) ──────────────────────────────
+# Startup table mapping every feature to its .py files, and a one-line module
+# chain under each task the app performs. Console only — no effect on the UI.
+SHOW_MODULE_BANNER = True
+SHOW_MODULE_TRACE  = True
+
 # ── Robot drawing ─────────────────────────────────────────────────────────────
 DRAW_Z           = -0.010  # m — pen contact (negative = below workspace surface origin)
 TRAVEL_Z         =  0.050  # m — pen-up travel height above workspace surface origin

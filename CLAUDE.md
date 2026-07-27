@@ -18,7 +18,9 @@ execution/export. Includes a projector subsystem that shines the detected mask
 back onto the sand, and a Save feature exporting URScript + JSON toolpaths.
 Two modes: **Developer Mode** (`/`, all manual controls) and **Participant
 Mode** (the ⧉ popup on the Depth viewport, `/depths`): an Auto toggle + depth
-trigger run the whole pipeline automatically and lock the manual buttons.
+trigger run the whole pipeline automatically and lock the manual buttons —
+including an OCR profanity guard that refuses offensive drawings before the
+robot moves.
 
 ## Run / test
 - Run: `run.bat` or the conda-env python (`ENVPY` below) `main.py` → Developer
@@ -35,7 +37,7 @@ trigger run the whole pipeline automatically and lock the manual buttons.
   Never bare `pip` (broken launcher risk — use `<ENVPY> -m pip`). The Intel
   RealSense USB driver is an OS-level install, outside the env. The old
   `.venv` is retired.
-- Unit tests: `<ENVPY> -m pytest -q -m "not integration"` (233, no
+- Unit tests: `<ENVPY> -m pytest -q -m "not integration"` (305, no
   hardware). Integration: `-m integration`, needs RealSense/robot + TEST_ROBOT_IP.
 - No CLI modes. Hardware vs no-robot is in the UI: "Test Mode (no robot)" button
   unlocks capture with a synthetic workspace; Run stays gated on a robot connection.
@@ -134,14 +136,36 @@ trigger run the whole pipeline automatically and lock the manual buttons.
     region only, so motion outside the popup's visible area never triggers. Auto ON → **Auto On**; anything
     below trigger → **Alerted**; frame clear for PARTICIPANT_CLEAR_S →
     **Sensing** (waits buffer refill, then capture) → **Generating Paths**
-    (current Dev-Mode crop/adjustments/spacing) → **Actuating** (save_bundle,
-    then run if robot connected; skipped otherwise) → back to **Auto On**
-    (**Auto Off** when toggled off). While Auto is ON the manual
+    (current Dev-Mode crop/adjustments/spacing/join) → **profanity guard**
+    (below) → **Actuating** (save_bundle, then run if robot connected; skipped
+    otherwise) → back to **Auto On** (**Auto Off** when toggled off). While
+    Auto is ON the manual
     capture/generate/run WS calls are refused server-side (`_manual_locked`,
     also blocks MCP tools) and the Dev-Mode buttons grey out; automation
     itself calls the SAME handlers via `server.broadcast_ws()` (a ws shim
     fanning out to all browser clients), so Developer windows watch it live.
     Statuses shown big top-right in the popup via `state.participant`.
+11. **Profanity guard** `text_guard` — Participant Mode ONLY. Between Generating
+    Paths and Actuating, OCRs the groove MASK (`shared_state["last_mask"]`,
+    stashed by `on_generate_path`) and, on a wordlist hit, calls
+    `automation.reject()` → status **Invalid**, red chip, nothing saved and
+    nothing run. Invalid is STICKY (stays on screen, still armed — `_ARMED` in
+    automation.py) so the participant reads the verdict; the next trigger, or
+    toggling Auto off/on, clears it. OCR = Tesseract via `pytesseract`, both
+    INSIDE the conda env; `_ensure_engine` points pytesseract at
+    `sys.prefix/Library/bin/tesseract.exe`, prepends that dir to PATH (run.bat
+    starts the env python WITHOUT activating, so tesseract55.dll's neighbours
+    are otherwise unfindable) and sets TESSDATA_PREFIX. Mask is read at both
+    polarities × PROFANITY_OCR_ROTATIONS (0°/180° — participants write from the
+    far side), ~4 passes, once per capture. Matching (`find_profanity`, pure
+    text, no OCR needed) = whole-token match, then substring match on the
+    de-spaced text for entries ≥ PROFANITY_MIN_SUBSTRING_LEN (4) so "assist"
+    survives "ass"; text normalized for case, umlauts/ß, accents and leetspeak.
+    Wordlists = every `.txt` in `wordlists/` (seed en+de shipped; drop LDNOOBW
+    files in to extend, no code change). Any failure — no engine, no wordlist,
+    OCR error — returns `available=False, profane=False` so the pipeline still
+    runs. Deliberately NOT wired into Developer Mode (the operator decides) and
+    NOT exposed to MCP.
 
 ## Contained prototype: Dual-Cam Vision (NOT part of the two modes)
 `run_stitch.bat` → `stitch_main.py` → http://localhost:5006. Merges TWO D435i
@@ -194,8 +218,17 @@ never import `main` from these modules.
 - Pixels 640×480, v grows down (flipped to world/robot Y-up). Crops normalized
   [0,1]; stroke coords always shifted back to full frame before mapping.
 - Mesh files + UI depth params in mm; everything robot-side in m.
+- Console output goes through `module_trace.log(action, msg, extra=())`, which
+  prints the task line then `  └ a.py → b.py` naming the modules that served it;
+  `module_trace.print_banner()` prints the feature→modules table at startup with
+  ✓/· for actually-imported. Adding a pipeline stage means adding its chain to
+  `STAGES` (a test asserts every STAGES module exists in `FEATURES`). Only
+  process-lifecycle lines stay bare `print()`. Flags: SHOW_MODULE_BANNER /
+  SHOW_MODULE_TRACE.
 - `config.py` = every constant. `settings.json` = last robot IP + projector
-  corners. `environment.yml` = the committed conda-env recipe (env = `sandskript`).
+  corners. `environment.yml` = the committed conda-env recipe (env = `sandskript`;
+  pulls `tesseract` + `libcurl` from conda-forge for the profanity guard).
+  `wordlists/*.txt` = profanity seed lists (committed, not gitignored).
   Gitignored: `surfaces/`, `paths/`, `presets/`, `settings.json`, `.venv/`
   (retired but still ignored as a safety net).
 - Phases: idle → previewing → editing → captured → executing → done | error.
@@ -265,4 +298,16 @@ never import `main` from these modules.
 - `_segments_cross` deliberately requires strictly opposite orientation signs,
   so a stroke that merely touches or ends ON the connecting line (a T junction)
   does NOT earn the doubled join threshold — only one that truly passes through.
-- Test count reference: 252 unit (+6 hardware-gated). Keep green.
+- The profanity guard must FAIL OPEN, never closed: a missing Tesseract, a
+  missing wordlist or an OCR exception all return `available=False,
+  profane=False`. Blocking every drawing because an optional OCR install is
+  absent would take the installation down; keep that property.
+- `libcurl` is NOT optional in environment.yml — conda-forge's `tesseract`
+  package does not pull it in on Windows and `tesseract55.dll` fails to load
+  (exit 0xC0000135) without it. Symptom: guard silently reports "OCR engine
+  unavailable" and every drawing passes.
+- Never OCR the skeleton or the projected 3D strokes — 1-px hairlines read
+  terribly. The guard is on the thick mask for a reason.
+- Test count reference: 305 unit (+6 hardware-gated). The `text_guard` OCR
+  tests skip themselves when Tesseract is absent; the text-matching ones always
+  run. Keep green.

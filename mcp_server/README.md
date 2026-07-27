@@ -14,4 +14,7 @@ executing robot motion stays a human action in the browser.
 
 Note: while the Participant-Mode **Auto toggle is ON** (the ⧉ popup in the
 browser), the app refuses manual `capture_image`/`generate_path` calls — the
-automation owns the pipeline. `app_status` shows `participant_status`.
+automation owns the pipeline. `app_status` shows `participant_status`, which
+includes **`Invalid`** — the profanity guard rejected that drawing, so it was
+neither saved nor run. The guard is Participant-Mode only and has no MCP tool:
+`generate_path` via MCP is never gated by it.

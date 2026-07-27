@@ -19,7 +19,14 @@ Statuses (shown big in the popup, top-right):
   Sensing           frame cleared — capturing the averaged depth still
   Generating Paths  extracting strokes + projecting the toolpath
   Actuating         saving the bundle and running it on the robot
+  Invalid           the profanity guard rejected the drawing — nothing was
+                    saved or run. Sticky: it stays on screen (still armed) until
+                    the next participant trips the trigger.
 """
+
+# Statuses that mean "armed and watching the trigger". "Invalid" is included so
+# a rejected drawing keeps its verdict visible without disarming the machine.
+_ARMED = ("Auto On", "Invalid")
 
 
 class ParticipantAutomation:
@@ -53,7 +60,7 @@ class ParticipantAutomation:
         if not self.enabled or self.busy or below is None:
             return False
 
-        if self.status == "Auto On":
+        if self.status in _ARMED:
             if below:
                 self.status = "Alerted"
                 self.message = ""
@@ -80,4 +87,19 @@ class ParticipantAutomation:
         self.busy = False
         self._clear_count = 0
         self.status = "Auto On" if self.enabled else "Auto Off"
+        self.message = message
+
+    def reject(self, message: str = "") -> None:
+        """
+        The profanity guard refused the drawing: stop before Actuating, so
+        nothing is saved and nothing is sent to the robot.
+
+        Unlike ``finish`` the status stays "Invalid" rather than reverting to
+        "Auto On" — the verdict has to be readable by whoever just drew it. The
+        machine is still armed (see ``_ARMED``), so the next trigger proceeds
+        normally. Toggling Auto off and on also clears it.
+        """
+        self.busy = False
+        self._clear_count = 0
+        self.status = "Invalid" if self.enabled else "Auto Off"
         self.message = message

@@ -9,6 +9,12 @@ channels:
 dependencies:
   - python=3.11
   - pip
+  # OCR engine for the Participant-Mode profanity guard (text_guard.py). Kept
+  # as conda packages so it lives INSIDE the env — no OS-level install needed.
+  # libcurl is not optional: tesseract55.dll fails to load without it, and the
+  # tesseract package does not pull it in on Windows.
+  - tesseract
+  - libcurl
   - pip:
       - -r requirements.txt
       - -r requirements-dev.txt

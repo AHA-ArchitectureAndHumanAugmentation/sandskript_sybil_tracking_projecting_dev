@@ -32,6 +32,8 @@ Requires [Miniconda](https://docs.conda.io/en/latest/miniconda.html) (or Anacond
 | `numpy >= 1.26`            | Array operations                                             |
 | `trimesh >= 4.0` + `rtree` | Target-surface mesh loading and ray-casting                  |
 | `scipy >= 1.11`            | Rotations (surface-normal TCP orientations, retracts)        |
+| `tesseract` + `libcurl`    | OCR engine for the Participant-Mode profanity guard — conda packages, so no OS-level install (`libcurl` is required: `tesseract55.dll` will not load without it) |
+| `pytesseract >= 0.3.10`    | Python wrapper around the Tesseract binary above             |
 
 
 ---
@@ -45,6 +47,42 @@ python main.py        # or double-click run.bat
 ```
 
 The browser opens at `http://localhost:5005` in **Developer Mode** (the full manual UI); **Participant Mode** is its **⧉ popup** on the Depth viewport. Closing the last browser window stops the server.
+
+### Reading the terminal
+
+The console tells you **which `.py` file did what**, so you can go from a behaviour to its source without hunting. On startup it prints a map of every feature to its modules, with `✓` for those actually imported in this process and `·` for those not:
+
+```
+── Python modules by feature ──────────────────────────────────────────────
+   ✓ = imported in this process    · = not loaded
+
+   Core / server       ✓ main.py  ✓ server.py  ✓ config.py  ✓ settings.py
+   Capture             ✓ camera_thread.py  ✓ depth_extractor.py
+   Groove detection    ✓ depth_extractor.py
+   Stroke extraction   ✓ path_extractor.py
+   Surface mapping     ✓ surface.py  ✓ workspace.py  ✓ registration.py
+   Reach check         ✓ reach.py
+   Execution           ✓ path_executor.py  ✓ robot_controller.py
+   Export              ✓ path_export.py
+   Participant Mode    ✓ automation.py  ✓ text_guard.py
+```
+
+Then every task prints the module chain that served it on the line below, in call order:
+
+```
+Captured still: 640×480 (depth+colour) — ready for crop/adjust
+  └ camera_thread.py → depth_extractor.py
+Generated path: 12 strokes, 340 points
+  └ depth_extractor.py → path_extractor.py → surface.py → reach.py
+[executor] starting path: 12 strokes, 5% speed (0.050 m/s), offset 0.0 mm, ...
+  └ path_export.py → path_executor.py → robot_controller.py
+[participant] REJECTED: drawing reads as offensive text ('****')
+  └ text_guard.py → automation.py
+```
+
+The chain is *runtime-accurate*, not a fixed label: **Generate Path** shows `surface.py` with a mesh loaded and `workspace.py` in Test Mode, because that's what actually ran. Errors are attributed too, so a failure names its own module.
+
+Turn either off with `SHOW_MODULE_BANNER` / `SHOW_MODULE_TRACE` in `config.py`.
 
 ---
 
@@ -144,9 +182,9 @@ depth_cam-to-robot
 │     │
 │     ├─ 🟣 Participant Mode  —  ⧉ popup: Auto toggle + depth trigger run the pipeline hands-free
 │     │     modules
-│     │     ┌───────────────┐
-│     │     │ automation.py │  + the 🟢 pipeline modules it re-drives
-│     │     └───────────────┘
+│     │     ┌───────────────┐ ┌───────────────┐
+│     │     │ automation.py │ │ text_guard.py │  + the 🟢 pipeline modules it re-drives
+│     │     └───────────────┘ └───────────────┘
 │     │     UI
 │     │     ┌────────────────────────┐ ┌─────────────────────────┐
 │     │     │ viewer/depth_view.html │ │ viewer/depth_overlay.js │
@@ -203,6 +241,8 @@ depth_cam-to-robot
 depth_cam-to-robot/
 ├── main.py                  🟢🟣🟠 Entry point: shared state, callbacks, startup, TCP poller
 ├── automation.py            🟣 Participant-Mode state machine (trigger → auto pipeline)
+├── text_guard.py            🟣 Profanity guard: OCR the mask, reject offensive drawings
+├── module_trace.py          🟢🟣🟠 Console: startup feature→module table + per-task module trail
 ├── config.py                🟢🟣🟠🔵⚪🤖 All configurable parameters
 ├── server.py                🟢🟣🟠🤖 aiohttp server: MJPEG feeds, WebSocket, surface upload
 ├── camera_thread.py         🟢🟣🟠 DepthCameraThread: RealSense → depth/RGB/skeleton/mask streams
@@ -239,6 +279,7 @@ depth_cam-to-robot/
 ├── surfaces/                🟢🟣 Uploaded target meshes (gitignored)
 ├── paths/                   🟢🟣⚪ Saved toolpaths: dated folders of .script/.json/.png (gitignored)
 ├── presets/                 🟢 Saved Detection-Parameter files, named by date (gitignored)
+├── wordlists/               🟣 Profanity wordlists (en/de seed; add LDNOOBW .txt files here)
 ├── tests/                   🟢🟣🟠🔵⚪🤖 Unit + hardware-gated integration tests
 └── viewer/
     ├── index.html           🟢 Single-page app
@@ -373,9 +414,25 @@ The **⧉ Participant Mode popup** replaces the buttons with a **depth trigger**
 | **Sensing**          | Frame stayed clear for ~1 s → capturing the averaged depth still. |
 | **Generating Paths** | Extracting strokes and building the toolpath.                     |
 | **Actuating**        | Saving the bundle to `paths/` and running it on the robot.        |
+| **Invalid**          | The profanity guard rejected the drawing — nothing saved, nothing run. |
 
 
 After Actuating it returns to **Auto On**, ready for the next participant. While Auto is **ON**, the manual Capture / Retake / Generate / Run buttons grey out (the server also refuses them) — **Cancel stays active** as the emergency stop. Worth knowing: the automated run reuses the **same pipeline and current settings** as the Developer-Mode buttons (set everything up, then flip Auto ON; the Developer window shows each step live); an empty trigger box can never fire; without a robot the toolpath is still generated and **saved**, only the run is skipped; Auto stays ON server-side even if the popup closes; Sensing deliberately waits ~1 s so the averaged still doesn't contain the hand.
+
+#### Profanity guard
+
+Because Participant Mode runs unattended, it reads the sand before the robot does. Between *Generating Paths* and *Actuating*, the detected **mask** is passed through OCR (English + German); if what was raked spells something on a wordlist, the run stops: the chip turns red and reads **Invalid**, and **nothing is saved and nothing is sent to the robot**.
+
+**Invalid is sticky** — it stays on screen so whoever drew it sees the verdict, while the trigger stays armed. The next participant clears it; so does toggling Auto off and on.
+
+- **Where it looks** — the mask, not the skeleton. Thick strokes are what OCR can read; 1-px centrelines are not.
+- **What it reads** — the mask upright *and* upside down (participants write from the far side of the sandbox), in both black-on-white and white-on-black. Four quick passes, once per capture — no effect on the live feeds.
+- **What counts** — case, umlauts/ß, accents and leetspeak (`5H1T`) are all folded before matching, and OCR's broken spacing is handled by also testing the words run together. Entries under 4 letters only match as standalone words, so `assist` and `classic` are safe.
+- **Wordlists** — every `.txt` in `wordlists/`. A short English and German seed list ships with the repo; for real coverage drop in the [LDNOOBW](https://github.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words) `en` and `de` files (rename to anything ending `.txt`). All files are merged — no code change needed.
+
+**It fails open, on purpose.** If Tesseract is missing, the wordlist is empty, or OCR errors out, the drawing goes through and a line is printed to the console. An installation should not stop dead because an OCR dependency is absent. ⚠️ The flip side: this is a coarse filter, not a guarantee — handwriting in sand is genuinely hard to read, so expect misses. It does not detect offensive **symbols** at all, only text. Keep a human able to hit **Cancel**.
+
+Turn it off with `PROFANITY_CHECK_ENABLED = False` in `config.py`. It never runs in Developer Mode, where an operator is present to judge for themselves.
 
 ### Test mode (no robot)
 
@@ -484,6 +541,31 @@ All parameters live in `config.py`.
 | `JOIN_DISTANCE_MM`                   | `0.0` mm        | Default endpoint-join distance; `0` = joining off (Distance Threshold box overrides per generate) |
 | `JOIN_DISTANCE_MIN_MM` / `MAX_MM`    | `0` / `200` mm  | Distance Threshold box range                                     |
 | `JOIN_CROSSING_FACTOR`               | `2.0`           | Threshold multiplier when another stroke crosses the connecting line |
+
+
+
+
+#### Profanity guard (Participant Mode only)
+
+
+| Variable                      | Default      | Description                                                        |
+| ----------------------------- | ------------ | ------------------------------------------------------------------ |
+| `PROFANITY_CHECK_ENABLED`     | `True`       | Master switch; `False` skips the check entirely                    |
+| `PROFANITY_LANGS`             | `"eng+deu"`  | Tesseract language packs (both ship inside the conda env)          |
+| `PROFANITY_WORDLIST_DIR`      | `wordlists`  | Folder scanned for `*.txt` wordlists                               |
+| `PROFANITY_MIN_SUBSTRING_LEN` | `4`          | Entries this long also match inside run-together words; shorter ones must stand alone |
+| `PROFANITY_OCR_ROTATIONS`     | `(0, 180)`   | Angles the mask is re-read at (180° = written from the far side)   |
+
+
+
+
+#### Console output
+
+
+| Variable             | Default | Description                                                          |
+| -------------------- | ------- | -------------------------------------------------------------------- |
+| `SHOW_MODULE_BANNER` | `True`  | Print the feature→modules table at startup                           |
+| `SHOW_MODULE_TRACE`  | `True`  | Print the `└ a.py → b.py` module trail under each task line          |
 
 
 

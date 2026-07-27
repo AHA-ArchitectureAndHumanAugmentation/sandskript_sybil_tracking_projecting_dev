@@ -96,3 +96,55 @@ class TestPipelineLifecycle:
         assert a.status == "Sensing"          # pipeline keeps its stage...
         a.finish("Done.")
         assert a.status == "Auto Off"              # ...but re-arms disabled
+
+
+class TestProfanityRejection:
+    """reject() = the profanity guard refused the drawing (Participant Mode)."""
+
+    def test_reject_sets_invalid_and_clears_busy(self):
+        a = make(clear_ticks=1)
+        a.tick(True); a.tick(False)           # busy, Sensing
+        a.stage("Generating Paths")
+        a.reject("Drawing rejected.")
+        assert a.status == "Invalid"
+        assert a.busy is False
+        assert a.message == "Drawing rejected."
+
+    def test_invalid_is_sticky_until_the_next_trigger(self):
+        """The verdict has to stay readable — it must not revert to Auto On."""
+        a = make(clear_ticks=1)
+        a.tick(True); a.tick(False)
+        a.reject("nope")
+        assert a.tick(False) is False         # quiet frames leave it alone
+        assert a.status == "Invalid"
+
+    def test_still_armed_after_reject(self):
+        a = make(clear_ticks=1)
+        a.tick(True); a.tick(False)
+        a.reject("nope")
+        a.tick(True)                          # next participant steps in
+        assert a.status == "Alerted"
+        assert a.tick(False) is True          # pipeline runs again normally
+
+    def test_reject_while_disabled_goes_off(self):
+        a = make(clear_ticks=1)
+        a.tick(True); a.tick(False)
+        a.set_enabled(False)
+        a.reject("nope")
+        assert a.status == "Auto Off"
+
+    def test_toggling_auto_clears_the_invalid_verdict(self):
+        a = make(clear_ticks=1)
+        a.tick(True); a.tick(False)
+        a.reject("nope")
+        a.set_enabled(False)
+        a.set_enabled(True)
+        assert a.status == "Auto On"
+        assert a.message == ""
+
+    def test_finish_still_returns_to_auto_on(self):
+        """A normal run is unaffected by the new Invalid status."""
+        a = make(clear_ticks=1)
+        a.tick(True); a.tick(False)
+        a.finish("Done.")
+        assert a.status == "Auto On"
