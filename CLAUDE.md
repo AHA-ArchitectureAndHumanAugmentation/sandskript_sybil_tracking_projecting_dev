@@ -28,12 +28,12 @@ robot moves.
   last browser tab kills the server (deliberate, via SIGINT).
 - Python env = the **`sandskript` conda env** (recipe: `environment.yml`;
   recreate with `conda env create -f environment.yml`). On this machine
-  ENVPY = `C:\Users\staff\miniconda3\envs\sandskript\python.exe` — the .bat
+  ENVPY = `C:\Users\linfo\miniconda3\envs\sandskript\python.exe` — the .bat
   files and `.mcp.json` hardcode it; update those paths on a new machine.
   The recipe pulls python/pip from **conda-forge** (not `defaults`) so newer
   conda's Anaconda-ToS gate doesn't block env creation; keep the base/user
   `.condarc` on conda-forge too. If `conda` isn't found in PowerShell, run
-  `conda init powershell` once (conda lives at `C:\Users\staff\miniconda3`).
+  `conda init powershell` once (conda lives at `C:\Users\linfo\miniconda3`).
   Never bare `pip` (broken launcher risk — use `<ENVPY> -m pip`). The Intel
   RealSense USB driver is an OS-level install, outside the env. The old
   `.venv` is retired.

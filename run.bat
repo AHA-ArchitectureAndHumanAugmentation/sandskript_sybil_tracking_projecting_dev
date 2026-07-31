@@ -18,7 +18,7 @@ REM     conda env create -f environment.yml
 REM then update CONDA_PY below to that machine's env path).
 REM NOTE: the Intel RealSense USB driver is an OS-level install, NOT part of
 REM the conda env - install it separately on a new machine.
-set "CONDA_PY=C:\Users\staff\miniconda3\envs\sandskript\python.exe"
+set "CONDA_PY=C:\Users\linfo\miniconda3\envs\sandskript\python.exe"
 if exist "%CONDA_PY%" (
     "%CONDA_PY%" main.py
 ) else (

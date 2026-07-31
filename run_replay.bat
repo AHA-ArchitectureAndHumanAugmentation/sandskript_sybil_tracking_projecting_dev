@@ -13,7 +13,7 @@ echo (A browser tab will open at http://localhost:5007)
 echo.
 
 REM Hardcoded conda environment (see run.bat / environment.yml).
-set "CONDA_PY=C:\Users\staff\miniconda3\envs\sandskript\python.exe"
+set "CONDA_PY=C:\Users\linfo\miniconda3\envs\sandskript\python.exe"
 if exist "%CONDA_PY%" (
     "%CONDA_PY%" replay_main.py
 ) else (
