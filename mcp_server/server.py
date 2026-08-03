@@ -134,7 +134,7 @@ async def generate_path(adjustments: dict | None = None,
 
 @mcp.tool()
 async def load_surface(stl_path: str) -> dict:
-    """Upload an STL/OBJ target surface (Rhino export, millimetres) into the app; returns name/faces/bbox."""
+    """Add an STL/OBJ target surface (Rhino export, millimetres) to the app's surface scene. CUMULATIVE: each call adds a part, keeping the position authored in the file, and the loaded surfaces act as one target (loading the same file name again replaces that part). Returns name/faces/bbox of the combined scene plus count/parts."""
     p = Path(stl_path)
     if not p.exists():
         return _err(f"file not found: {stl_path}")

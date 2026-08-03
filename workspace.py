@@ -92,6 +92,22 @@ class WorkspaceConfig:
         }
 
 
+def scene_mm_per_px(workspace, surface_model=None) -> Optional[float]:
+    """
+    Millimetres per depth pixel for the mm-based groove filters and mm spacings
+    (Spacing, Distance Threshold). A loaded surface takes precedence over the
+    workspace — stroke mapping does the same (a surface replaces the flat
+    workspace) — so a mm entered in the UI stays a mm on whatever the strokes
+    actually land on. Duck-typed: ``surface_model`` only needs
+    ``drawing_mm_per_px``, ``workspace`` only ``x_extent``.
+    """
+    if surface_model is not None:
+        return surface_model.drawing_mm_per_px(DEPTH_WIDTH, DEPTH_HEIGHT)
+    if workspace is not None:
+        return (workspace.x_extent / DEPTH_WIDTH) * 1000.0
+    return None
+
+
 # ── Vector helpers (avoid heavy numpy import) ─────────────────────────────────
 
 def _dot(a: list[float], b: list[float]) -> float:

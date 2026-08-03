@@ -92,6 +92,7 @@ class Server:
         on_surface_upload: Optional[Callable] = None,
         on_set_surface_pose: Optional[Callable] = None,
         on_clear_surface: Optional[Callable] = None,
+        on_remove_surface: Optional[Callable] = None,
         on_depth_overlay_params: Optional[Callable] = None,
         on_register_freedrive: Optional[Callable] = None,
         on_register_corner: Optional[Callable] = None,
@@ -119,6 +120,7 @@ class Server:
         self._on_surface_upload = on_surface_upload
         self._on_set_surface_pose = on_set_surface_pose
         self._on_clear_surface = on_clear_surface
+        self._on_remove_surface = on_remove_surface
         self._on_depth_overlay_params = on_depth_overlay_params
         self._on_register_freedrive = on_register_freedrive
         self._on_register_corner = on_register_corner
@@ -221,6 +223,7 @@ class Server:
                 "stroke_count": len(s.get("strokes", [])),
                 "strokes_surface": s.get("strokes_surface", False),
                 "surface": (s.get("surface_info") or {}).get("name"),
+                "surface_count": (s.get("surface_info") or {}).get("count", 0),
                 "reference_set": s.get("reference_depth") is not None,
                 "projection_clients": s.get("projection_clients", 0),
                 "participant_status": s.get("participant_status", "Off"),
@@ -493,6 +496,10 @@ class Server:
         elif msg_type == "clear_surface":
             if self._on_clear_surface:
                 asyncio.create_task(self._on_clear_surface())
+
+        elif msg_type == "remove_surface":
+            if self._on_remove_surface:
+                asyncio.create_task(self._on_remove_surface(data.get("params", {})))
 
         elif msg_type == "tool_hello":
             # External tool (MCP) socket: exempt from shutdown-on-last-disconnect.

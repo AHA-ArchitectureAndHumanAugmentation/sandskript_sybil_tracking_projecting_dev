@@ -605,7 +605,21 @@ button:disabled { opacity: 0.3; cursor: not-allowed; }
   letter-spacing: 0.04em;
 }
 
-#preset-list, #register-list { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+#preset-list, #register-list, #surface-list { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+/* Loaded-surface list: one row per part, ✕ removes just that one. */
+#surface-list { margin: 6px 0 0; padding: 0; }
+#surface-list:empty { display: none; }
+#surface-list .preset-item { cursor: default; }
+.surface-del {
+  background: none;
+  border: none;
+  color: #888;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+.surface-del:hover { color: #ff6b6b; }
 .preset-item {
   display: flex;
   align-items: center;

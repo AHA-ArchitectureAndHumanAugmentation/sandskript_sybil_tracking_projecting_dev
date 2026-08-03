@@ -319,6 +319,104 @@ class SurfaceModel:
         return pts, nrm
 
 
+# ── Multi-surface scene ───────────────────────────────────────────────────────
+class SurfaceScene(SurfaceModel):
+    """
+    One or more meshes treated as a SINGLE drawing target.
+
+    Each part keeps the coordinates authored in its STL/OBJ — nothing is
+    re-centred — so several surfaces exported from one Rhino document arrive in
+    their true relative positions and stay there. The parts are concatenated
+    into one mesh, and that union is what every downstream stage sees:
+
+      • the drawing is fitted across the union's footprint (one drawing spread
+        over the whole assembly, not one copy per part);
+      • rays hit whichever part lies nearest the draw side, so overlapping or
+        stacked pieces resolve naturally;
+      • ``corner_points`` come from the union's bounding box, so a corner→TCP
+        registration produces ONE pose that moves the whole assembly rigidly —
+        the parts can never drift apart.
+
+    Being a SurfaceModel subclass, a scene is a drop-in replacement wherever a
+    single surface was used before (projection, mm-per-px, registration).
+    """
+
+    def __init__(self, parts: list[SurfaceModel]) -> None:
+        if not parts:
+            raise ValueError("a surface scene needs at least one part")
+        self.parts = list(parts)
+        if len(self.parts) == 1:
+            mesh, name = self.parts[0].mesh, self.parts[0].name
+        else:
+            if not _HAVE_TRIMESH:
+                raise RuntimeError("trimesh is required to combine surfaces.")
+            mesh = _trimesh.util.concatenate([p.mesh for p in self.parts])
+            name = f"{len(self.parts)} surfaces"
+        super().__init__(mesh, name)
+
+    @classmethod
+    def load(cls, path: str | Path, units_to_m: float = SURFACE_UNITS_TO_M) -> "SurfaceScene":
+        """Load one file as a single-part scene."""
+        return cls([SurfaceModel.load(path, units_to_m)])
+
+    @classmethod
+    def combine(cls, existing: "SurfaceScene | None", model: SurfaceModel) -> "SurfaceScene":
+        """Add ``model`` to ``existing`` (or start a new scene when None)."""
+        if existing is None:
+            return cls([model])
+        return existing.with_part(model)
+
+    def with_part(self, model: SurfaceModel) -> "SurfaceScene":
+        """
+        New scene with ``model`` added. A part with the same file name is
+        REPLACED in place, so re-exporting a mesh from Rhino and loading it
+        again updates that surface instead of stacking a duplicate on top.
+        Returns a new object rather than mutating: worker threads may be
+        projecting through the current scene while this runs.
+        """
+        parts = list(self.parts)
+        for i, p in enumerate(parts):
+            if p.name == model.name:
+                parts[i] = model
+                return SurfaceScene(parts)
+        parts.append(model)
+        return SurfaceScene(parts)
+
+    def without_part(self, index: int) -> "SurfaceScene | None":
+        """New scene minus one part; None once the last one is removed."""
+        if not 0 <= index < len(self.parts):
+            raise IndexError(f"no surface at index {index}")
+        parts = [p for i, p in enumerate(self.parts) if i != index]
+        return SurfaceScene(parts) if parts else None
+
+    def part_infos(self) -> list[dict]:
+        """Per-part summary for the browser list (index = removal index)."""
+        return [
+            {
+                "index": i,
+                "name": p.name,
+                "faces": int(len(p.mesh.faces)),
+                "bbox": {
+                    "min": [round(float(x), 4) for x in p.mesh.bounds[0]],
+                    "max": [round(float(x), 4) for x in p.mesh.bounds[1]],
+                },
+            }
+            for i, p in enumerate(self.parts)
+        ]
+
+    def info(self) -> dict:
+        d = super().info()
+        d["count"] = len(self.parts)
+        d["parts"] = self.part_infos()
+        return d
+
+    def mesh_payload(self) -> dict:
+        """Union geometry + corners (as for one surface), plus the parts list."""
+        d = super().mesh_payload()
+        d["parts"] = self.part_infos()
+        return d
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 def _flush(out: list, seg_pts: list, seg_nrm: list) -> None:
     """Close a contiguous run of hits into a stroke with chained orientations."""

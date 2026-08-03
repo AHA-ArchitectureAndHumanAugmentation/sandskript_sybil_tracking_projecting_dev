@@ -37,7 +37,7 @@ robot moves.
   Never bare `pip` (broken launcher risk — use `<ENVPY> -m pip`). The Intel
   RealSense USB driver is an OS-level install, outside the env. The old
   `.venv` is retired.
-- Unit tests: `<ENVPY> -m pytest -q -m "not integration"` (305, no
+- Unit tests: `<ENVPY> -m pytest -q -m "not integration"` (320, no
   hardware). Integration: `-m integration`, needs RealSense/robot + TEST_ROBOT_IP.
 - No CLI modes. Hardware vs no-robot is in the UI: "Test Mode (no robot)" button
   unlocks capture with a synthetic workspace; Run stays gated on a robot connection.
@@ -80,7 +80,18 @@ robot moves.
 4. **Mapping** `surface.SurfaceModel.project_strokes` — STL/OBJ (Rhino, mm→m) via
    trimesh; camera frame fitted centred (aspect kept) onto the footprint ⟂ the
    mesh's dominant normal; ray-cast; TCP ⟂ surface with minimal twist; offset
-   along outward normal. Draw side: authored mesh normals, EXCEPT steep
+   along outward normal. **Multi-surface**: Load Surface is CUMULATIVE —
+   `surface.SurfaceScene` (a SurfaceModel subclass, so drop-in everywhere) holds
+   the parts and hands downstream ONE concatenated mesh. Each file keeps the
+   coordinates authored in it (nothing is re-centred), so surfaces exported from
+   one Rhino document assemble themselves; the drawing is fitted across the
+   UNION's footprint (one drawing over the assembly, not one per part), rays hit
+   whichever part is nearest the draw side, and corners come from the union bbox
+   so ONE `SurfacePose` — sliders or registration — moves everything rigidly.
+   Re-loading the same file NAME replaces that part in place; `with_part`/
+   `without_part` return NEW scenes (worker threads may hold the old one);
+   removing the last part clears the scene.
+   Draw side: authored mesh normals, EXCEPT steep
    surfaces (>~45° from horizontal) always draw on the side facing the robot
    base wherever the pose puts them (`draw_side_flip`) — so positive offset
    moves the TCP toward the robot and never behind a wall. Placement = `SurfacePose` (m + XYZ euler deg, base frame),
@@ -93,6 +104,9 @@ robot moves.
    nearest the bbox corners, shipped in `mesh_payload()["corners"]`, same
    indices browser + server). No camera↔robot calibration exists. Planar fallback:
    `path_extractor.pixels_to_robot_coords` + `workspace.WorkspaceConfig` (Test Mode).
+   The mm→px scale for all mm-based filters/spacings = `workspace.scene_mm_per_px`:
+   surface first, workspace fallback — SAME precedence as stroke mapping, so a mm
+   in the UI is a mm on whatever the strokes land on (Test Mode + surface included).
 5. **Reach check** `reach.reach_flags` — envelope only (1.30 m sphere − 0.18 m axis
    cylinder). No IK/joint-limit/collision model. Red segments in preview.
 6. **Execution** `path_executor.PathExecutor` — per stroke: retract along tool axis
@@ -109,8 +123,12 @@ robot moves.
 8. **Server/UI** `server.py` (aiohttp) + `viewer/` — MJPEG: /depth /rgb
    /depth/grooves /depth/mask /depth/mask/full /depth/cropped (colorized depth
    restricted to the Developer-Mode crop; composed only while a /depths popup
-   is connected); WS /ws (JSON); POST /surface/upload;
-   GET /status (compact state JSON for tools); GET/POST /presets + GET
+   is connected); WS /ws (JSON); POST /surface/upload (ADDS a part to the scene
+   — see stage 4; the browser file input is `multiple` and posts them one at a
+   time, since each upload is a read-modify-write of the scene, serialized
+   server-side by `main._surface_lock`);
+   GET /status (compact state JSON for tools; `surface` = scene name,
+   `surface_count` = parts loaded); GET/POST /presets + GET
    /presets/{name} (Detection-Parameter slider presets; saved as
    `presets/<date_time>.json` but ANY .json in the folder loads — the GET
    guard (`_safe_preset_path`) allows custom-renamed files, rejecting only
@@ -240,7 +258,9 @@ never import `main` from these modules.
   `run{params:{speed_pct,offset_mm,safety_mm,blend_mm}}`, `cancel`,
   `save_path{params:{speed_pct,offset_mm,safety_mm,blend_mm,image}}`,
   `set_groove_params{params}`, `set_reference`/`clear_reference`,
-  `set_surface_pose{params:{pose,offset_mm}}`, `clear_surface`,
+  `set_surface_pose{params:{pose,offset_mm}}`, `clear_surface` (ALL parts),
+  `remove_surface{params:{index}}` (one part; index = `info.parts[].index`,
+  out-of-range/missing is a no-op; removing the last part clears the scene),
   `projection_hello`, `projection_corners{corners}`,
   `depth_overlay_hello`, `depth_overlay_params{params:{interval_mm}}`,
   `register_freedrive{params:{on}}`, `register_corner{params:{corner_index}}`,
@@ -256,7 +276,10 @@ never import `main` from these modules.
   + `exec{speed_pct,offset_mm,safety_mm,blend_mm}` — the browser restores its
   controls from these on (re)open), `capture_result{stroke_count,point_count,strokes,
   reach_flags,reach_out,skeleton,exec_viz:{blend_m,reach_m,min_reach_m,
-  spacing_mm,join_mm}}`, `still`, `preview`, `surface_status`, `save_result`,
+  spacing_mm,join_mm}}`, `still`, `preview`,
+  `surface_status{loaded,info,pose,offset_mm,mesh,message}` (`info.count` +
+  `info.parts[{index,name,faces,bbox}]` = the loaded parts; `mesh` = the
+  COMBINED geometry + union corners), `save_result`,
   `reference_status`, `execution_update`, `connection_result`,
   `register_result{success,message,pose,error}`,
   `depth_labels{labels:[[u,v,mm],...],size:[w,h]}` (only to /depths popups,
@@ -282,6 +305,13 @@ never import `main` from these modules.
   otherwise. Keep that wait ≥ the buffer length.
 - `movep` orientation interp assumes neighbouring waypoints don't flip the
   wrist — surface projection chains tool-X for minimal twist; keep that property.
+- Multi-surface parts are NEVER re-centred — preserving the authored coordinates
+  is the whole point (that is what keeps a multi-part Rhino export assembled).
+  Don't "helpfully" normalize a part's origin, and don't give parts individual
+  poses: one scene = one `SurfacePose`, which is what makes corner registration
+  move the whole assembly. Note the drawing still fits the UNION bbox aspect, so
+  parts placed far apart leave the centred drawing hovering over the gap between
+  them (rays miss → empty path); that is correct "contain" behaviour, not a bug.
 - Live drawing and the saved path.script both use movep with the exec-bar
   Radius blend — keep them in sync (that equivalence is the point of the movep
   executor). Both clamp via `path_export.stroke_blend` (45% of the stroke's
@@ -308,6 +338,6 @@ never import `main` from these modules.
   unavailable" and every drawing passes.
 - Never OCR the skeleton or the projected 3D strokes — 1-px hairlines read
   terribly. The guard is on the thick mask for a reason.
-- Test count reference: 305 unit (+6 hardware-gated). The `text_guard` OCR
+- Test count reference: 320 unit (+6 hardware-gated). The `text_guard` OCR
   tests skip themselves when Tesseract is absent; the text-matching ones always
   run. Keep green.

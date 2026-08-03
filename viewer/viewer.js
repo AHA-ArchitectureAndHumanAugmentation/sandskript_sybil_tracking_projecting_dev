@@ -1337,19 +1337,27 @@ function sendSurfacePose() {
   }, 150);
 }
 
+/* Uploads add to the scene, so several files can be picked at once. They go up
+   ONE AT A TIME on purpose: each upload reads the current scene and writes back
+   the combined one, so parallel posts could drop a part. */
 async function uploadSurface(e) {
-  const file = e.target.files && e.target.files[0];
-  if (!file) return;
-  setHeaderStatus("robot", true, `Uploading ${file.name}…`);
-  const form = new FormData();
-  form.append("file", file);
-  try {
-    const res = await fetch("/surface/upload", { method: "POST", body: form });
-    const out = await res.json();
-    if (!out.ok) throw new Error(out.error || "upload failed");
-    // The server broadcasts surface_status (with the mesh) to all clients.
-  } catch (err) {
-    setHeaderStatus("robot", false, "Surface upload failed: " + err.message);
+  const files = Array.from(e.target.files || []);
+  if (!files.length) return;
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    const of = files.length > 1 ? ` (${i + 1}/${files.length})` : "";
+    setHeaderStatus("robot", true, `Uploading ${file.name}…${of}`);
+    const form = new FormData();
+    form.append("file", file);
+    try {
+      const res = await fetch("/surface/upload", { method: "POST", body: form });
+      const out = await res.json();
+      if (!out.ok) throw new Error(out.error || "upload failed");
+      // The server broadcasts surface_status (with the combined mesh) to all clients.
+    } catch (err) {
+      setHeaderStatus("robot", false, `Surface upload failed (${file.name}): ` + err.message);
+      break;
+    }
   }
   e.target.value = "";   // allow re-selecting the same file
 }
@@ -1361,7 +1369,9 @@ function handleSurfaceStatus(data) {
     if (data.pose) setSurfaceSliders(data.pose, data.offset_mm);
     const i = data.info || {};
     const size = i.bbox ? `${i.bbox.size[0]}×${i.bbox.size[1]}×${i.bbox.size[2]} m` : "";
-    status.textContent = `Loaded: ${i.name || "surface"} — ${i.faces || "?"} faces, ${size}`;
+    const what = (i.count > 1) ? `${i.count} surfaces combined` : (i.name || "surface");
+    status.textContent = `Loaded: ${what} — ${i.faces || "?"} faces, ${size}`;
+    renderSurfaceList(i.parts || []);
     showOverlay(false);   // surface replaces the P0/Px/Py calibration
   } else {
     if (surfaceGroup) { scene.remove(surfaceGroup); surfaceGroup = null; }
@@ -1372,9 +1382,38 @@ function handleSurfaceStatus(data) {
     hoveredCorner = -1;
     canvas.style.cursor = "";
     status.textContent = "No surface loaded.";
+    renderSurfaceList([]);
   }
   if (data.message) setHeaderStatus("robot", true, data.message);
   applySurfacePose(readSurfacePose());
+}
+
+/* One row per loaded surface. The ✕ removes only that part (remove_surface);
+   the indices come from the server, so they always match its parts list. */
+function renderSurfaceList(parts) {
+  const list = document.getElementById("surface-list");
+  list.innerHTML = "";
+  if (parts.length < 2) return;    // a single surface is already named above
+  parts.forEach(p => {
+    const li = document.createElement("li");
+    li.className = "preset-item";
+    const name = document.createElement("span");
+    name.className = "preset-name";
+    name.textContent = p.name;
+    const right = document.createElement("span");
+    right.className = "preset-time";
+    right.textContent = `${p.faces} faces`;
+    const del = document.createElement("button");
+    del.className = "surface-del";
+    del.textContent = "✕";
+    del.title = `Remove ${p.name}`;
+    del.addEventListener("click", () =>
+      sendWS({ type: "remove_surface", params: { index: p.index } }));
+    li.appendChild(name);
+    li.appendChild(right);
+    li.appendChild(del);
+    list.appendChild(li);
+  });
 }
 
 function setSurfaceSliders(pose, offsetMm) {

@@ -188,13 +188,19 @@
         workspace. Mesh your Rhino surface and export <b>STL/OBJ in millimetres</b>, then load
         it here. The drawing is shone straight down onto the surface; the TCP stays
         perpendicular to it. With no surface loaded, paths map to the flat workspace as before.</p>
+      <p class="adj-note"><b>Load more than one</b> to build a multi-part target: each file keeps
+        the position it was authored at, so surfaces exported from the same Rhino document
+        assemble themselves. They then behave as ONE surface — the drawing spreads across all
+        of them, and the pose sliders and <b>Register Corner → TCP</b> move them together.
+        Loading a file again replaces that part.</p>
       <div class="adj-row">
-        <input type="file" id="surface-file" accept=".stl,.obj" class="hidden" />
+        <input type="file" id="surface-file" accept=".stl,.obj" class="hidden" multiple />
         <button id="btn-surface-load" class="adj-btn">Load Surface (STL/OBJ)</button>
       </div>
       <div class="adj-row">
-        <button id="btn-surface-clear" class="adj-btn">Clear Surface</button>
+        <button id="btn-surface-clear" class="adj-btn">Clear All Surfaces</button>
       </div>
+      <ul id="surface-list"></ul>
       <p class="adj-note" id="surface-status">No surface loaded.</p>
 
       <div class="adj-row" data-skey="tx" data-min="-1.5" data-max="1.5" data-step="0.005" data-default="0.4">

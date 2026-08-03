@@ -7,7 +7,7 @@ import pytest
 import trimesh
 from scipy.spatial.transform import Rotation
 
-from surface import SurfaceModel, SurfacePose
+from surface import SurfaceModel, SurfacePose, SurfaceScene
 
 W, H = 640, 480   # drawing frame (4:3 — matches the 0.4×0.3 m test meshes)
 
@@ -263,3 +263,115 @@ class TestLoadAndPayload:
         payload = model.mesh_payload()
         assert payload["corners"] == model.corner_points()
         assert len(payload["corners"]) == 4          # flat sheet → 4 corners
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-surface scene: several files loaded together behave as ONE target
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _plane_at(x0: float, y0: float, name: str) -> SurfaceModel:
+    """0.4×0.3 m flat sheet whose authored origin is (x0, y0) — the position
+    the file carries, exactly what a second Rhino export would bring along."""
+    v = np.array([[x0, y0, 0], [x0 + 0.4, y0, 0],
+                  [x0 + 0.4, y0 + 0.3, 0], [x0, y0 + 0.3, 0]], dtype=float)
+    f = np.array([[0, 1, 2], [0, 2, 3]])
+    return SurfaceModel(trimesh.Trimesh(vertices=v, faces=f, process=False), name)
+
+
+class TestSurfaceScene:
+
+    def test_single_part_matches_a_plain_model(self):
+        scene = SurfaceScene([_flat_plane()])
+        assert scene.name == "flat"
+        assert scene.info()["count"] == 1
+        assert scene.corner_points() == _flat_plane().corner_points()
+
+    def test_parts_keep_their_authored_positions(self):
+        # Two sheets authored side by side must stay side by side: the union
+        # spans both, nothing is re-centred onto a common origin.
+        scene = SurfaceScene([_plane_at(0.0, 0.0, "a"), _plane_at(1.0, 0.0, "b")])
+        lo, hi = scene.mesh.bounds
+        assert lo[0] == pytest.approx(0.0)
+        assert hi[0] == pytest.approx(1.4)           # 1.0 + 0.4, gap preserved
+        assert hi[1] == pytest.approx(0.3)
+
+    def test_combine_appends_and_reload_replaces(self):
+        scene = SurfaceScene.combine(None, _plane_at(0, 0, "a.stl"))
+        scene = SurfaceScene.combine(scene, _plane_at(1, 0, "b.stl"))
+        assert [p.name for p in scene.parts] == ["a.stl", "b.stl"]
+        # Same file name again → replaces that part in place, no duplicate.
+        scene = SurfaceScene.combine(scene, _plane_at(0, 0.5, "a.stl"))
+        assert [p.name for p in scene.parts] == ["a.stl", "b.stl"]
+        assert len(scene.parts) == 2
+
+    def test_with_part_does_not_mutate_the_original(self):
+        # Worker threads may be projecting through the old scene.
+        first = SurfaceScene([_plane_at(0, 0, "a")])
+        second = first.with_part(_plane_at(1, 0, "b"))
+        assert len(first.parts) == 1 and len(second.parts) == 2
+
+    def test_without_part_and_emptying(self):
+        scene = SurfaceScene([_plane_at(0, 0, "a"), _plane_at(1, 0, "b")])
+        left = scene.without_part(0)
+        assert [p.name for p in left.parts] == ["b"]
+        assert left.without_part(0) is None          # last one removed
+        with pytest.raises(IndexError):
+            scene.without_part(5)
+
+    def test_drawing_spans_the_whole_assembly(self):
+        # Two tiles laid edge to edge (0.8×0.3 m total). ONE drawing is fitted
+        # across the union — not one copy per part — so a horizontal line
+        # crosses from tile A into tile B.
+        scene = SurfaceScene([_plane_at(0.0, 0.0, "a"), _plane_at(0.4, 0.0, "b")])
+        out = scene.project_strokes([[(5, 240), (635, 240)]], W, H, IDENTITY)
+        xs = [p[0] for stroke in out for p in stroke]
+        assert min(xs) < 0.4 < max(xs)          # lands on both tiles
+        # The aspect-preserving fit centres the 4:3 frame in the union bbox.
+        assert min(xs) >= 0.2 - 1e-6 and max(xs) <= 0.6 + 1e-6
+
+    def test_separated_parts_leave_a_real_gap(self):
+        # Parts far apart stay apart, and rays into the empty space between
+        # them simply miss — the drawing falls off the edges as with one mesh.
+        scene = SurfaceScene([_plane_at(0.0, 0.0, "a"), _plane_at(1.0, 0.0, "b")])
+        out = scene.project_strokes([[(5, 240), (635, 240)]], W, H, IDENTITY)
+        assert out == []                        # the centred fit sits in the gap
+
+    def test_corners_come_from_the_union_so_registration_moves_all(self):
+        scene = SurfaceScene([_plane_at(0.0, 0.0, "a"), _plane_at(1.0, 0.0, "b")])
+        corners = scene.corner_points()
+        xs = [c[0] for c in corners]
+        assert min(xs) == pytest.approx(0.0)
+        assert max(xs) == pytest.approx(1.4)         # spans both parts
+        # One pose moves the assembly rigidly → the gap between the parts is
+        # unchanged after placement.
+        pose = SurfacePose(tx=0.5, ty=-0.2, tz=0.1, rz=30.0)
+        m = pose.matrix()
+        moved = scene.mesh.vertices @ m[:3, :3].T + m[:3, 3]
+        d_before = np.linalg.norm(scene.mesh.vertices[0] - scene.mesh.vertices[-1])
+        d_after = np.linalg.norm(moved[0] - moved[-1])
+        assert d_after == pytest.approx(d_before)
+
+    def test_payload_and_info_carry_the_parts_list(self):
+        scene = SurfaceScene([_plane_at(0, 0, "a.stl"), _plane_at(1, 0, "b.stl")])
+        info = scene.info()
+        assert info["count"] == 2
+        assert [p["index"] for p in info["parts"]] == [0, 1]
+        assert [p["name"] for p in info["parts"]] == ["a.stl", "b.stl"]
+        payload = scene.mesh_payload()
+        assert payload["corners"] == scene.corner_points()
+        assert max(payload["faces"]) < len(payload["vertices"]) // 3
+        assert len(payload["parts"]) == 2
+
+    def test_empty_scene_rejected(self):
+        with pytest.raises(ValueError):
+            SurfaceScene([])
+
+    def test_load_returns_a_one_part_scene(self, tmp_path):
+        v = np.array([[0, 0, 0], [400, 0, 0], [400, 300, 0], [0, 300, 0]], dtype=float)
+        f = np.array([[0, 1, 2], [0, 2, 3]])
+        p = tmp_path / "sheet_mm.stl"
+        trimesh.Trimesh(vertices=v, faces=f, process=False).export(p)
+        scene = SurfaceScene.load(p)
+        assert isinstance(scene, SurfaceScene)
+        assert len(scene.parts) == 1
+        assert abs(scene.info()["bbox"]["size"][0] - 0.4) < 1e-6

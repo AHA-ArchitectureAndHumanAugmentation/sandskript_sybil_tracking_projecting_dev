@@ -40,8 +40,8 @@ from path_export import save_bundle
 from robot_controller import RobotController
 from server import Server
 from settings import load_settings, save_settings
-from surface import SurfaceModel, SurfacePose
-from workspace import WorkspaceConfig
+from surface import SurfaceModel, SurfacePose, SurfaceScene
+from workspace import WorkspaceConfig, scene_mm_per_px
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 shared_state: dict = {
@@ -187,16 +187,8 @@ async def on_simulate_workspace() -> None:
 
 # ── Capture image / Edit / Generate path callbacks ───────────────────────────
 def _mm_per_px(workspace, surface_model=None) -> float | None:
-    """
-    Millimetres per depth pixel for the mm-based groove filters. Planar mode
-    derives it from the workspace calibration; surface mode from the drawing's
-    fit onto the mesh — so neither strictly requires the other.
-    """
-    if workspace is not None:
-        return (workspace.x_extent / DEPTH_WIDTH) * 1000.0
-    if surface_model is not None:
-        return surface_model.drawing_mm_per_px(DEPTH_WIDTH, DEPTH_HEIGHT)
-    return None
+    """Scene scale for the mm-based filters/spacings — see workspace.scene_mm_per_px."""
+    return scene_mm_per_px(workspace, surface_model)
 
 
 async def on_set_groove_params(params: dict) -> None:
@@ -248,8 +240,19 @@ async def on_clear_reference(ws) -> None:
 
 
 # ── Target surface (3D projection) callbacks ─────────────────────────────────
+# Loading and removing are read-modify-write on the scene (read the current
+# parts, rebuild, store) with awaits in between, so they are serialized: two
+# clients uploading at once must not drop a part.
+_surface_lock = asyncio.Lock()
+
+
 async def on_surface_upload(filename: str, blob: bytes) -> dict:
-    """Save an uploaded STL/OBJ, load it, and broadcast mesh + status to clients."""
+    """
+    Save an uploaded STL/OBJ, ADD it to the surface scene, and broadcast the
+    combined mesh + status. Loading is cumulative: each file keeps the position
+    authored in it, so surfaces exported from one Rhino document assemble
+    themselves. Re-loading the same file name replaces that part in place.
+    """
     SURFACE_DIR.mkdir(exist_ok=True)
     safe_name = os.path.basename(filename)
     path = SURFACE_DIR / safe_name
@@ -257,30 +260,74 @@ async def on_surface_upload(filename: str, blob: bytes) -> dict:
 
     loop = asyncio.get_running_loop()
     model = await loop.run_in_executor(None, SurfaceModel.load, path)
-    info = model.info()
-    mesh_payload = await loop.run_in_executor(None, model.mesh_payload)
+    async with _surface_lock:
+        with state_lock:
+            existing = shared_state.get("surface_model")
+        scene = await loop.run_in_executor(None, SurfaceScene.combine, existing, model)
+        info = scene.info()
+        mesh_payload = await loop.run_in_executor(None, scene.mesh_payload)
 
-    with state_lock:
-        shared_state["surface_model"] = model
-        shared_state["surface_info"] = info
-        shared_state["surface_mesh_payload"] = mesh_payload
-        pose = shared_state["surface_pose"]
-        offset = shared_state["surface_offset_mm"]
-        # A surface replaces the flat workspace for mapping, so it also unlocks
-        # the capture flow — no P0/Px/Py calibration needed in surface mode.
-        if shared_state["phase"] == "idle":
-            shared_state["phase"] = "previewing"
+        with state_lock:
+            shared_state["surface_model"] = scene
+            shared_state["surface_info"] = info
+            shared_state["surface_mesh_payload"] = mesh_payload
+            pose = shared_state["surface_pose"]
+            offset = shared_state["surface_offset_mm"]
+            # A surface replaces the flat workspace for mapping, so it also
+            # unlocks the capture flow — no P0/Px/Py calibration in surface mode.
+            if shared_state["phase"] == "idle":
+                shared_state["phase"] = "previewing"
 
     if not camera_thread.running:
         camera_thread.start()
 
+    added = f"Surface loaded: {safe_name} ({int(len(model.mesh.faces))} faces)"
+    if info["count"] > 1:
+        added += (f" — {info['count']} surfaces combined, "
+                  f"{info['bbox']['size'][0]}×{info['bbox']['size'][1]} m total")
     await server.broadcast_surface_status(
         loaded=True, info=info, pose=pose, offset_mm=offset, mesh=mesh_payload,
-        message=f"Surface loaded: {info['name']} ({info['faces']} faces, "
-                f"{info['bbox']['size'][0]}×{info['bbox']['size'][1]} m)",
+        message=added,
     )
-    module_trace.log("surface", f"[surface] loaded {info['name']}: {info['faces']} faces, bbox {info['bbox']['size']} m")
+    module_trace.log("surface", f"[surface] {added}; scene bbox {info['bbox']['size']} m")
     return {"info": info}
+
+
+async def on_remove_surface(params: dict) -> None:
+    """Drop ONE loaded surface from the scene (the ✕ next to it in the list)."""
+    try:
+        idx = int((params or {}).get("index", -1))
+    except (TypeError, ValueError):
+        idx = -1
+    async with _surface_lock:
+        with state_lock:
+            scene = shared_state.get("surface_model")
+        # Explicit bounds check: a missing/garbled index must be a no-op, and
+        # Python would happily read parts[-1] as "the last one".
+        if not isinstance(scene, SurfaceScene) or not 0 <= idx < len(scene.parts):
+            return
+        removed = scene.parts[idx].name
+        new_scene = scene.without_part(idx)
+        if new_scene is None:                   # last one gone → back to flat
+            await on_clear_surface()
+            return
+
+        loop = asyncio.get_running_loop()
+        info = new_scene.info()
+        mesh_payload = await loop.run_in_executor(None, new_scene.mesh_payload)
+        with state_lock:
+            shared_state["surface_model"] = new_scene
+            shared_state["surface_info"] = info
+            shared_state["surface_mesh_payload"] = mesh_payload
+            pose = shared_state["surface_pose"]
+            offset = shared_state["surface_offset_mm"]
+
+    msg = f"Removed {removed} — {info['count']} surface(s) left."
+    await server.broadcast_surface_status(
+        loaded=True, info=info, pose=pose, offset_mm=offset, mesh=mesh_payload,
+        message=msg,
+    )
+    module_trace.log("surface", f"[surface] {msg}")
 
 
 async def on_set_surface_pose(params: dict) -> None:
@@ -297,12 +344,13 @@ async def on_set_surface_pose(params: dict) -> None:
 
 
 async def on_clear_surface() -> None:
+    """Remove every loaded surface (the whole scene)."""
     with state_lock:
         shared_state["surface_model"] = None
         shared_state["surface_info"] = None
         shared_state["surface_mesh_payload"] = None
         shared_state["strokes_surface"] = False
-    await server.broadcast_surface_status(loaded=False, message="Surface cleared.")
+    await server.broadcast_surface_status(loaded=False, message="Surfaces cleared.")
     module_trace.log("surface", "[surface] cleared — paths map to the flat workspace again", extra=("workspace",))
 
 
@@ -369,8 +417,13 @@ async def on_register_corner(ws, params: dict) -> None:
         shared_state["surface_pose"] = new_pose.to_dict()
         shared_state["freedrive"] = False
 
+    # Corners belong to the COMBINED scene bbox, so the solved pose moves every
+    # loaded surface as one rigid assembly — their authored relative positions
+    # are preserved by construction.
+    n_parts = len(getattr(model, "parts", [])) or 1
+    whole = f" (all {n_parts} surfaces moved together)" if n_parts > 1 else ""
     msg = (f"Corner {idx + 1} registered at TCP "
-           f"[{tcp[0]:.3f}, {tcp[1]:.3f}, {tcp[2]:.3f}] m — re-run Generate Path.")
+           f"[{tcp[0]:.3f}, {tcp[1]:.3f}, {tcp[2]:.3f}] m{whole} — re-run Generate Path.")
     await server.send_register_result(ws, True, message=msg, pose=new_pose.to_dict())
     # Sliders + preview update everywhere via the normal surface_status path.
     await server.broadcast_surface_status(
@@ -967,6 +1020,7 @@ server = Server(
     on_surface_upload=on_surface_upload,
     on_set_surface_pose=on_set_surface_pose,
     on_clear_surface=on_clear_surface,
+    on_remove_surface=on_remove_surface,
     on_depth_overlay_params=on_depth_overlay_params,
     on_register_freedrive=on_register_freedrive,
     on_register_corner=on_register_corner,

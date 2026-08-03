@@ -7,7 +7,11 @@ override). Tools: app_status, capture_image, generate_path (accepts
 adjustments, crop, spacing_mm 10–100 for waypoint spacing, join_mm 0–200 =
 Distance Threshold — merge strokes whose endpoints are closer than this, with
 the threshold doubled when another stroke crosses the connecting line; 0 = off),
-load_surface,
+load_surface (CUMULATIVE — each call ADDS a surface to the scene, keeping the
+position authored in its file; loading the same file name again replaces that
+part. The loaded surfaces then act as ONE target: the drawing spans them all
+and a single pose moves them together. The reply carries `count` = parts now
+loaded. Removing one part / clearing them all is browser-only),
 set_surface_pose, save_toolpath (speed_pct, offset_mm, safety_mm, blend_mm
 0–5 = movep corner radius), validate_toolpath. No run() tool by design —
 executing robot motion stays a human action in the browser.
