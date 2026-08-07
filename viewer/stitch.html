@@ -2,14 +2,14 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Dual-Cam Vision (prototype)</title>
+<title>Multi-Cam Vision (prototype)</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body {
     margin: 0; background: #101114; color: #d8d8d8;
     font-family: "Segoe UI", system-ui, sans-serif; font-size: 14px;
-    display: flex; flex-direction: column; height: 100vh;
+    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
   }
   header {
     display: flex; align-items: baseline; gap: 14px;
@@ -23,142 +23,164 @@
   #info { font-size: 12px; color: #8a8f98; margin-left: auto; }
   #note { font-size: 12px; color: #ffb020; }
   main { flex: 1; display: flex; min-height: 0; }
-  .views {
-    flex: 1; display: grid; gap: 8px; padding: 10px;
-    grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; min-width: 0;
-  }
-  #views-setup {
-    flex: 1; display: flex; flex-direction: column; min-width: 0;
-  }
-  #views-setup .views { flex: 1; padding-bottom: 4px; }
+  .stage { flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 10px; }
+
   .vp {
     position: relative; background: #000; border: 1px solid #2a2b30;
     border-radius: 6px; overflow: hidden; display: flex;
     align-items: center; justify-content: center;
   }
-  .vp img { max-width: 100%; max-height: 100%; object-fit: contain; }
-  .vp .lbl {
+  .vp img { max-width: 100%; max-height: 100%; object-fit: contain;
+            user-select: none; -webkit-user-drag: none; }
+  .vp svg { position: absolute; overflow: visible; }
+  .lbl {
     position: absolute; top: 6px; left: 8px; font-size: 12px; color: #cfd3da;
     background: #000a; padding: 1px 7px; border-radius: 4px; pointer-events: none;
   }
-  #setup-bar {
-    display: flex; justify-content: center; gap: 10px; padding: 6px 10px 10px;
+
+  /* ── Top: the result. Look only — nothing here is draggable. ── */
+  #result { flex: 1; min-height: 90px; }
+  #result svg { pointer-events: none; }
+  #result svg polygon {
+    fill: none; stroke: #00e5a0; stroke-width: 1.5px; stroke-dasharray: 7 5;
+    opacity: .55; vector-effect: non-scaling-stroke;
   }
-  #setup-bar button { min-width: 150px; }
+
+  /* ── The grab bar between result and workbench ── */
+  #splitter {
+    flex: none; height: 12px; margin: 2px 0; cursor: row-resize;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #splitter::before {
+    content: ""; width: 64px; height: 4px; border-radius: 2px; background: #3a3d44;
+  }
+  #splitter:hover::before, #splitter.on::before { background: #00e5a0; }
+
+  /* ── Bottom: the workbench, one panel per camera ── */
+  #strip { flex: none; height: 300px; min-height: 90px; display: flex; gap: 8px; }
+  #strip .vp { flex: 1; min-width: 0; cursor: pointer; }
+  #strip .vp.sel { border-color: #00e5a0; cursor: default; }
+  #strip .vp.off img { opacity: .3; }
+  /* Green = where this picture lands on the canvas. Blue = what gets kept. */
+  #strip .vp svg .shape {
+    fill: #00e5a014; stroke: #00e5a0; stroke-width: 1.5px;
+    vector-effect: non-scaling-stroke; cursor: move;
+  }
+  #strip .vp svg .crop {
+    fill: none; stroke: #4a9eff; stroke-width: 1.5px;
+    vector-effect: non-scaling-stroke; pointer-events: none;
+  }
+  #strip .vp:not(.sel) svg .crop { stroke: #4a9eff88; stroke-dasharray: 5 4; }
+  #strip .vp svg .edge { fill: #4a9eff; opacity: .55; }
+  #strip .vp svg .edge:hover { opacity: 1; }
+  #strip .vp svg .edge.h { cursor: ns-resize; }
+  #strip .vp svg .edge.v { cursor: ew-resize; }
+
+  /* Corner handles — same look and feel as the projector calibration window. */
+  .handle {
+    position: absolute; width: 26px; height: 26px; margin: -13px 0 0 -13px;
+    border: 3px solid #00e5a0; border-radius: 50%; outline: 2px solid #fff;
+    background: rgba(0, 229, 160, 0.25); color: #fff;
+    font-size: 12px; font-weight: bold; line-height: 20px; text-align: center;
+    cursor: grab; z-index: 10; user-select: none; touch-action: none;
+    box-shadow: 0 0 10px rgba(0, 229, 160, 0.8);
+  }
+  .handle.sel { border-color: #ffcc00; background: rgba(255,204,0,0.3);
+                box-shadow: 0 0 12px rgba(255,204,0,0.9); }
+
   aside {
-    width: 300px; flex: none; overflow-y: auto; padding: 10px 12px;
+    width: 226px; flex: none; overflow-y: auto; padding: 12px;
     background: #15161a; border-left: 1px solid #2a2b30;
+    display: flex; flex-direction: column; gap: 14px;
   }
-  fieldset {
-    border: 1px solid #2a2b30; border-radius: 6px;
-    margin: 0 0 12px; padding: 8px 10px 10px;
+  .group { display: flex; flex-direction: column; gap: 6px; }
+  .group > h2 {
+    font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+    color: #6d727c; margin: 0;
   }
-  fieldset.dim { opacity: 0.45; pointer-events: none; }
-  legend { font-size: 12px; color: #9aa0aa; padding: 0 4px; }
-  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
-  .row label { flex: 1; font-size: 12.5px; color: #b8bcc4; }
-  .row output { width: 44px; text-align: right; font-size: 12px; color: #8a8f98; }
-  input[type=number] {
-    width: 76px; background: #0d0e11; color: #d8d8d8;
-    border: 1px solid #33353b; border-radius: 4px; padding: 3px 6px;
-  }
-  input[type=range] { flex: 1.4; accent-color: #4a9eff; }
-  select {
-    background: #0d0e11; color: #d8d8d8; border: 1px solid #33353b;
-    border-radius: 4px; padding: 3px 6px;
-  }
+  .pair { display: flex; gap: 6px; }
+  .pair button { flex: 1; }
   button {
     background: #23262c; color: #d8d8d8; border: 1px solid #3a3d44;
-    border-radius: 5px; padding: 5px 10px; cursor: pointer; font-size: 13px;
+    border-radius: 5px; padding: 7px 10px; cursor: pointer; font-size: 13px;
   }
   button:hover { background: #2c3038; }
-  #btn-stitch {
-    width: 100%; padding: 9px 10px; font-size: 14px; font-weight: 600;
-    border-color: #3a3d44;
+  button:disabled { opacity: .4; cursor: default; }
+  #btn-save { border-color: #2f6f4f; color: #8fe0b4; }
+  #camera-list { display: flex; flex-direction: column; gap: 4px; }
+  .cam-row {
+    display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+    border: 1px solid #2a2b30; border-radius: 5px; cursor: pointer; font-size: 13px;
   }
-  #btn-stitch.on { background: #1d3a2c; border-color: #2f6f4f; color: #8fe0b4; }
-  #btn-save { border-color: #2f6f4f; }
-  #msg { font-size: 12px; min-height: 30px; color: #7ec8a8; white-space: pre-wrap; }
+  .cam-row.sel { border-color: #00e5a0; background: #14231d; }
+  .cam-row .name { flex: 1; }
+  .cam-row .eye {
+    background: none; border: none; padding: 0 2px; font-size: 14px;
+    color: #8a8f98; cursor: pointer; line-height: 1;
+  }
+  .cam-row.off .name { color: #6d727c; text-decoration: line-through; }
+  .readout { font-size: 11.5px; color: #8a8f98; text-align: center; }
+  .hint { font-size: 11px; color: #6d727c; margin: 0; line-height: 1.45; }
+  #msg { font-size: 12px; min-height: 16px; color: #7ec8a8; }
   #msg.err { color: #ff7a6e; }
-  .hint { font-size: 11px; color: #6d727c; margin: 4px 0 0; line-height: 1.4; }
-  .hidden { display: none !important; }
 </style>
 </head>
 <body>
   <header>
-    <h1>Dual-Cam Vision</h1><span class="tag">PROTOTYPE</span>
+    <h1>Multi-Cam Vision</h1><span class="tag">PROTOTYPE</span>
     <span id="note"></span>
     <span id="info">connecting…</span>
   </header>
   <main>
-    <!-- Stream srcs are set by stitch.js AFTER the WebSocket is open and only
-         for the active mode: MJPEG streams hold their connections forever and
-         would otherwise starve the WS handshake out of Chrome's per-host
-         connection pool. -->
-    <div id="views-setup" class="hidden">
-      <div class="views">
-        <div class="vp"><img data-src="/cam/left/depth" alt=""><span class="lbl">Left camera — depth</span></div>
-        <div class="vp"><img data-src="/cam/right/depth" alt=""><span class="lbl">Right camera — depth</span></div>
-        <div class="vp"><img data-src="/cam/left/rgb" alt=""><span class="lbl">Left camera — RGB</span></div>
-        <div class="vp"><img data-src="/cam/right/rgb" alt=""><span class="lbl">Right camera — RGB</span></div>
+    <div class="stage">
+      <!-- Stream srcs are set by stitch.js AFTER the WebSocket is open: MJPEG
+           streams hold their connections forever and would otherwise starve the
+           WS handshake out of Chrome's per-host connection pool. -->
+      <div class="vp" id="result">
+        <img id="result-img" alt="" data-src="/canvas">
+        <svg id="result-marks" preserveAspectRatio="none"></svg>
+        <span class="lbl" id="result-lbl">Result — combined view</span>
       </div>
-      <div id="setup-bar">
-        <button id="btn-rot-left" title="Rotate the left camera's feed 180° (upside-down mounting)">⟲ Rotate left 180°</button>
-        <button id="btn-swap" title="Exchange which camera is left and which is right">⇄ Swap left/right</button>
-        <button id="btn-rot-right" title="Rotate the right camera's feed 180° (upside-down mounting)">⟲ Rotate right 180°</button>
-      </div>
-    </div>
-    <div id="views-stitch" class="views hidden">
-      <div class="vp"><img data-src="/stitch/depth" alt=""><span class="lbl">Combined depth (overlap outlined)</span></div>
-      <div class="vp"><img data-src="/stitch/rgb" alt=""><span class="lbl">Combined RGB (gap expected)</span></div>
-      <div class="vp"><img data-src="/stitch/mask" alt=""><span class="lbl">Mask</span></div>
-      <div class="vp"><img data-src="/stitch/skel" alt=""><span class="lbl">Skeleton</span></div>
+      <div id="splitter" title="Drag to make the workbench taller or shorter"></div>
+      <div id="strip"></div>
     </div>
     <aside>
-      <fieldset>
-        <legend>Stitch</legend>
-        <button id="btn-stitch">Stitch: …</button>
-        <p class="hint" id="stitch-hint">Stitch OFF shows each camera live.
-        Swap / rotate the feeds until they match reality, then turn the stitch
-        on — it looks for the overlap automatically.</p>
-      </fieldset>
-      <fieldset id="fs-align">
-        <legend>Alignment (camera 2 → camera 1)</legend>
-        <div class="row"><label>tx (mm)</label><input type="number" id="cal-tx" step="1"></div>
-        <div class="row"><label>ty (mm)</label><input type="number" id="cal-ty" step="1"></div>
-        <div class="row"><label>tz (mm)</label><input type="number" id="cal-tz" step="1"></div>
-        <div class="row"><label>yaw (°)</label><input type="number" id="cal-yaw" step="0.1"></div>
-        <div class="row">
-          <button id="btn-align" title="Search the full range of plausible camera spacings for the overlap — needs a groove or object crossing the seam">Find overlap</button>
-          <button id="btn-refine" title="Fine-trim tx/ty from the current overlap band">Fine-tune</button>
+      <div class="group">
+        <h2>Cameras</h2>
+        <div id="camera-list"></div>
+      </div>
+      <div class="group">
+        <h2>Turn</h2>
+        <div class="pair">
+          <button id="btn-ccw" title="Turn this camera's picture a quarter turn left">⟲</button>
+          <button id="btn-cw" title="Turn this camera's picture a quarter turn right">⟳</button>
         </div>
-        <div class="row">
-          <button id="btn-save">Save calibration</button>
+      </div>
+      <div class="group">
+        <h2>Height</h2>
+        <div class="pair">
+          <button id="btn-lower" title="This camera's sand sits too high">▼</button>
+          <button id="btn-raise" title="This camera's sand sits too low">▲</button>
         </div>
-        <p class="hint">Find overlap searches for the camera spacing by itself;
-        rake a groove across the seam first. Fine-tune only trims an
-        already-close alignment. Save writes stitch_calibration.json
-        (reloaded on next start).</p>
-      </fieldset>
-      <fieldset>
-        <legend>Detection parameters</legend>
-        <div class="row"><label>Detect</label>
-          <select id="p-detect">
-            <option value="valley">valley</option>
-            <option value="ridge">ridge</option>
-            <option value="band">band</option>
-          </select>
-        </div>
-        <div class="row"><label>Smooth σ</label><input type="range" id="p-smooth" min="0" max="5" step="0.1"><output for="p-smooth"></output></div>
-        <div class="row"><label>Detrend σ</label><input type="range" id="p-detrend" min="5" max="80" step="1"><output for="p-detrend"></output></div>
-        <div class="row"><label>Depth (mm)</label><input type="range" id="p-depth" min="0.2" max="10" step="0.1"><output for="p-depth"></output></div>
-        <div class="row"><label>Min blob (px)</label><input type="range" id="p-blob" min="0" max="500" step="10"><output for="p-blob"></output></div>
-        <div class="row"><label>Min mean depth (mm)</label><input type="range" id="p-meand" min="0" max="5" step="0.1"><output for="p-meand"></output></div>
-        <div class="row"><label>Min width (mm)</label><input type="range" id="p-minw" min="0" max="50" step="1"><output for="p-minw"></output></div>
-        <div class="row"><label>Max width (mm, 0=off)</label><input type="range" id="p-maxw" min="0" max="150" step="5"><output for="p-maxw"></output></div>
-        <div class="row"><label>Min length (mm)</label><input type="range" id="p-minl" min="0" max="300" step="5"><output for="p-minl"></output></div>
-      </fieldset>
-      <div id="msg"></div>
+        <div class="readout" id="height-readout">0 mm</div>
+      </div>
+      <div class="group">
+        <h2>Start over</h2>
+        <button id="btn-reset-corners">Reset corners</button>
+        <button id="btn-reset-cam">Reset camera</button>
+      </div>
+      <div class="group">
+        <h2>View</h2>
+        <button id="btn-colour">Showing depth</button>
+      </div>
+      <div class="group">
+        <button id="btn-save">Save layout</button>
+        <div id="msg"></div>
+      </div>
+      <p class="hint">Work in the panels below: drag handles <b>1–4</b> to
+      shape where that camera lands, drag inside the green outline to move it,
+      drag a <b>blue edge</b> to trim the picture. Arrow keys nudge the last
+      handle you touched (Shift = faster). Watch the result up top.</p>
     </aside>
   </main>
   <script src="/static/stitch.js"></script>

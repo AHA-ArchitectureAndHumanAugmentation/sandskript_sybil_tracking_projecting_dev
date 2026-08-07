@@ -1,14 +1,14 @@
 @echo off
-REM -- Dual-Cam Vision prototype launcher ------------------------------------
-REM Merges the feeds of TWO RealSense D435i cameras into one heightmap.
+REM -- Multi-Cam Vision prototype launcher -----------------------------------
+REM Merges the feeds of every connected RealSense D435i into one heightmap.
 REM CONTAINED prototype: close the main app first (one process per RealSense).
-REM With fewer than two cameras it runs on a synthetic scene.
+REM With no camera attached it runs on a synthetic scene.
 
 set PYTHONUTF8=1
 chcp 65001 >nul
 cd /d "%~dp0"
 
-echo Starting Dual-Cam Vision prototype...
+echo Starting Multi-Cam Vision prototype...
 echo (A browser tab will open at http://localhost:5006)
 echo.
 

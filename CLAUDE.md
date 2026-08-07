@@ -37,7 +37,7 @@ robot moves.
   Never bare `pip` (broken launcher risk — use `<ENVPY> -m pip`). The Intel
   RealSense USB driver is an OS-level install, outside the env. The old
   `.venv` is retired.
-- Unit tests: `<ENVPY> -m pytest -q -m "not integration"` (320, no
+- Unit tests: `<ENVPY> -m pytest -q -m "not integration"` (345, no
   hardware). Integration: `-m integration`, needs RealSense/robot + TEST_ROBOT_IP.
 - No CLI modes. Hardware vs no-robot is in the UI: "Test Mode (no robot)" button
   unlocks capture with a synthetic workspace; Run stays gated on a robot connection.
@@ -185,28 +185,58 @@ robot moves.
     runs. Deliberately NOT wired into Developer Mode (the operator decides) and
     NOT exposed to MCP.
 
-## Contained prototype: Dual-Cam Vision (NOT part of the two modes)
-`run_stitch.bat` → `stitch_main.py` → http://localhost:5006. Merges TWO D435i
-depth feeds (~5-10% frame overlap) into one top-down heightmap covering a
-larger sand area. Two screens toggled by the Stitch button (`set_stitch{on}`):
-OFF = setup (per-camera live depth+RGB left/right, ⇄ Swap and per-side ⟲
-Rotate 180° buttons for upside-down mounts), ON = combined views. Starts OFF
-unless `stitch_calibration.json` exists. Turning stitch ON auto-runs
-`auto_align` (sweep candidate baselines tx, score overlap relief correlation,
-`refine_shift` trim; fails cleanly on featureless sand — calib unchanged).
-Modules: `stitcher.py` (pure math: deproject with per-device intrinsics →
-cam2→cam1 rig transform `StitchCalib` (tx/ty/tz mm + yaw, swap, rot1/rot2 =
-per-physical-camera 180° flags applied by `apply_orientation` before swap) →
-rasterize onto a shared grid; overlap averaged; `refine_shift` = template-match
-XY trim; `auto_align` = full baseline search), `dual_camera.py` (owns both
-RealSense pipelines by serial; <2 cameras → SYNTHETIC scene; publishes
-per-camera left/right JPEGs in both modes, stitched set only when ON),
-`stitch_server.py` + `viewer/stitch.html`/`stitch.js` (MJPEG: /stitch/depth
-w/ overlap outline, /stitch/rgb (middle gap expected — narrower colour FOV),
-/stitch/mask, /stitch/skel + setup views /cam/{left,right}/{depth,rgb}; WS:
-set_stitch, set_calib, set_params, auto_align, auto_refine, save_calib →
-`stitch_calibration.json`, gitignored; state/init carry `stitch_on`).
-Detection reuses `grooves_and_mask` unchanged on the stitched heightmap.
+## Contained prototype: Multi-Cam Vision (NOT part of the two modes)
+`run_stitch.bat` → `stitch_main.py` → http://localhost:5006. Lays HOWEVER MANY
+D435i depth feeds are plugged in (1 … STITCH_MAX_CAMERAS = 4, enumerated by
+serial) onto ONE top-down canvas covering a larger sand area. It ONLY combines
+images: no overlap search (the cameras are bolted down), no groove detection
+and no detection parameters (those live in the main app). ONE screen, always
+live, split by a drag bar into RESULT on top (the combined canvas, look-only,
+`pointer-events:none`; only the selected camera's footprint is outlined so you
+can tell the pictures apart) and WORKBENCH underneath (one panel per camera —
+every edit happens here). Splitter height persists in localStorage.
+Per panel: green numbered handles 1-4 on the corners shape where that camera
+lands, dragging inside the green outline moves it, blue EDGE bars trim the
+picture (edges not corners, so the two never fight for the same hit area).
+The green outline is the camera's canvas quad drawn at the panel's own scale
+(`panelShape`: centred on the crop rect, scaled crop-width/quad-width), so an
+unskewed camera reads as a plain rectangle and a keystoned one visibly leans;
+drag deltas convert panel px → canvas mm through that same `pxPerMm`.
+Handles live on `<body>`, positioned from the panel's client rect, so a short
+workbench never clips them.
+Per camera (`stitcher.CameraPlacement`): `rot_deg` 0/90/180/270 mounting
+rotation, `crop` normalized x/y/w/h, **`quad_mm` = the four canvas corners the
+cropped frame is pinned to**, `height_mm`, `enabled`. `quad_mm` IS the
+placement — move/rotate/skew are all just different ways of moving corners, so
+there are no separate offset/angle numbers and the UI is four drag handles.
+Corner order is **TL, TR, BL, BR** = handles 1-4, the SAME convention (and
+look) as `viewer/projection.html`'s projector calibration.
+Pipeline per camera: rotate image+intrinsics → crop (clears `valid`, never
+slices, so the pixel coords the pin is built on stay exact) →
+`cv2.getPerspectiveTransform(crop_corners_px, quad)` → `cv2.warpPerspective`
+straight onto the shared canvas; overlaps averaged, `coverage` counts
+contributors, `fill_small_holes` closes speckle. Image-space, not deprojection:
+that is what makes a corner drag land exactly where the operator put it, and
+for a near-flat sand plane the two agree to well under a pixel.
+Helpers worth knowing: `rotate_quad` (turn a quad about its centre AND
+re-label its corners, so the picture turns unstretched — pair it with
+`rot_deg`, `MultiCameraThread.rotate_camera` does both plus `_rotate_crop`),
+`requad_for_crop` (push a new crop through the OLD pin so trimming an edge
+never slides the sand that was kept), `default_quad_mm` (unplaced camera =
+upright rect parked one footprint right of the last), `bind_placements`
+(match a saved calib to the cameras present, serial first then position).
+Modules: `stitcher.py` (pure math + `synthetic_scene(n)`), `multi_camera.py`
+(`MultiCameraThread` owns every RealSense pipeline; 0 cameras → SYNTHETIC
+scene of STITCH_SYNTHETIC_CAMERAS), `stitch_server.py` +
+`viewer/stitch.html`/`stitch.js` (MJPEG: `/canvas` = the result view with
+overlap outlined, `/cam/{index}` = one workbench panel per camera carrying the
+crop rectangle; WS in: set_camera{index,…}, rotate_camera{index,steps},
+nudge_height{index,steps}, reset_camera{index,corners_only},
+set_grid{mm_per_px}, set_colour{on}, save_calib → `stitch_calibration.json`,
+gitignored; out: init/state carry `calib{cams[],mm_per_px}` and
+`info.cameras[].quad_px` = each placed quad in canvas pixels, which the browser
+uses ONLY to outline the selected camera in the result view — the workbench
+handles are driven by `calib.cams[].quad_mm`, not by `quad_px`).
 Deliberately NOT wired into Developer/Participant Mode or the MCP tools; no
 main-app API change. Cannot run while the main app runs (one process per
 RealSense). Never import `main` or `camera_thread` from these modules.
@@ -338,6 +368,36 @@ never import `main` from these modules.
   unavailable" and every drawing passes.
 - Never OCR the skeleton or the projected 3D strokes — 1-px hairlines read
   terribly. The guard is on the thick mask for a reason.
-- Test count reference: 320 unit (+6 hardware-gated). The `text_guard` OCR
+- Multi-Cam Vision has no auto-alignment and no detection ON PURPOSE. The
+  cameras are bolted down, so an overlap search only ever failed on flat sand;
+  and the tool exists to combine images — groove parameters belong in the main
+  app, where they are actually tuned. Don't add either back "to help".
+- The whole placement is `quad_mm`. Resist adding tx/ty/yaw/skew fields
+  alongside it: two representations of the same thing is what made the previous
+  UI unusable, and every one of those is a corner move.
+- A camera's crop is applied by clearing `valid`, NOT by slicing the array —
+  slicing would move the pixel coordinates the corner-pin is built on. Same
+  reason `rotate_frame` rotates the intrinsics alongside the image.
+- Changing a crop MUST go through `requad_for_crop` (the thread's
+  `set_placement` does it), or trimming an edge stretches what is left over the
+  same canvas area and slides the camera out of alignment.
+- `_prepare` falls back to the default quad when a corner is dragged past its
+  neighbours: a folded quad makes `warpPerspective` smear that camera across
+  the canvas, and a blank view gives the operator nothing to drag back.
+- Placements are bound to cameras by SERIAL (`bind_placements`), so unplugging
+  a camera or changing USB port order does not shuffle the rig. The positional
+  fallback exists only for calibrations saved before serials were recorded.
+  `MultiCameraThread._sync_placements` then materializes default corners: the
+  browser drags corners RELATIVE to `quad_mm`, so it must never be empty.
+- `stitch.js` ignores the server's `calib` echo for ~700 ms after sending an
+  edit. Drags are relative, so a stale echo would not just flicker the outline,
+  it would make the NEXT delta start from the wrong corner.
+- Keep the result view non-interactive. Handles used to live on the combined
+  canvas and it read as two competing workspaces; the split is result-on-top,
+  edits-below, and the top's SVG is `pointer-events:none` to enforce it.
+- `stitch_server` serves `/static/*` no-store like the main app. A cached
+  `stitch.js` against a restarted server is a browser talking a protocol the
+  server no longer speaks, and it corrupts placements silently.
+- Test count reference: 345 unit (+6 hardware-gated). The `text_guard` OCR
   tests skip themselves when Tesseract is absent; the text-matching ones always
   run. Keep green.

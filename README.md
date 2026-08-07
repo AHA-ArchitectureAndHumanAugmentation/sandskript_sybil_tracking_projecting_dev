@@ -200,12 +200,12 @@ depth_cam-to-robot
 │           │ viewer/projection.html │  (corner-pin calibration)
 │           └────────────────────────┘
 │
-├─ DUAL-CAM VISION  ·  contained prototype (in development)
-│  └─ 🔵 Stitching  —  merge two RealSense feeds into one heightmap, detect grooves (same engine)
+├─ MULTI-CAM VISION  ·  contained prototype (in development)
+│  └─ 🔵 Stitching  —  lay every RealSense feed onto one canvas by dragging its corners
 │        modules
-│        ┌─────────────┐ ┌────────────────┐ ┌──────────────────┐ ┌────────────────────┐
-│        │ stitcher.py │ │ dual_camera.py │ │ stitch_server.py │ │ depth_extractor.py │
-│        └─────────────┘ └────────────────┘ └──────────────────┘ └────────────────────┘
+│        ┌─────────────┐ ┌─────────────────┐ ┌──────────────────┐ ┌────────────────────┐
+│        │ stitcher.py │ │ multi_camera.py │ │ stitch_server.py │ │ depth_extractor.py │
+│        └─────────────┘ └─────────────────┘ └──────────────────┘ └────────────────────┘
 │        UI
 │        ┌────────────────────┐ ┌──────────────────┐
 │        │ viewer/stitch.html │ │ viewer/stitch.js │
@@ -255,10 +255,10 @@ depth_cam-to-robot/
 ├── robot_controller.py      🟢🟣⚪ Thread-safe ur-rtde wrapper (moveL, movep paths, EE pose)
 ├── workspace.py             🟢 Planar fallback mapping (Test Mode)
 ├── reach.py                 🟢🟣 Reach-envelope estimate (importable without hardware)
-├── stitcher.py              🔵 Dual-Cam Vision: heightmap stitching + auto-align math
-├── dual_camera.py           🔵 Dual-Cam Vision: owns two RealSense pipelines
-├── stitch_server.py         🔵 Dual-Cam Vision: aiohttp server (port 5006)
-├── stitch_main.py           🔵 Dual-Cam Vision entry point (run_stitch.bat)
+├── stitcher.py              🔵 Multi-Cam Vision: corner-pin placement + canvas warping math
+├── multi_camera.py          🔵 Multi-Cam Vision: owns every connected RealSense pipeline
+├── stitch_server.py         🔵 Multi-Cam Vision: aiohttp server (port 5006)
+├── stitch_main.py           🔵 Multi-Cam Vision entry point (run_stitch.bat)
 ├── toolpath_loader.py       ⚪ Replay tool: read saved bundles (path.json OR path.script)
 ├── replay_robot.py          ⚪ Replay tool: robot-brand abstraction (UR now, ABB-ready)
 ├── replay_server.py         ⚪ Replay tool: aiohttp server (port 5007)
@@ -271,7 +271,7 @@ depth_cam-to-robot/
 ├── requirements.txt         🟢🟣🟠🔵⚪🤖 pip dependencies (installed by environment.yml)
 ├── requirements-dev.txt     🟢🟣🟠🔵⚪🤖 dev extras: pytest, mcp
 ├── run.bat                  🟢🟣🟠 Main-app launcher (double-click)
-├── run_stitch.bat           🔵 Dual-Cam launcher
+├── run_stitch.bat           🔵 Multi-Cam launcher
 ├── run_replay.bat           ⚪ Replay launcher
 ├── conftest.py              🟢🟣🟠🔵⚪🤖 Pytest shared fixtures
 ├── pytest.ini               🟢🟣🟠🔵⚪🤖 Test configuration
@@ -287,8 +287,8 @@ depth_cam-to-robot/
     ├── projection.html      🟠 Projector output / corner-pin calibration window
     ├── depth_view.html      🟣 Participant Mode popup (depth numbers + Auto + trigger)
     ├── depth_overlay.js     🟣 Popup logic: number overlay, Auto toggle, status chip
-    ├── stitch.html          🔵 Dual-Cam Vision prototype UI
-    ├── stitch.js            🔵 Dual-Cam Vision logic (setup/stitch modes, calibration)
+    ├── stitch.html          🔵 Multi-Cam Vision prototype UI
+    ├── stitch.js            🔵 Multi-Cam Vision logic (corner handles, crop drags)
     ├── replay.html          ⚪ Toolpath replay tool UI
     ├── replay.js            ⚪ Replay UI logic (connect, pick bundle, run)
     ├── style.css            🟢 Responsive layout
@@ -299,7 +299,7 @@ depth_cam-to-robot/
 
 Feature tags:
 
-🟢 Developer Mode · 🟣 Participant Mode · 🟠 Projection · 🔵 Dual-Cam · ⚪ Replay · 🤖 MCP
+🟢 Developer Mode · 🟣 Participant Mode · 🟠 Projection · 🔵 Multi-Cam · ⚪ Replay · 🤖 MCP
 
 ---
 
@@ -464,23 +464,24 @@ Measure the placement with the robot instead of guessing sliders. **Register Cor
 
 A projector pointed at the sandbox lights up the detected grooves in place: **⧉ Project** (Mask viewport) opens `/projection` — drag it onto the projector display and press **F11**. No extra software; a corner-pin homography in the browser does the mapping, and the projector-side stream is only computed while the window is open. **Calibrate once:** rake reference marks into the sand corners, then drag the projected handles **1–4** until the mask lands on the physical marks (arrows nudge 1 px, Shift = 10 px); saved to `settings.json`; **C** re-enters calibration, **B** blanks. The projection uses the **full-frame** mask (stable regardless of crop). **Capture auto-blanks** the projector and waits ~1 s for the depth buffer to refill, so projected light never contaminates the capture. Projector: keystone OFF, no digital zoom, fixed mount — recalibrate after any bump; a dimmer room gives crisper grooves.
 
-### Dual-Cam Vision prototype (standalone)
+### Multi-Cam Vision prototype (standalone)
 
-A **contained** prototype — not part of Developer or Participant Mode — that merges the feeds of **two** D435i cameras into one combined depth image covering a larger sand area, aiming for a **5–10 % frame overlap**.
+A **contained** prototype — not part of Developer or Participant Mode — that lays the feeds of **however many** D435i cameras are plugged in (one, two, three, up to four) onto one combined depth image covering a larger sand area. It does one job: **putting the pictures together**. There is no groove detection here — that stays in the main app, which is where its parameters are tuned.
 
-- Launch with `run_stitch.bat` → [http://localhost:5006](http://localhost:5006). **Close the main app first** — each RealSense can only be owned by one process. With fewer than two cameras connected, the tool runs on a **synthetic** sand scene (banner shows why) so the UI and calibration workflow can still be tried.
-- The big **Stitch** button switches between two screens:
-  - **Stitch OFF — setup.** Each camera's live depth and RGB shown side by side. Use **⇄ Swap left/right** if the cameras come up on the wrong sides, and **⟲ Rotate 180°** under either side if a camera is mounted upside-down, until the feeds match reality. (First start opens here; once a calibration has been saved, later starts open stitched.)
-  - **Stitch ON — combined.** Four live views: **combined depth** (the overlap band is outlined), **combined RGB**, and the detected **mask** and **skeleton**. The RGB view has a dark strip in the middle — expected: the colour lens has a narrower field of view than the depth sensor, and depth is the product here.
-- **How it merges:** each camera's depth image is converted to 3D points using its own factory intrinsics, camera 2's points are moved into camera 1's frame by a fixed rig transform, and both are projected onto one top-down heightmap (uniform mm-per-pixel, no perspective seam). Where the frames overlap, the two measurements are **averaged** — the seam region ends up *less* noisy than either camera alone.
-- **Aligning the rig (once per mounting):**
-  1. Rake a groove **across the seam region** (flat sand has nothing to
-    align on), then turn the stitch on — it automatically searches all  plausible camera spacings for the overlap (**Find overlap** retries  this any time).
-  2. If needed, trim **tz / yaw** by hand and press **Fine-tune** to
-    re-measure the residual XY offset from the overlap band.
-  3. **Save calibration** → `stitch_calibration.json` (gitignored), reloaded
-    automatically next start.
-- **Detection parameters** (same engine and meaning as Developer Mode) tune the mask/skeleton computed on the stitched heightmap, live at ~4 Hz.
+- Launch with `run_stitch.bat` → [http://localhost:5006](http://localhost:5006). **Close the main app first** — each RealSense can only be owned by one process. The tool **finds the cameras itself**; with none connected it runs on a **synthetic** three-camera scene (banner shows why) so the workflow can still be tried.
+- **One screen, split in two.** The **top is the result** — the combined picture, always live, look-only. The **bottom is the workbench**, one panel per camera, where every adjustment is made. Drag the **bar between them** to give whichever half you need more room; the size is remembered. On the right are the remaining controls — all of them buttons.
+- **Putting a camera in place.** Click a camera panel (or its name in the list) to select it. A green outline appears on that panel with four numbered handles, **exactly like the projector calibration window**:
+  - **Drag handle 1–4** to shape where that camera lands. This is the fix for a camera mounted at an **angle**: a tilted camera sees the sand as a keystone, and pulling the corners back into shape squares it up. The green outline shows the shape you are making; the top view shows the effect.
+  - **Drag inside the green outline** to slide that camera across the combined picture until it lines up with its neighbour.
+  - **Arrow keys** nudge the last handle you touched (**Shift** = faster).
+  - **⟲ / ⟳** turn the camera a quarter turn — for a camera mounted on its side or upside-down. The picture turns without stretching.
+  - **▲ / ▼** raise or lower just that camera, for when it hangs higher or lower than its neighbour and its sand sits at the wrong level.
+  - **Reset corners** puts one camera back on a plain rectangle; **Reset camera** clears its turn and crop too.
+  - The **eye** next to a camera drops it out of the result without losing its placement.
+- **Trimming a camera.** Drag a **blue edge bar** on that camera's panel to cut away table edges, walls, or anything that is not sand — one edge at a time. Trimming never moves the sand you kept: the placement is re-cut to match.
+- **Showing depth / colour** flips both halves between the depth image and the colour cameras. The colour view has dark strips — expected: the colour lens has a narrower field of view than the depth sensor, and depth is the product here.
+- **Save layout** → `stitch_calibration.json` (gitignored), reloaded automatically next start and matched back to each camera by **serial number**, so swapping USB ports does not shuffle the rig.
+- **How it merges:** each camera's cropped, turned picture is warped onto one shared top-down canvas through the corner pin you set, at a uniform mm-per-pixel. Where two cameras overlap, the measurements are **averaged** — the seam region ends up *less* noisy than either camera alone, and the overlap is outlined so you can see it.
 - Like the main app, closing the last browser tab stops the program.
 
 

@@ -149,19 +149,23 @@ MOVEP_BLEND_M    = 0.0005  # 0.5 mm
 # ── Visualization ─────────────────────────────────────────────────────────────
 VIS_INTERVAL = 0.05  # seconds between WebSocket state broadcasts
 
-# ── Dual-Cam Vision prototype (stitch_main.py — CONTAINED) ────────────────────
+# ── Multi-Cam Vision prototype (stitch_main.py — CONTAINED) ───────────────────
 # A standalone tool (run_stitch.bat → http://localhost:5006) that merges the
-# depth feeds of TWO D435i cameras into one top-down heightmap covering a larger
-# sand area (~5-10% frame overlap). Deliberately NOT wired into Developer or
-# Participant Mode yet. It cannot run at the same time as the main app: one
-# process per RealSense.
+# depth feeds of however many D435i cameras are plugged in (1-4) into one
+# top-down heightmap covering a larger sand area. The cameras are fixed, so
+# placement is set by hand and saved — nothing searches for the overlap.
+# Deliberately NOT wired into Developer or Participant Mode yet. It cannot run
+# at the same time as the main app: one process per RealSense.
 STITCH_HTTP_PORT      = 5006
-STITCH_CALIB_FILE     = Path("stitch_calibration.json")  # cam2→cam1 transform, gitignored
+STITCH_CALIB_FILE     = Path("stitch_calibration.json")  # per-camera placements, gitignored
 STITCH_AVERAGE_FRAMES = 10     # temporal averaging per camera (smaller than main: live-ish)
 STITCH_EVERY_S        = 0.25   # seconds between stitched-output recomputes (~4 Hz)
 STITCH_MM_PER_PX      = 0.0    # heightmap grid resolution; 0 = auto from median depth
 STITCH_MAX_GRID_W     = 1920   # cap the heightmap size (cost bound)
 STITCH_MAX_GRID_H     = 1080
+STITCH_MAX_CAMERAS    = 4      # extra devices are ignored (MJPEG/USB bandwidth)
+STITCH_SYNTHETIC_CAMERAS = 3   # cameras faked when no RealSense is attached
+STITCH_HEIGHT_STEP_MM = 2.0    # one press of Raise/Lower on a camera
 # Nominal D435 depth intrinsics (87°×58° FOV) — used for the synthetic fallback
 # and as a sanity default; real runs read exact intrinsics from each device.
 STITCH_NOMINAL_HFOV_DEG = 87.0

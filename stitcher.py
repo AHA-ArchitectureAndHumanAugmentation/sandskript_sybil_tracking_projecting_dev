@@ -1,34 +1,39 @@
 """
-Pure math for the Dual-Cam Vision prototype (no hardware, no server).
+Pure math for Multi-Cam Vision (no hardware, no server).
 
-Two D435i cameras look down at the sand side by side with a small (~5-10%)
-overlap. Each camera's metric depth image is deprojected to 3D points with its
-own intrinsics, camera 2's points are moved into camera 1's frame by a fixed
-rig transform (StitchCalib — calibrated once per mounting), and both clouds are
-rasterized onto one shared top-down grid. The result is a single "virtual
-overhead camera" heightmap: uniform mm-per-pixel, no perspective seam, grooves
-still read as locally-larger depth so `depth_extractor.grooves_and_mask` works
-on it unchanged. Where the two cameras overlap, samples are averaged (the
-overlap band ends up LESS noisy than either camera alone).
+N RealSense cameras (1 … STITCH_MAX_CAMERAS) look down at the sand from FIXED
+mounts. This module lays their frames side by side on one canvas — nothing
+more. Per camera: rotate the image to match how it hangs, crop away what is
+not sand, then pin the four corners of what is left onto the canvas. The four
+corners ARE the placement: sliding all of them moves the camera, turning them
+rotates it, pulling one skews it — which is exactly the keystone a camera
+mounted at an angle produces. `cv2.warpPerspective` then drops each camera's
+depth (and colour) onto the shared grid, and overlapping pixels are averaged.
 
-Frame conventions (RealSense camera frame): x right, y down, z forward into
-the scene. The output grid keeps camera 1's x/y axes, so v grows down exactly
-like the single-camera pipeline. Heightmap values are metres along camera 1's
-z axis — "depth below camera 1" — so valleys are larger values, same as raw
-depth. The rig transform models a level side-by-side mounting: translation
-(tx, ty, tz) plus yaw about the viewing axis. Small pitch/roll differences are
-absorbed later by the detrend stage of groove detection.
+Same corner-pin convention as the projector calibration in
+viewer/projection.html, so the two feel identical: corner order is
+**TL, TR, BL, BR** — handles 1, 2, 3, 4.
+
+There is deliberately NO overlap search and no groove detection here. The
+cameras are bolted down, so the layout is dialled in once by hand (or loaded
+from stitch_calibration.json) and then stays put; detection lives in the main
+app, which is the only place its parameters are tuned.
+
+Canvas conventions: millimetres, x right and y down, so v grows down exactly
+like the single-camera pipeline. Heightmap values are metres of depth below
+the cameras — valleys are larger values, same as raw depth — which keeps the
+result a drop-in input for `depth_extractor.grooves_and_mask`.
 
 RGB: the colour stream is aligned to depth per camera, so each depth pixel
 carries a colour sample where the (narrower-FOV) RGB lens covers it. Those
-samples are rasterized onto the same grid; the strip the RGB lenses miss stays
-black (expected — the depth image is the product, RGB is reference only).
+ride the same warp; the strips the RGB lenses miss stay black (expected — the
+depth image is the product, RGB is reference only).
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 import cv2
@@ -40,12 +45,21 @@ from config import (
     STITCH_NOMINAL_HFOV_DEG, STITCH_NOMINAL_VFOV_DEG,
 )
 
+# Corner order shared with the projector calibration: handles 1-4 on screen.
+CORNER_NAMES = ("top-left", "top-right", "bottom-left", "bottom-right")
+# Index of each corner when walked around the perimeter (for area/drawing).
+_PERIMETER = (0, 1, 3, 2)
+
 
 # ── data types ────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
 class Intrinsics:
-    """Pinhole intrinsics of one depth stream (pixels)."""
+    """
+    Pinhole intrinsics of one depth stream (pixels). Only used to guess a
+    sensible STARTING size for a camera's canvas footprint — the placement
+    itself is whatever the operator drags it to.
+    """
     fx: float
     fy: float
     cx: float
@@ -61,37 +75,126 @@ class Intrinsics:
         return cls(fx=fx, fy=fy, cx=width / 2, cy=height / 2, width=width, height=height)
 
 
+def _norm_rot(value) -> int:
+    """Snap any angle to the four mounting orientations (clockwise degrees)."""
+    try:
+        k = int(round(float(value) / 90.0)) % 4
+    except (TypeError, ValueError):
+        k = 0
+    return k * 90
+
+
+def _norm_crop(value) -> tuple[float, float, float, float]:
+    """Clamp a normalized crop rect into the frame, never zero-sized."""
+    try:
+        x, y, w, h = (float(v) for v in value)
+    except (TypeError, ValueError):
+        return (0.0, 0.0, 1.0, 1.0)
+    x = min(max(x, 0.0), 0.95)
+    y = min(max(y, 0.0), 0.95)
+    w = min(max(w, 0.05), 1.0 - x)
+    h = min(max(h, 0.05), 1.0 - y)
+    return (x, y, w, h)
+
+
+def _norm_quad(value) -> tuple[tuple[float, float], ...]:
+    """Four canvas corners in mm (TL, TR, BL, BR); () when never placed."""
+    if not value:
+        return ()
+    try:
+        pts = [(float(p[0]), float(p[1])) for p in value]
+    except (TypeError, ValueError, IndexError):
+        return ()
+    return tuple(pts) if len(pts) == 4 else ()
+
+
+def quad_area_mm2(quad) -> float:
+    """Shoelace area walked around the perimeter; ≤ 0 means the corners crossed."""
+    q = np.asarray(quad, np.float64)[list(_PERIMETER)]
+    x, y = q[:, 0], q[:, 1]
+    return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+@dataclass
+class CameraPlacement:
+    """
+    Where ONE camera's frame lands on the canvas.
+
+    `quad_mm` is the whole placement — the four canvas corners the cropped,
+    rotated frame is pinned to. There are no separate move/rotate/skew numbers
+    on purpose: every one of those is just a different way of moving corners,
+    and one representation means the UI can be four drag handles.
+    """
+    serial: str = ""
+    rot_deg: int = 0                                    # 0/90/180/270, clockwise
+    crop: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)   # x,y,w,h normalized
+    quad_mm: tuple[tuple[float, float], ...] = ()       # TL,TR,BL,BR; () = not placed yet
+    height_mm: float = 0.0                              # shifts this camera's depths
+    enabled: bool = True
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "CameraPlacement":
+        d = d or {}
+        p = cls(serial=str(d.get("serial", "")))
+        p.rot_deg = _norm_rot(d.get("rot_deg", 0))
+        p.crop = _norm_crop(d.get("crop"))
+        p.quad_mm = _norm_quad(d.get("quad_mm"))
+        if d.get("height_mm") is not None:
+            try:
+                p.height_mm = float(d["height_mm"])
+            except (TypeError, ValueError):
+                pass
+        p.enabled = bool(d.get("enabled", True))
+        return p
+
+    def to_dict(self) -> dict:
+        return {"serial": self.serial, "rot_deg": self.rot_deg,
+                "crop": list(self.crop),
+                "quad_mm": [list(c) for c in self.quad_mm],
+                "height_mm": self.height_mm, "enabled": self.enabled}
+
+    def merged(self, changes: dict) -> "CameraPlacement":
+        """A NEW placement with `changes` applied — the UI edits one thing at a time."""
+        return CameraPlacement.from_dict({**self.to_dict(), **(changes or {})})
+
+
 @dataclass
 class StitchCalib:
-    """
-    Rig transform mapping camera-2 points into camera 1's frame:
-    p1 = Rz(yaw) @ p2 + [tx, ty, tz]. Millimetres/degrees because that is what
-    the UI edits; converted to metres internally.
-    """
-    tx_mm: float = 400.0    # cam2 offset along cam1 +x (side-by-side baseline)
-    ty_mm: float = 0.0      # offset along cam1 +y (down-image)
-    tz_mm: float = 0.0      # mounting-height difference along the view axis
-    yaw_deg: float = 0.0    # rotation about the viewing axis
-    swap: bool = False      # swap which physical camera plays cam1/cam2
-    rot1: bool = False      # physical camera 1 mounted upside-down (feed rotated 180°)
-    rot2: bool = False      # physical camera 2 mounted upside-down
+    """The whole rig: one placement per camera plus the canvas resolution."""
+    cams: list[CameraPlacement] = field(default_factory=list)
+    mm_per_px: float = STITCH_MM_PER_PX     # 0 = auto from the first camera
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "StitchCalib":
         d = d or {}
-        c = cls()
-        for k in ("tx_mm", "ty_mm", "tz_mm", "yaw_deg"):
-            if k in d and d[k] is not None:
-                setattr(c, k, float(d[k]))
-        c.swap = bool(d.get("swap", False))
-        c.rot1 = bool(d.get("rot1", False))
-        c.rot2 = bool(d.get("rot2", False))
-        return c
+        cams = [CameraPlacement.from_dict(c) for c in (d.get("cams") or [])]
+        try:
+            mm = float(d.get("mm_per_px", STITCH_MM_PER_PX))
+        except (TypeError, ValueError):
+            mm = STITCH_MM_PER_PX
+        return cls(cams=cams, mm_per_px=max(0.0, mm))
 
     def to_dict(self) -> dict:
-        return {"tx_mm": self.tx_mm, "ty_mm": self.ty_mm, "tz_mm": self.tz_mm,
-                "yaw_deg": self.yaw_deg, "swap": self.swap,
-                "rot1": self.rot1, "rot2": self.rot2}
+        return {"cams": [c.to_dict() for c in self.cams],
+                "mm_per_px": self.mm_per_px}
+
+    def placement_for(self, serial: str, index: int) -> CameraPlacement:
+        """Serial wins when there is one; otherwise fall back to position."""
+        if serial:
+            for p in self.cams:
+                if p.serial == serial:
+                    return p
+        if not serial and 0 <= index < len(self.cams):
+            return self.cams[index]
+        return CameraPlacement(serial=serial)
+
+    def with_camera(self, index: int, placement: CameraPlacement) -> "StitchCalib":
+        """A NEW calib with one camera replaced (worker threads may hold the old one)."""
+        if not 0 <= index < len(self.cams):
+            return self
+        cams = list(self.cams)
+        cams[index] = placement
+        return StitchCalib(cams=cams, mm_per_px=self.mm_per_px)
 
 
 @dataclass
@@ -101,117 +204,211 @@ class CameraFrame:
     valid: np.ndarray                   # bool HxW
     intr: Intrinsics
     rgb: Optional[np.ndarray] = None    # uint8 HxWx3 BGR aligned to depth, or None
+    serial: str = ""
 
 
 @dataclass
 class StitchResult:
-    depth_m: np.ndarray                 # float32 HxW — depth below cam1 plane (m)
+    depth_m: np.ndarray                 # float32 HxW — depth below the cameras (m)
     valid: np.ndarray                   # bool HxW
     rgb: np.ndarray                     # uint8 HxWx3 BGR (black where no colour)
     rgb_valid: np.ndarray               # bool HxW
-    overlap: np.ndarray                 # bool HxW — both cameras contributed
+    coverage: np.ndarray                # uint8 HxW — how many cameras hit each pixel
+    overlap: np.ndarray                 # bool HxW — two or more cameras contributed
     mm_per_px: float
-    origin_xy: tuple[float, float]      # world (cam1-frame) x,y of pixel (0,0), metres
-    # Per-camera height grids on the same grid (used by refine_shift).
-    h1: np.ndarray = field(repr=False, default=None)
-    v1: np.ndarray = field(repr=False, default=None)
-    h2: np.ndarray = field(repr=False, default=None)
-    v2: np.ndarray = field(repr=False, default=None)
+    origin_mm: tuple[float, float]      # canvas mm at grid pixel (0,0)
+    # Each camera's placed quad in GRID PIXELS (TL,TR,BL,BR), None when the
+    # camera is disabled or had nothing to show. These are the drag handles.
+    quads_px: list[Optional[list[tuple[float, float]]]] = field(default_factory=list)
 
 
-# ── geometry ──────────────────────────────────────────────────────────────────
+# ── per-camera preparation ────────────────────────────────────────────────────
 
-def rotate180(frame: CameraFrame) -> CameraFrame:
+def _rot90_intr(i: Intrinsics) -> Intrinsics:
+    """Intrinsics after rotating the image 90° CLOCKWISE (w/h and fx/fy swap)."""
+    return Intrinsics(fx=i.fy, fy=i.fx,
+                      cx=(i.height - 1) - i.cy, cy=i.cx,
+                      width=i.height, height=i.width)
+
+
+def rotate_frame(frame: CameraFrame, deg: int) -> CameraFrame:
     """
-    A camera mounted upside-down delivers the scene rotated 180° about its
-    optical axis. Flipping the image both ways and mirroring the principal
-    point makes the frame equivalent to a right-side-up camera, so the rest of
-    the pipeline (and the operator looking at the feed) can forget about it.
+    Undo the mounting orientation: a camera bolted on its side or upside-down
+    delivers the scene rotated about its optical axis. `deg` is clockwise and
+    snaps to 0/90/180/270.
     """
+    k = _norm_rot(deg) // 90
+    if k == 0:
+        return frame
+
+    def rot(a):
+        return None if a is None else np.rot90(a, -k).copy()
+
     intr = frame.intr
-    return CameraFrame(
-        depth_m=frame.depth_m[::-1, ::-1].copy(),
-        valid=frame.valid[::-1, ::-1].copy(),
-        intr=Intrinsics(fx=intr.fx, fy=intr.fy,
-                        cx=(intr.width - 1) - intr.cx,
-                        cy=(intr.height - 1) - intr.cy,
-                        width=intr.width, height=intr.height),
-        rgb=None if frame.rgb is None else frame.rgb[::-1, ::-1].copy(),
-    )
+    for _ in range(k):
+        intr = _rot90_intr(intr)
+    return CameraFrame(rot(frame.depth_m), rot(frame.valid), intr,
+                       rot(frame.rgb), frame.serial)
 
 
-def apply_orientation(f1: CameraFrame, f2: CameraFrame, calib: StitchCalib
-                      ) -> tuple[CameraFrame, CameraFrame]:
-    """Physical frames (serial order) → logical (cam1=left, cam2=right)."""
-    if calib.rot1:
-        f1 = rotate180(f1)
-    if calib.rot2:
-        f2 = rotate180(f2)
-    return (f2, f1) if calib.swap else (f1, f2)
-
-
-def deproject(depth_m: np.ndarray, valid: np.ndarray, intr: Intrinsics
-              ) -> tuple[np.ndarray, np.ndarray]:
+def crop_mask(valid: np.ndarray, crop) -> np.ndarray:
     """
-    Depth image → Nx3 points in the camera frame (metres), plus the flat pixel
-    indices of each point (for looking up the aligned RGB sample later).
+    Keep only the crop rectangle. Done by clearing the valid mask rather than
+    slicing, so the pixel coordinates the corner-pin is built on stay exact.
     """
-    h, w = depth_m.shape
-    vs, us = np.nonzero(valid)
-    z = depth_m[vs, us].astype(np.float64)
-    x = (us.astype(np.float64) - intr.cx) / intr.fx * z
-    y = (vs.astype(np.float64) - intr.cy) / intr.fy * z
-    pts = np.column_stack([x, y, z])
-    return pts, vs * w + us
-
-
-def transform_points(pts: np.ndarray, calib: StitchCalib) -> np.ndarray:
-    """Apply the cam2→cam1 rig transform: yaw about the view axis, then translate."""
-    a = math.radians(calib.yaw_deg)
-    c, s = math.cos(a), math.sin(a)
-    out = np.empty_like(pts)
-    out[:, 0] = c * pts[:, 0] - s * pts[:, 1] + calib.tx_mm / 1000.0
-    out[:, 1] = s * pts[:, 0] + c * pts[:, 1] + calib.ty_mm / 1000.0
-    out[:, 2] = pts[:, 2] + calib.tz_mm / 1000.0
+    x, y, w, h = _norm_crop(crop)
+    ih, iw = valid.shape
+    u0 = max(0, min(iw - 1, int(round(x * iw))))
+    u1 = max(u0 + 1, min(iw, int(round((x + w) * iw))))
+    v0 = max(0, min(ih - 1, int(round(y * ih))))
+    v1 = max(v0 + 1, min(ih, int(round((y + h) * ih))))
+    out = np.zeros_like(valid)
+    out[v0:v1, u0:u1] = valid[v0:v1, u0:u1]
     return out
 
 
-def _auto_mm_per_px(frame: CameraFrame) -> float:
-    """Grid resolution matching cam1's native pixel size at the median depth."""
-    z = frame.depth_m[frame.valid]
-    if z.size == 0:
-        return 2.0
-    med = float(np.median(z))
-    return max(0.5, med * 1000.0 / frame.intr.fx)
+def crop_corners_px(shape, crop) -> np.ndarray:
+    """The crop rectangle's corners in image pixels, TL/TR/BL/BR."""
+    ih, iw = shape[:2]
+    x, y, w, h = _norm_crop(crop)
+    u0, u1 = x * iw, (x + w) * iw
+    v0, v1 = y * ih, (y + h) * ih
+    return np.array([[u0, v0], [u1, v0], [u0, v1], [u1, v1]], np.float32)
 
 
-def _rasterize(pts: np.ndarray, xmin: float, ymin: float, res: float,
-               gw: int, gh: int, extra_weights: list[np.ndarray] | None = None
-               ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
+def median_depth_m(depth_m: np.ndarray, valid: np.ndarray) -> Optional[float]:
+    z = depth_m[valid]
+    return float(np.median(z)) if z.size else None
+
+
+def footprint_mm(frame: CameraFrame) -> tuple[float, float]:
+    """How wide and tall a patch of sand one full frame covers, at median depth."""
+    med = median_depth_m(frame.depth_m, frame.valid) or 0.8
+    return (med * 1000.0 * frame.intr.width / frame.intr.fx,
+            med * 1000.0 * frame.intr.height / frame.intr.fy)
+
+
+def default_quad_mm(footprint: tuple[float, float], crop, index: int
+                    ) -> tuple[tuple[float, float], ...]:
     """
-    Bin points onto the grid. Returns (count, height_sum, [extra_sum, ...])
-    each as float32 gh×gw. `extra_weights` lets RGB channels ride along using
-    the same bin indices.
+    A camera the calibration has never seen: an upright rectangle the size of
+    the patch it actually covers, parked one patch further right than the
+    previous camera. A fresh rig therefore opens as a readable row of frames
+    that the operator drags together, rather than a pile.
     """
-    iu = np.floor((pts[:, 0] - xmin) / res).astype(np.int64)
-    iv = np.floor((pts[:, 1] - ymin) / res).astype(np.int64)
-    m = (iu >= 0) & (iu < gw) & (iv >= 0) & (iv < gh)
-    idx = iv[m] * gw + iu[m]
-    n = gw * gh
-    cnt = np.bincount(idx, minlength=n).astype(np.float32).reshape(gh, gw)
-    hsum = np.bincount(idx, weights=pts[m, 2], minlength=n).astype(np.float32).reshape(gh, gw)
-    extras = []
-    for w in (extra_weights or []):
-        extras.append(np.bincount(idx, weights=w[m], minlength=n)
-                      .astype(np.float32).reshape(gh, gw))
-    return cnt, hsum, extras
+    fw, fh = footprint
+    _, _, cw, ch = _norm_crop(crop)
+    w, h = fw * cw, fh * ch
+    x0 = index * fw
+    return ((x0, 0.0), (x0 + w, 0.0), (x0, h), (x0 + w, h))
+
+
+def rotate_quad(quad, steps: int = 1) -> tuple[tuple[float, float], ...]:
+    """
+    Turn a placed quad a quarter turn (positive = clockwise) about its own
+    centre, re-labelling the corners so the picture inside visibly rotates
+    while keeping its proportions. Pairs with `rot_deg`: rotate the image and
+    its quad together, or the frame ends up stretched into the old shape.
+    """
+    q = [list(p) for p in quad]
+    if len(q) != 4:
+        return tuple(tuple(p) for p in q)
+    for _ in range(steps % 4):
+        cx = sum(p[0] for p in q) / 4.0
+        cy = sum(p[1] for p in q) / 4.0
+        # Clockwise on screen, where y grows down: (dx, dy) → (-dy, dx).
+        spun = [[cx - (p[1] - cy), cy + (p[0] - cx)] for p in q]
+        # After a clockwise image turn the new TL is the old BL, and so on.
+        q = [spun[2], spun[0], spun[3], spun[1]]
+    return tuple((float(p[0]), float(p[1])) for p in q)
+
+
+def requad_for_crop(placement: CameraPlacement, new_crop, shape
+                    ) -> tuple[tuple[float, float], ...]:
+    """
+    Re-cut the placed quad for a new crop so the sand does not move: the new
+    crop rectangle is pushed through the corner-pin the OLD crop defined. Without
+    this, cropping would stretch what is left over the same canvas area and slide
+    the camera out of alignment.
+    """
+    if not placement.quad_mm:
+        return ()
+    src = crop_corners_px(shape, placement.crop)
+    dst = np.asarray(placement.quad_mm, np.float32)
+    h = cv2.getPerspectiveTransform(src, dst)
+    pts = crop_corners_px(shape, new_crop).reshape(-1, 1, 2)
+    out = cv2.perspectiveTransform(pts, h).reshape(-1, 2)
+    return tuple((float(x), float(y)) for x, y in out)
+
+
+@dataclass
+class _Placed:
+    """One camera, ready to warp onto the canvas."""
+    frame: CameraFrame          # rotated
+    valid: np.ndarray           # rotated AND cropped
+    src: np.ndarray             # crop corners in image px (TL,TR,BL,BR)
+    quad: np.ndarray            # canvas corners in mm (TL,TR,BL,BR)
+    height_m: float
+
+
+def _prepare(frame: CameraFrame, p: CameraPlacement, index: int) -> Optional[_Placed]:
+    if not p.enabled:
+        return None
+    g = rotate_frame(frame, p.rot_deg)
+    valid = crop_mask(g.valid, p.crop)
+    if not valid.any():
+        return None
+    quad = p.quad_mm or default_quad_mm(footprint_mm(g), p.crop, index)
+    # A corner dragged past its neighbours folds the quad over, and the warp
+    # would smear that camera across the canvas. Park it back on its default
+    # rather than leaving the operator a blank view to fix.
+    if quad_area_mm2(quad) <= 1.0:
+        quad = default_quad_mm(footprint_mm(g), p.crop, index)
+    return _Placed(g, valid, crop_corners_px(g.depth_m.shape, p.crop),
+                   np.asarray(quad, np.float32), p.height_mm / 1000.0)
+
+
+def bind_placements(calib: StitchCalib, frames: list[CameraFrame]) -> StitchCalib:
+    """
+    Match saved placements to the cameras actually plugged in: by serial first,
+    then positionally for placements saved without one (or from a rig whose
+    cameras were swapped out), then defaults for anything left over. Returns a
+    NEW calib whose `cams` is index-aligned with `frames`.
+    """
+    taken: set[int] = set()
+    out: list[Optional[CameraPlacement]] = [None] * len(frames)
+    for k, f in enumerate(frames):
+        for j, p in enumerate(calib.cams):
+            if j not in taken and p.serial and p.serial == f.serial:
+                out[k] = replace(p, serial=f.serial)
+                taken.add(j)
+                break
+    spare = [j for j in range(len(calib.cams)) if j not in taken]
+    for k, f in enumerate(frames):
+        if out[k] is None and spare:
+            out[k] = replace(calib.cams[spare.pop(0)], serial=f.serial)
+    for k, f in enumerate(frames):
+        if out[k] is None:
+            out[k] = CameraPlacement(serial=f.serial)
+    return StitchCalib(cams=[p for p in out if p is not None],
+                       mm_per_px=calib.mm_per_px)
+
+
+# ── the canvas ────────────────────────────────────────────────────────────────
+
+def _auto_mm_per_px(placed: list[_Placed]) -> float:
+    """Resolution that keeps the first camera at roughly its native detail."""
+    p = placed[0]
+    w_mm = float(np.hypot(*(p.quad[1] - p.quad[0])))
+    w_px = float(np.hypot(*(p.src[1] - p.src[0])))
+    return max(0.1, w_mm / max(1.0, w_px))
 
 
 def fill_small_holes(height: np.ndarray, valid: np.ndarray, iters: int = 2
                      ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Fill 1-2 px rasterization holes with the mean of valid 3×3 neighbours.
-    Large gaps (outside both footprints) stay invalid.
+    Fill 1-2 px speckle holes with the mean of valid 3×3 neighbours. Large gaps
+    (outside every footprint, or a real dropout) stay invalid.
     """
     h = height.astype(np.float32).copy()
     v = valid.copy()
@@ -226,213 +423,92 @@ def fill_small_holes(height: np.ndarray, valid: np.ndarray, iters: int = 2
     return h, v
 
 
-def stitch(f1: CameraFrame, f2: CameraFrame, calib: StitchCalib,
-           mm_per_px: float = STITCH_MM_PER_PX) -> StitchResult:
-    """
-    Merge two camera frames into one top-down heightmap in cam1's frame.
-    f1/f2 are the PHYSICAL frames (serial order); calib's rot/swap flags are
-    applied here.
-    """
-    f1, f2 = apply_orientation(f1, f2, calib)
+def _empty_result(n_cams: int, mm_per_px: float) -> StitchResult:
+    empty = np.zeros((2, 2), np.float32)
+    return StitchResult(empty, empty.astype(bool), np.zeros((2, 2, 3), np.uint8),
+                        empty.astype(bool), empty.astype(np.uint8),
+                        empty.astype(bool), max(mm_per_px, 1.0), (0.0, 0.0),
+                        [None] * n_cams)
 
-    p1, idx1 = deproject(f1.depth_m, f1.valid, f1.intr)
-    p2, idx2 = deproject(f2.depth_m, f2.valid, f2.intr)
-    p2 = transform_points(p2, calib)
+
+def stitch(frames: list[CameraFrame], calib: StitchCalib,
+           mm_per_px: Optional[float] = None) -> StitchResult:
+    """
+    Lay every camera's frame onto the shared canvas through its corner-pin.
+    `frames` are the raw per-device captures in enumeration order; the rotation,
+    crop and placement in `calib` are applied here.
+    """
+    if mm_per_px is None:
+        mm_per_px = calib.mm_per_px
+
+    prepared = [_prepare(f, calib.placement_for(f.serial, i), i)
+                for i, f in enumerate(frames)]
+    live = [q for q in prepared if q is not None]
+    if not live:
+        return _empty_result(len(frames), mm_per_px if mm_per_px > 0 else 2.0)
 
     if mm_per_px <= 0:
-        mm_per_px = _auto_mm_per_px(f1)
-    res = mm_per_px / 1000.0
+        mm_per_px = _auto_mm_per_px(live)
 
-    allx = np.concatenate([p1[:, 0], p2[:, 0]]) if p2.size else p1[:, 0]
-    ally = np.concatenate([p1[:, 1], p2[:, 1]]) if p2.size else p1[:, 1]
-    if allx.size == 0:
-        empty = np.zeros((2, 2), np.float32)
-        return StitchResult(empty, empty.astype(bool),
-                            np.zeros((2, 2, 3), np.uint8), empty.astype(bool),
-                            empty.astype(bool), mm_per_px, (0.0, 0.0))
-    # Percentile bounds resist stray outlier points; quantized so the grid does
-    # not jitter frame to frame.
-    q = res * 8
-    xmin = math.floor(np.percentile(allx, 0.5) / q) * q
-    ymin = math.floor(np.percentile(ally, 0.5) / q) * q
-    xmax = math.ceil(np.percentile(allx, 99.5) / q) * q
-    ymax = math.ceil(np.percentile(ally, 99.5) / q) * q
-    gw = int(round((xmax - xmin) / res))
-    gh = int(round((ymax - ymin) / res))
+    corners = np.concatenate([q.quad for q in live])
+    xmin, ymin = float(corners[:, 0].min()), float(corners[:, 1].min())
+    xmax, ymax = float(corners[:, 0].max()), float(corners[:, 1].max())
+    # Quantize the origin so the canvas does not shuffle by a pixel every frame.
+    step = mm_per_px * 8
+    xmin = math.floor(xmin / step) * step
+    ymin = math.floor(ymin / step) * step
+    gw = int(math.ceil((xmax - xmin) / mm_per_px))
+    gh = int(math.ceil((ymax - ymin) / mm_per_px))
     # Cap the grid by coarsening resolution, never by cropping coverage.
     scale = max(gw / STITCH_MAX_GRID_W, gh / STITCH_MAX_GRID_H, 1.0)
     if scale > 1.0:
-        res *= scale
         mm_per_px *= scale
-        gw = max(1, int(round((xmax - xmin) / res)))
-        gh = max(1, int(round((ymax - ymin) / res)))
-    gw = max(gw, 16)
-    gh = max(gh, 16)
+        gw = max(1, int(math.ceil((xmax - xmin) / mm_per_px)))
+        gh = max(1, int(math.ceil((ymax - ymin) / mm_per_px)))
+    gw, gh = max(gw, 16), max(gh, 16)
 
-    def rgb_weights(f: CameraFrame, idx: np.ndarray) -> tuple[list[np.ndarray], np.ndarray]:
-        n = idx.shape[0]
-        if f.rgb is None:
-            z = np.zeros(n, np.float64)
-            return [z, z, z], np.zeros(n, bool)
-        flat = f.rgb.reshape(-1, 3).astype(np.float64)
-        samples = flat[idx]
-        has = samples.sum(axis=1) > 0    # aligned-RGB black = outside colour FOV
-        return [samples[:, 0] * has, samples[:, 1] * has, samples[:, 2] * has], has
+    depth_sum = np.zeros((gh, gw), np.float32)
+    coverage = np.zeros((gh, gw), np.uint8)
+    rgb_sum = np.zeros((gh, gw, 3), np.float32)
+    rgb_cnt = np.zeros((gh, gw), np.float32)
+    quads_px: list[Optional[list[tuple[float, float]]]] = []
 
-    w1, has1 = rgb_weights(f1, idx1)
-    w2, has2 = rgb_weights(f2, idx2)
+    for q in prepared:
+        if q is None:
+            quads_px.append(None)
+            continue
+        dst = (q.quad - np.array([xmin, ymin], np.float32)) / mm_per_px
+        quads_px.append([(float(u), float(v)) for u, v in dst])
+        h = cv2.getPerspectiveTransform(q.src, dst.astype(np.float32))
+        # NEAREST everywhere: interpolating depth across a dropout would invent
+        # surface that is not there, and the mask must stay strictly binary.
+        src_depth = np.where(q.valid, q.frame.depth_m, 0.0).astype(np.float32)
+        warped = cv2.warpPerspective(src_depth, h, (gw, gh), flags=cv2.INTER_NEAREST)
+        hit = cv2.warpPerspective(q.valid.astype(np.uint8), h, (gw, gh),
+                                  flags=cv2.INTER_NEAREST) > 0
+        depth_sum[hit] += warped[hit] + q.height_m
+        coverage += hit.astype(np.uint8)
+        if q.frame.rgb is not None:
+            colour = np.where(q.valid[..., None], q.frame.rgb, 0)
+            cw = cv2.warpPerspective(colour, h, (gw, gh), flags=cv2.INTER_NEAREST)
+            has = hit & (cw.sum(axis=2) > 0)   # aligned-RGB black = outside colour FOV
+            rgb_sum[has] += cw[has]
+            rgb_cnt += has.astype(np.float32)
 
-    c1, s1, e1 = _rasterize(p1, xmin, ymin, res, gw, gh, w1 + [has1.astype(np.float64)])
-    c2, s2, e2 = _rasterize(p2, xmin, ymin, res, gw, gh, w2 + [has2.astype(np.float64)])
+    valid = coverage > 0
+    depth = np.zeros((gh, gw), np.float32)
+    depth[valid] = depth_sum[valid] / coverage[valid]
+    overlap = coverage >= 2
+    depth, valid = fill_small_holes(depth, valid)
 
-    cnt = c1 + c2
-    valid = cnt > 0
-    height = np.zeros((gh, gw), np.float32)
-    height[valid] = (s1 + s2)[valid] / cnt[valid]
-    overlap = (c1 > 0) & (c2 > 0)
-
-    # Per-camera grids kept for refine_shift, BEFORE hole filling.
-    h1 = np.zeros_like(height); v1 = c1 > 0
-    h1[v1] = s1[v1] / c1[v1]
-    h2 = np.zeros_like(height); v2 = c2 > 0
-    h2[v2] = s2[v2] / c2[v2]
-
-    height, valid = fill_small_holes(height, valid)
-
-    # RGB: last extra channel is the per-bin colour-sample count.
     rgb = np.zeros((gh, gw, 3), np.uint8)
-    if e1 and e2:
-        rc = e1[3] + e2[3]
-        rgb_valid = rc > 0
-        for ch in range(3):
-            plane = np.zeros((gh, gw), np.float32)
-            plane[rgb_valid] = (e1[ch] + e2[ch])[rgb_valid] / rc[rgb_valid]
-            rgb[:, :, ch] = np.clip(plane, 0, 255).astype(np.uint8)
-        for ch in range(3):  # fill pinholes so the colour view reads cleanly
-            filled, _ = fill_small_holes(rgb[:, :, ch].astype(np.float32), rgb_valid)
-            rgb[:, :, ch] = np.clip(filled, 0, 255).astype(np.uint8)
-        _, rgb_valid = fill_small_holes(np.zeros_like(height), rgb_valid)
-        rgb[~rgb_valid] = 0
-    else:
-        rgb_valid = np.zeros((gh, gw), bool)
+    rgb_valid = rgb_cnt > 0
+    if rgb_valid.any():
+        rgb[rgb_valid] = np.clip(
+            rgb_sum[rgb_valid] / rgb_cnt[rgb_valid, None], 0, 255).astype(np.uint8)
 
-    return StitchResult(height, valid, rgb, rgb_valid, overlap, mm_per_px,
-                        (xmin, ymin), h1=h1, v1=v1, h2=h2, v2=v2)
-
-
-# ── overlap auto-refine / auto-align ──────────────────────────────────────────
-
-def _overlap_patches(result: StitchResult, min_overlap_px: int
-                     ) -> Optional[tuple[np.ndarray, np.ndarray]]:
-    """
-    Detrended, unit-std height patches of the two cameras over the overlap
-    band's bounding box, or None if the overlap is too small.
-    """
-    both = result.v1 & result.v2
-    if int(both.sum()) < min_overlap_px:
-        return None
-    vs, us = np.nonzero(both)
-    y0, y1 = vs.min(), vs.max() + 1
-    x0, x1 = us.min(), us.max() + 1
-
-    def patch(h: np.ndarray, v: np.ndarray) -> np.ndarray:
-        p = h[y0:y1, x0:x1].astype(np.float32)
-        m = v[y0:y1, x0:x1]
-        mean = p[m].mean() if m.any() else 0.0
-        p = np.where(m, p, mean)
-        p -= cv2.blur(p, (31, 31))       # detrend: align on relief, not tilt
-        std = p.std()
-        return (p / std if std > 1e-9 else p).astype(np.float32)
-
-    return patch(result.h1, result.v1), patch(result.h2, result.v2)
-
-
-def overlap_score(result: StitchResult, min_overlap_px: int = 300
-                  ) -> Optional[float]:
-    """
-    How well the two cameras' height relief agrees inside the overlap band
-    (~normalized correlation, 1 = identical). None if the overlap is too small.
-    Flat sand scores ≈ 0 — there is nothing to agree on.
-    """
-    patches = _overlap_patches(result, min_overlap_px)
-    if patches is None:
-        return None
-    pa, pb = patches
-    return float((pa * pb).mean())
-
-
-def refine_shift(result: StitchResult, min_overlap_px: int = 400
-                 ) -> Optional[tuple[float, float]]:
-    """
-    Estimate the residual XY misalignment between the two cameras from the
-    overlap band of an existing stitch, by phase-correlating the two detrended
-    height patches. Returns (dtx_mm, dty_mm) to ADD to the calibration's
-    tx_mm/ty_mm, or None if the overlap is too small / correlation too weak.
-    Needs some relief (grooves, objects) in the overlap — flat sand has nothing
-    to correlate.
-    """
-    patches = _overlap_patches(result, min_overlap_px)
-    if patches is None:
-        return None
-    pa, pb = patches
-    ph, pw = pa.shape
-    if ph < 32 or pw < 32:
-        return None
-    # Exhaustive translation search: an interior crop of cam2's patch slid over
-    # cam1's patch. Deterministic (no convergence basin needed — the grooves
-    # can be narrower than the misalignment) and the margin sets the maximum
-    # detectable shift. ±1 px ≈ ±1 grid-mm accuracy, plenty for a rig trim.
-    my = min(40, ph // 4)
-    mx = min(40, pw // 4)
-    templ = pb[my:ph - my, mx:pw - mx]
-    scores = cv2.matchTemplate(pa, templ, cv2.TM_CCOEFF_NORMED)
-    _, best, _, loc = cv2.minMaxLoc(scores)
-    if best < 0.2:                       # nothing distinctive in the overlap
-        return None
-    # Template found at `loc` in pa; cam2's content sits shifted by
-    # (m - loc) grid px, and the correction is the negative of that shift.
-    return (float(loc[0] - mx) * result.mm_per_px,
-            float(loc[1] - my) * result.mm_per_px)
-
-
-def auto_align(f1: CameraFrame, f2: CameraFrame, calib: StitchCalib,
-               mm_per_px: float = STITCH_MM_PER_PX, coarse_mm: float = 6.0,
-               min_score: float = 0.25) -> Optional[StitchCalib]:
-    """
-    Find the side-by-side baseline automatically: sweep candidate tx values
-    over plausible spacings (55–100 % of one camera footprint, i.e. up to
-    ~45 % overlap), score each coarse stitch by how well the two cameras'
-    relief agrees in the resulting overlap band, then fine-trim the winner
-    with refine_shift. Returns a new calibration (tx/ty replaced; rot, swap,
-    tz and yaw kept from `calib`) or None when no candidate scores — which is
-    what flat, featureless sand produces; there must be a groove or object
-    crossing the seam.
-    """
-    # RGB rides along in stitch(); strip it — 20 coarse stitches only need depth.
-    a = CameraFrame(f1.depth_m, f1.valid, f1.intr, None)
-    b = CameraFrame(f2.depth_m, f2.valid, f2.intr, None)
-    ref = apply_orientation(a, b, calib)[0]        # the frame acting as cam1
-    z = ref.depth_m[ref.valid]
-    if z.size == 0:
-        return None
-    foot_mm = float(np.median(z)) * 1000.0 * ref.intr.width / ref.intr.fx
-    best_tx, best_score = None, -1.0
-    for frac in np.arange(0.55, 1.0, 0.025):
-        cand = StitchCalib(**{**calib.to_dict(),
-                              "tx_mm": frac * foot_mm, "ty_mm": 0.0})
-        score = overlap_score(stitch(a, b, cand, coarse_mm))
-        if score is not None and score > best_score:
-            best_tx, best_score = cand.tx_mm, score
-    if best_tx is None or best_score < min_score:
-        return None
-    out = StitchCalib(**{**calib.to_dict(), "tx_mm": best_tx, "ty_mm": 0.0})
-    # Sweep steps (~2.5 % of a footprint) land well inside refine_shift's
-    # search margin, so the trim converges in one pass.
-    delta = refine_shift(stitch(a, b, out, mm_per_px))
-    if delta is not None:
-        out.tx_mm += delta[0]
-        out.ty_mm += delta[1]
-    return out
+    return StitchResult(depth, valid, rgb, rgb_valid, coverage, overlap,
+                        mm_per_px, (xmin, ymin), quads_px)
 
 
 # ── synthetic scene (no-hardware fallback + tests) ────────────────────────────
@@ -440,11 +516,10 @@ def auto_align(f1: CameraFrame, f2: CameraFrame, calib: StitchCalib,
 def _world_relief_mm(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     """
     Groove pattern carved into the synthetic sand, in mm below the flat surface.
-    Spans a wide footprint so strokes cross the seam between the two cameras.
-    x, y in metres (cam1 frame).
+    Spans a wide footprint so strokes cross every seam. x, y in metres.
     """
     relief = np.zeros_like(x)
-    # A long wavy groove running left-right across both footprints.
+    # A long wavy groove running left-right across all footprints.
     cy = 0.05 * np.sin(x * 7.0)
     relief += 2.5 * np.exp(-((y - cy) ** 2) / (2 * 0.006 ** 2))
     # A diagonal straight groove.
@@ -453,59 +528,60 @@ def _world_relief_mm(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     return relief
 
 
-def synthetic_frame(intr: Intrinsics, cam_from_world: StitchCalib | None,
+def synthetic_frame(intr: Intrinsics, tx_mm: float = 0.0, ty_mm: float = 0.0,
                     plane_z_m: float = 0.8, noise_mm: float = 0.35,
-                    rng: np.random.Generator | None = None) -> CameraFrame:
+                    rng: np.random.Generator | None = None,
+                    serial: str = "") -> CameraFrame:
     """
-    Render what one camera sees of the synthetic sand plane. `cam_from_world`
-    is the camera's pose in cam1's frame (None/identity for cam1 itself); the
-    surface lives at z = plane_z_m below cam1.
+    Render what one camera sees of the synthetic sand plane, given where it
+    hangs over the canvas (tx/ty in mm). The surface lies plane_z_m below.
     """
     rng = rng or np.random.default_rng(0)
     h, w = intr.height, intr.width
     us, vs = np.meshgrid(np.arange(w, dtype=np.float64),
                          np.arange(h, dtype=np.float64))
-    calib = cam_from_world or StitchCalib(tx_mm=0, ty_mm=0, tz_mm=0, yaw_deg=0)
-    a = math.radians(calib.yaw_deg)
-    c, s = math.cos(a), math.sin(a)
-    z0 = plane_z_m - calib.tz_mm / 1000.0          # flat-plane depth from this camera
-    xr = (us - intr.cx) / intr.fx * z0             # rays at the plane, camera frame
-    yr = (vs - intr.cy) / intr.fy * z0
-    xw = c * xr - s * yr + calib.tx_mm / 1000.0    # → world (cam1) frame
-    yw = s * xr + c * yr + calib.ty_mm / 1000.0
-    depth = z0 + _world_relief_mm(xw, yw) / 1000.0
+    xw = (us - intr.cx) / intr.fx * plane_z_m + tx_mm / 1000.0
+    yw = (vs - intr.cy) / intr.fy * plane_z_m + ty_mm / 1000.0
+    depth = plane_z_m + _world_relief_mm(xw, yw) / 1000.0
     depth += rng.normal(0.0, noise_mm / 1000.0, size=depth.shape)
     valid = rng.random(depth.shape) > 0.01         # ~1% dropout speckle
     depth = depth.astype(np.float32)
     depth[~valid] = 0.0
 
     # Fake aligned RGB: sand colour, black band at the frame edges imitating
-    # the narrower colour FOV (so the stitched RGB shows the expected gap).
+    # the narrower colour FOV (so the stitched RGB shows the expected gaps).
     rgb = np.full((h, w, 3), (96, 130, 168), np.uint8)   # BGR sand tone
     shade = np.clip(1.0 - 0.12 * _world_relief_mm(xw, yw), 0.0, 1.0)
     rgb = (rgb.astype(np.float32) * shade[..., None]).astype(np.uint8)
     edge = int(w * 0.10)
     rgb[:, :edge] = 0
     rgb[:, -edge:] = 0
-    return CameraFrame(depth_m=depth, valid=valid, intr=intr, rgb=rgb)
+    return CameraFrame(depth_m=depth, valid=valid, intr=intr, rgb=rgb, serial=serial)
 
 
-def synthetic_pair(overlap_frac: float = 0.08, plane_z_m: float = 0.8,
-                   yaw2_deg: float = 1.5, seed: int = 0
-                   ) -> tuple[CameraFrame, CameraFrame, StitchCalib]:
+def synthetic_scene(n: int = 2, overlap_frac: float = 0.08,
+                    plane_z_m: float = 0.8, seed: int = 0
+                    ) -> tuple[list[CameraFrame], StitchCalib]:
     """
-    Two synthetic cameras side by side with the requested footprint overlap.
-    Returns (frame1, frame2, true_calib) — feed true_calib to stitch() for a
-    perfect merge, or perturb it to exercise refine_shift().
+    `n` synthetic cameras in a row with the requested footprint overlap.
+    Returns (frames, true_calib) — feed true_calib to stitch() for a perfect
+    merge, or move a quad to exercise the placement controls.
     """
     intr = Intrinsics.nominal()
     rng = np.random.default_rng(seed)
-    footprint_w = plane_z_m * intr.width / intr.fx
-    baseline = footprint_w * (1.0 - overlap_frac)
-    true_calib = StitchCalib(tx_mm=baseline * 1000.0, ty_mm=0.0, tz_mm=0.0,
-                             yaw_deg=yaw2_deg)
-    f1 = synthetic_frame(intr, None, plane_z_m, rng=rng)
-    # Render cam2 with the INVERSE view: pixels of cam2 map to world through
-    # its pose, which is exactly what synthetic_frame(cam_from_world) does.
-    f2 = synthetic_frame(intr, true_calib, plane_z_m, rng=rng)
-    return f1, f2, true_calib
+    fw = plane_z_m * intr.width / intr.fx * 1000.0     # footprint, mm
+    fh = plane_z_m * intr.height / intr.fy * 1000.0
+    baseline = fw * (1.0 - overlap_frac)
+    # Where each camera's full frame lands on the canvas, exactly as rendered.
+    x0 = -intr.cx / intr.fx * plane_z_m * 1000.0
+    y0 = -intr.cy / intr.fy * plane_z_m * 1000.0
+    frames, cams = [], []
+    for i in range(max(1, n)):
+        serial = f"SYN-{i + 1}"
+        tx = i * baseline
+        frames.append(synthetic_frame(intr, tx_mm=tx, plane_z_m=plane_z_m,
+                                      rng=rng, serial=serial))
+        left, top = x0 + tx, y0
+        cams.append(CameraPlacement(serial=serial, quad_mm=(
+            (left, top), (left + fw, top), (left, top + fh), (left + fw, top + fh))))
+    return frames, StitchCalib(cams=cams)

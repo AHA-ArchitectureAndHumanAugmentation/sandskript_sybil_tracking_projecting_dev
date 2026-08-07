@@ -1,9 +1,12 @@
 """
-aiohttp server for the Dual-Cam Vision prototype (port 5006).
+aiohttp server for the Multi-Cam Vision prototype (port 5006).
 
-Serves the UI (viewer/stitch.html), the MJPEG streams (stitched depth / RGB /
-mask / skeleton, plus the per-camera left/right setup views) and a small JSON
-WebSocket for the stitch toggle, calibration and detection-parameter controls.
+Serves the UI (viewer/stitch.html), the MJPEG streams (the combined canvas plus
+one thumbnail per connected camera) and a small JSON WebSocket for the
+per-camera placement controls. There is ONE screen and no detection here — the
+tool exists only to lay the cameras' frames next to each other; grooves are
+detected, and their parameters tuned, in the main app.
+
 Completely separate from server.py — this tool must stay contained from
 Developer/Participant Mode. Like the main app, the process exits (SIGINT) when
 the last browser tab closes.
@@ -20,23 +23,23 @@ from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
-from config import HTTP_HOST, STITCH_CALIB_FILE, STITCH_HTTP_PORT
-from depth_extractor import DepthGrooveParams
-from dual_camera import DualCameraThread
+from config import (
+    HTTP_HOST, STITCH_CALIB_FILE, STITCH_HTTP_PORT, STITCH_MAX_CAMERAS,
+)
+from multi_camera import MultiCameraThread, cam_key
 from stitcher import StitchCalib
 
 _VIEWER_DIR = Path(__file__).parent / "viewer"
 
 
 class StitchServer:
-    def __init__(self, camera: DualCameraThread,
+    def __init__(self, camera: MultiCameraThread,
                  shared_state: dict, state_lock: threading.Lock) -> None:
         self._camera = camera
         self._state = shared_state
         self._lock = state_lock
         self._ws_clients: set[web.WebSocketResponse] = set()
         self._had_client = False
-        self._params = DepthGrooveParams()
         self._app = self._build_app()
 
     def _build_app(self) -> web.Application:
@@ -45,21 +48,18 @@ class StitchServer:
         @web.middleware
         async def no_cache(request, handler):
             resp = await handler(request)
-            if request.path == "/":
+            # The page AND its script: a cached stitch.js against a restarted
+            # server is a browser talking a protocol the server no longer speaks.
+            if request.path == "/" or request.path.startswith("/static/"):
                 resp.headers["Cache-Control"] = "no-store"
             return resp
 
         app.middlewares.append(no_cache)
         app.router.add_get("/", self._handle_index)
-        app.router.add_get("/stitch/depth", lambda r: self._mjpeg(r, "stitch_depth_jpg"))
-        app.router.add_get("/stitch/rgb", lambda r: self._mjpeg(r, "stitch_rgb_jpg"))
-        app.router.add_get("/stitch/mask", lambda r: self._mjpeg(r, "stitch_mask_jpg"))
-        app.router.add_get("/stitch/skel", lambda r: self._mjpeg(r, "stitch_skel_jpg"))
-        # Per-camera setup views (stitch OFF), already oriented left/right.
-        app.router.add_get("/cam/left/depth", lambda r: self._mjpeg(r, "stitch_left_depth_jpg"))
-        app.router.add_get("/cam/left/rgb", lambda r: self._mjpeg(r, "stitch_left_rgb_jpg"))
-        app.router.add_get("/cam/right/depth", lambda r: self._mjpeg(r, "stitch_right_depth_jpg"))
-        app.router.add_get("/cam/right/rgb", lambda r: self._mjpeg(r, "stitch_right_rgb_jpg"))
+        app.router.add_get("/canvas", lambda r: self._mjpeg(r, "stitch_canvas_jpg"))
+        # One thumbnail per camera, indexed by enumeration order — the same
+        # index the placement controls edit.
+        app.router.add_get("/cam/{index}", self._handle_cam)
         app.router.add_get("/ws", self._handle_ws)
         app.router.add_static("/static", _VIEWER_DIR, show_index=False)
         return app
@@ -75,6 +75,12 @@ class StitchServer:
     async def _handle_index(self, request: web.Request) -> web.FileResponse:
         return web.FileResponse(_VIEWER_DIR / "stitch.html")
 
+    async def _handle_cam(self, request: web.Request) -> web.StreamResponse:
+        index = _as_index(request.match_info.get("index"))
+        if index is None:
+            raise web.HTTPNotFound()
+        return await self._mjpeg(request, cam_key(index))
+
     async def _mjpeg(self, request: web.Request, key: str) -> web.StreamResponse:
         response = web.StreamResponse()
         response.content_type = "multipart/x-mixed-replace; boundary=frame"
@@ -86,7 +92,7 @@ class StitchServer:
                 if jpg:
                     await response.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
                                          + jpg + b"\r\n")
-                await asyncio.sleep(0.2)   # streams refresh at the stitch cadence
+                await asyncio.sleep(0.2)   # streams refresh at the canvas cadence
         except (ConnectionResetError, asyncio.CancelledError):
             pass
         return response
@@ -100,8 +106,8 @@ class StitchServer:
         await ws.send_str(json.dumps({
             "type": "init",
             "calib": self._camera.get_calib().to_dict(),
-            "params": _params_dict(self._params),
-            "stitch_on": self._camera.get_stitch(),
+            "colour": self._camera.get_colour(),
+            "max_cameras": STITCH_MAX_CAMERAS,
         }))
         try:
             async for msg in ws:
@@ -117,48 +123,44 @@ class StitchServer:
         return ws
 
     async def _dispatch(self, ws, mtype: str, params: dict) -> None:
-        if mtype == "set_params":
-            self._params = DepthGrooveParams.from_dict(params)
-            self._camera.set_params(self._params)
-        elif mtype == "set_calib":
-            merged = {**self._camera.get_calib().to_dict(), **params}
-            self._camera.set_calib(StitchCalib.from_dict(merged))
-        elif mtype == "set_stitch":
-            was = self._camera.get_stitch()
-            on = bool(params.get("on"))
-            self._camera.set_stitch(on)
-            if on and not was:
-                # Turning the stitch on attempts the overlap search right away;
-                # on failure the current calibration simply stays.
-                self._camera.request_align()
-        elif mtype == "auto_align":
-            self._camera.request_align()
-        elif mtype == "auto_refine":
-            self._camera.request_refine()
+        index = _as_index(params.get("index"))
+        if mtype == "set_camera":
+            if index is not None:
+                self._camera.set_placement(
+                    index, {k: v for k, v in params.items() if k != "index"})
+        elif mtype == "rotate_camera":
+            if index is not None:
+                self._camera.rotate_camera(index, _as_steps(params.get("steps"), 1))
+        elif mtype == "nudge_height":
+            if index is not None:
+                self._camera.nudge_height(index, _as_steps(params.get("steps"), 1))
+        elif mtype == "reset_camera":
+            if index is not None:
+                self._camera.reset_camera(index, bool(params.get("corners_only")))
+        elif mtype == "set_grid":
+            try:
+                self._camera.set_grid(float(params.get("mm_per_px", 0.0)))
+            except (TypeError, ValueError):
+                pass
+        elif mtype == "set_colour":
+            self._camera.set_colour(bool(params.get("on")))
         elif mtype == "save_calib":
             calib = self._camera.get_calib().to_dict()
             STITCH_CALIB_FILE.write_text(json.dumps(calib, indent=2))
             await ws.send_str(json.dumps({
                 "type": "save_result", "success": True,
-                "message": f"Calibration saved to {STITCH_CALIB_FILE}"}))
+                "message": f"Layout saved to {STITCH_CALIB_FILE}"}))
 
     # ── state broadcast + last-tab shutdown ──────────────────────────────────
     async def _broadcast_loop(self) -> None:
         empty_since = None
-        last_refine = None
         while True:
             with self._lock:
                 info = self._state.get("stitch_info")
                 note = self._state.get("stitch_note")
                 calib = self._state.get("stitch_calib")
-                refine = self._state.get("stitch_refine_result")
-                stitch_on = self._state.get("stitch_on", self._camera.get_stitch())
-            payload = {"type": "state", "info": info, "note": note,
-                       "calib": calib, "stitch_on": stitch_on}
-            if refine is not None and refine is not last_refine:
-                payload["refine"] = refine
-                last_refine = refine
-            text = json.dumps(payload)
+            text = json.dumps({"type": "state", "info": info, "note": note,
+                               "calib": calib})
             for ws in list(self._ws_clients):
                 try:
                     await ws.send_str(text)
@@ -175,22 +177,26 @@ class StitchServer:
             await asyncio.sleep(0.25)
 
 
-def _params_dict(p: DepthGrooveParams) -> dict:
-    return {
-        "detect": p.detect,
-        "smooth_sigma_px": p.smooth_sigma_px,
-        "detrend_sigma_px": p.detrend_sigma_px,
-        "groove_depth_mm": p.groove_depth_mm,
-        "min_blob_px": p.min_blob_px,
-        "min_mean_depth_mm": p.min_mean_depth_mm,
-        "min_width_mm": p.min_width_mm,
-        "max_width_mm": p.max_width_mm,
-        "min_length_mm": p.min_length_mm,
-    }
+def _as_index(value) -> int | None:
+    """Camera index from the browser; anything out of range is ignored."""
+    try:
+        index = int(value)
+    except (TypeError, ValueError):
+        return None
+    return index if 0 <= index < STITCH_MAX_CAMERAS else None
+
+
+def _as_steps(value, default: int) -> int:
+    """A quarter turn / height nudge count, bounded so one message stays small."""
+    try:
+        steps = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(-8, min(8, steps))
 
 
 def load_saved_calib() -> StitchCalib:
-    """Read stitch_calibration.json if present, else defaults."""
+    """Read stitch_calibration.json if present, else an empty rig."""
     try:
         return StitchCalib.from_dict(json.loads(STITCH_CALIB_FILE.read_text()))
     except (OSError, json.JSONDecodeError, ValueError):
