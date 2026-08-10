@@ -7,6 +7,12 @@ Each save produces a timestamped subfolder under ``paths/`` containing:
   - path.json    the same strokes as 6-DOF poses PLUS a full plane/frame per
                  waypoint (origin + x/y/z axes), for frame-guided workflows.
   - preview.png  the 3D Path Preview image, so an operator can identify the file.
+  - mask.png     the thick detected-region mask the path came from.
+  - skeleton.png the 1-px groove centrelines the strokes were traced along.
+
+The last two are the detection stage as it stood at save time, cropped to the
+same region the strokes were extracted from — what the sand actually looked
+like to the detector, kept alongside the path it produced.
 
 Strokes are the robot-space poses from Generate Path: a list of strokes, each a
 list of ``[x, y, z, rx, ry, rz]`` (metres, UR rotation vector). The run-time
@@ -20,13 +26,18 @@ import math
 from datetime import datetime
 from pathlib import Path
 
+import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from config import PATHS_DIR, DRAW_ACCEL, TRAVEL_ACCEL, MOVEP_BLEND_M
+from config import (
+    PATHS_DIR, DRAW_ACCEL, TRAVEL_ACCEL, MOVEP_BLEND_M, PREVIEW_MAX_BYTES,
+)
 
 Pose = list           # [x, y, z, rx, ry, rz]
 Strokes = list        # list[list[Pose]]
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 # ── geometry helpers (mirror path_executor) ──────────────────────────────────
@@ -126,6 +137,23 @@ def _decode_png(data_url: str | None) -> bytes | None:
         return None
 
 
+def is_png_data_url(value, max_bytes: int = PREVIEW_MAX_BYTES) -> bool:
+    """
+    True for a browser ``canvas.toDataURL("image/png")`` payload worth keeping.
+
+    Participant Mode takes its preview image from whatever a Developer window
+    pushes up rather than from a Save click, so this is the gate on a
+    client-supplied blob: right prefix, real base64, a genuine PNG signature,
+    and small enough to sit in memory until the save.
+    """
+    if not isinstance(value, str) or not value.startswith("data:image/png;base64,"):
+        return False
+    if len(value) > max_bytes * 2:       # base64 is ~4/3 of the bytes; cheap pre-check
+        return False
+    png = _decode_png(value)
+    return bool(png) and len(png) <= max_bytes and png[:8] == PNG_SIGNATURE
+
+
 def save_bundle(
     strokes: Strokes,
     speed: float,
@@ -135,8 +163,12 @@ def save_bundle(
     preview_png_data_url: str | None = None,
     base_dir: Path | None = None,
     blend_m: float = MOVEP_BLEND_M,
+    mask=None,
+    skeleton=None,
 ) -> Path:
-    """Write path.script + path.json (+ preview.png) into a timestamped folder."""
+    """Write path.script + path.json (+ preview/mask/skeleton .png) into a
+    timestamped folder. `mask` and `skeleton` are the cropped uint8 detection
+    images from Generate Path; either may be None (nothing is written for it)."""
     base = Path(base_dir) if base_dir is not None else PATHS_DIR
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     folder = base / ts
@@ -168,4 +200,24 @@ def save_bundle(
     png = _decode_png(preview_png_data_url)
     if png:
         (folder / "preview.png").write_bytes(png)
+
+    # The detection stage that produced this path, kept beside it.
+    _write_png(folder / "mask.png", mask)
+    _write_png(folder / "skeleton.png", skeleton)
     return folder
+
+
+def _write_png(path: Path, image) -> None:
+    """
+    Save one detection image. Encoded in memory rather than through
+    cv2.imwrite, which resolves the filename itself and silently writes
+    nothing when the path is not representable in the system codepage.
+    """
+    if image is None:
+        return
+    arr = np.asarray(image)
+    if arr.size == 0:
+        return
+    ok, buf = cv2.imencode(".png", arr)
+    if ok:
+        path.write_bytes(buf.tobytes())

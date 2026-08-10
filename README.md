@@ -211,6 +211,17 @@ depth_cam-to-robot
 │        │ viewer/stitch.html │ │ viewer/stitch.js │
 │        └────────────────────┘ └──────────────────┘
 │
+├─ SCHEDULER  ·  contained tool (read-only)
+│  └─ 🟡 Ledger  —  every saved path as a numbered spreadsheet: which, and when
+│        modules
+│        ┌──────────────┐ ┌─────────────────────┐ ┌────────────────────┐
+│        │ scheduler.py │ │ scheduler_server.py │ │ toolpath_loader.py │
+│        └──────────────┘ └─────────────────────┘ └────────────────────┘
+│        UI
+│        ┌───────────────────────┐ ┌─────────────────────┐
+│        │ viewer/scheduler.html │ │ viewer/scheduler.js │
+│        └───────────────────────┘ └─────────────────────┘
+│
 ├─ TOOLPATH REPLAY  ·  contained tool
 │  └─ ⚪ Replay  —  re-run a saved bundle from paths/ without the camera
 │        modules
@@ -250,7 +261,7 @@ depth_cam-to-robot/
 ├── path_extractor.py        🟢🟣 Grooves → pixel chains → smooth → resample → TSP
 ├── surface.py               🟢🟣 Target mesh: STL/OBJ load, multi-surface scene, projection, normal TCP orientations
 ├── registration.py          🟢 Corner→TCP touch-off placement (1-point + Kabsch ≥3-point)
-├── path_export.py           🟢🟣⚪ Save toolpath → URScript + JSON (poses+frames) + preview PNG
+├── path_export.py           🟢🟣⚪ Save toolpath → URScript + JSON (poses+frames) + preview/mask/skeleton PNGs
 ├── path_executor.py         🟢🟣⚪ Background thread: retract/travel/movep per stroke, progress
 ├── robot_controller.py      🟢🟣⚪ Thread-safe ur-rtde wrapper (moveL, movep paths, EE pose)
 ├── workspace.py             🟢 Planar fallback mapping (Test Mode)
@@ -259,7 +270,10 @@ depth_cam-to-robot/
 ├── multi_camera.py          🔵 Multi-Cam Vision: owns every connected RealSense pipeline
 ├── stitch_server.py         🔵 Multi-Cam Vision: aiohttp server (port 5006)
 ├── stitch_main.py           🔵 Multi-Cam Vision entry point (run_stitch.bat)
-├── toolpath_loader.py       ⚪ Replay tool: read saved bundles (path.json OR path.script)
+├── scheduler.py             🟡 Scheduler: read paths/ into numbered ledger rows (pure, read-only)
+├── scheduler_server.py      🟡 Scheduler: aiohttp server (port 5008)
+├── scheduler_main.py        🟡 Scheduler entry point (run_scheduler.bat)
+├── toolpath_loader.py       ⚪🟡 Replay tool: read saved bundles (path.json OR path.script)
 ├── replay_robot.py          ⚪ Replay tool: robot-brand abstraction (UR now, ABB-ready)
 ├── replay_server.py         ⚪ Replay tool: aiohttp server (port 5007)
 ├── replay_main.py           ⚪ Replay tool entry point (run_replay.bat)
@@ -272,6 +286,7 @@ depth_cam-to-robot/
 ├── requirements-dev.txt     🟢🟣🟠🔵⚪🤖 dev extras: pytest, mcp
 ├── run.bat                  🟢🟣🟠 Main-app launcher (double-click)
 ├── run_stitch.bat           🔵 Multi-Cam launcher
+├── run_scheduler.bat        🟡 Scheduler launcher
 ├── run_replay.bat           ⚪ Replay launcher
 ├── conftest.py              🟢🟣🟠🔵⚪🤖 Pytest shared fixtures
 ├── pytest.ini               🟢🟣🟠🔵⚪🤖 Test configuration
@@ -289,6 +304,8 @@ depth_cam-to-robot/
     ├── depth_overlay.js     🟣 Popup logic: number overlay, Auto toggle, status chip
     ├── stitch.html          🔵 Multi-Cam Vision prototype UI
     ├── stitch.js            🔵 Multi-Cam Vision logic (corner handles, crop drags)
+    ├── scheduler.html       🟡 Scheduler spreadsheet UI
+    ├── scheduler.js         🟡 Scheduler logic (live table from the paths folder)
     ├── replay.html          ⚪ Toolpath replay tool UI
     ├── replay.js            ⚪ Replay UI logic (connect, pick bundle, run)
     ├── style.css            🟢 Responsive layout
@@ -299,7 +316,7 @@ depth_cam-to-robot/
 
 Feature tags:
 
-🟢 Developer Mode · 🟣 Participant Mode · 🟠 Projection · 🔵 Multi-Cam · ⚪ Replay · 🤖 MCP
+🟢 Developer Mode · 🟣 Participant Mode · 🟠 Projection · 🔵 Multi-Cam · 🟡 Scheduler · ⚪ Replay · 🤖 MCP
 
 ---
 
@@ -458,7 +475,11 @@ Measure the placement with the robot instead of guessing sliders. **Register Cor
 
 ### Saving toolpaths
 
-**💾 Save Path** (execution bar) writes a **timestamped subfolder** under `paths/` (e.g. `paths/2026-07-13_14-32-08/`) with three files: `path.script` — a **URScript** program (movel travels + movep draws, Speed/Offset/Safety baked in), directly runnable on the pendant — verify TCP/payload and run slow first; `path.json` — the strokes as 6-DOF poses **plus a full plane/frame per waypoint** (`origin` + orthonormal `xaxis`/`yaxis`/`zaxis`, z = tool approach), for frame-guided workflows (Grasshopper, custom motion); `preview.png` — the 3D preview, to identify the path at a glance. `paths/` is gitignored; each `.script` header records mode, surface, speed, offset, safety and stroke count.
+**💾 Save Path** (execution bar) writes a **timestamped subfolder** under `paths/` (e.g. `paths/2026-07-13_14-32-08/`) with five files: `path.script` — a **URScript** program (movel travels + movep draws, Speed/Offset/Safety baked in), directly runnable on the pendant — verify TCP/payload and run slow first; `path.json` — the strokes as 6-DOF poses **plus a full plane/frame per waypoint** (`origin` + orthonormal `xaxis`/`yaxis`/`zaxis`, z = tool approach), for frame-guided workflows (Grasshopper, custom motion); `preview.png` — the 3D preview, to identify the path at a glance; and the two detection images the path was traced from — `mask.png` (the thick detected region) and `skeleton.png` (its 1-px centrelines), both cropped to the same region the strokes came from and saved lossless, so you can see later exactly what the sand looked like to the detector. `paths/` is gitignored; each `.script` header records mode, surface, speed, offset, safety and stroke count.
+
+The images come from the last **Generate Path**, so they always match the saved path — regenerating replaces both. Participant Mode saves the same five files, since it goes through the same Save step.
+
+One note on `preview.png`: the 3D preview is drawn by your graphics card inside the browser, so it is the one file the program cannot produce on its own. In Developer Mode the Save click sends the picture up with the request. In Participant Mode nobody clicks, so the Developer window the popup was opened from quietly hands over a screenshot after each drawing is processed, and that is what gets saved. **Leave the Developer window open during an automated session** and every bundle is complete; close it and everything else is still saved exactly as before, just without `preview.png`.
 
 ### Projecting the mask onto the sand
 
@@ -489,6 +510,18 @@ A **contained** prototype — not part of Developer or Participant Mode — that
 
 
 
+### Scheduler (standalone)
+
+A **contained, read-only** tool that turns the `paths/` folder into a spreadsheet: every toolpath that has been saved, numbered and dated. It is the record of what the machine has drawn.
+
+- Launch with `run_scheduler.bat` → [http://localhost:5008](http://localhost:5008). It opens no camera and no robot connection and writes nothing, so — unlike the Multi-Cam and replay tools — **you can leave it running next to the main app**.
+- **Four columns**: **#** (1, 2, 3 … oldest first, so row 1 is the earliest path saved), **Path executed** (the bundle folder, with the files it holds listed underneath), **Date and time**, and **Mask** — a thumbnail of the groove image that path was traced from. Click a thumbnail to open it full size. Bundles saved before mask images existed show a dash instead.
+- **It updates itself.** The folder is re-scanned every couple of seconds and the table refreshes on its own, so a path saved in Developer Mode — or by Participant Mode while nobody is watching — appears without touching the browser. **Refresh** forces a scan now.
+- **Download CSV** gives you the same columns as a real spreadsheet file. A CSV cannot hold a picture, so its Mask column carries the image's location on disk instead.
+- **About the date.** Nothing in the pipeline currently records the moment a path was *run*, so this is the moment the bundle was **written**. In Participant Mode the save happens immediately before the robot moves, so it is the run time to within a second; in Developer Mode it is when **Save Path** was pressed, which may be before, after, or instead of a run. The time normally comes from the folder's own name; if a folder has been renamed by hand the tool falls back to `path.json` and then to the file date, and marks the value so you know it was inferred.
+- The file list under each path makes gaps obvious: older bundles show `mask.png —` and `skeleton.png —` because they were saved before those images existed (so their Mask cell is a dash too), and a bundle shows `preview.png —` when no Developer window was open to supply that picture.
+- Like the other tools, closing the last browser tab stops the program.
+
 ### Toolpath replay tool (standalone)
 
 A **contained** tool — not part of Developer or Participant Mode — that re-runs a previously saved toolpath without the camera or the full app.
@@ -508,10 +541,14 @@ All parameters live in `config.py`.
 #### Server
 
 
-| Variable    | Default       | Description  |
-| ----------- | ------------- | ------------ |
-| `HTTP_HOST` | `"localhost"` | Bind address |
-| `HTTP_PORT` | `5005`        | Web UI port  |
+| Variable                | Default       | Description                             |
+| ----------------------- | ------------- | --------------------------------------- |
+| `HTTP_HOST`             | `"localhost"` | Bind address                            |
+| `HTTP_PORT`             | `5005`        | Web UI port (main app)                  |
+| `STITCH_HTTP_PORT`      | `5006`        | Multi-Cam Vision                        |
+| `REPLAY_HTTP_PORT`      | `5007`        | Toolpath replay                         |
+| `SCHEDULER_HTTP_PORT`   | `5008`        | Scheduler                               |
+| `SCHEDULER_REFRESH_S`   | `2.0`         | How often the Scheduler re-scans `paths/` |
 
 
 

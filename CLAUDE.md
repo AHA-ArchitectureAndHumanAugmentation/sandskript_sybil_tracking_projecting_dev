@@ -37,7 +37,7 @@ robot moves.
   Never bare `pip` (broken launcher risk — use `<ENVPY> -m pip`). The Intel
   RealSense USB driver is an OS-level install, outside the env. The old
   `.venv` is retired.
-- Unit tests: `<ENVPY> -m pytest -q -m "not integration"` (345, no
+- Unit tests: `<ENVPY> -m pytest -q -m "not integration"` (399, no
   hardware). Integration: `-m integration`, needs RealSense/robot + TEST_ROBOT_IP.
 - No CLI modes. Hardware vs no-robot is in the UI: "Test Mode (no robot)" button
   unlocks capture with a synthetic workspace; Run stays gated on a robot connection.
@@ -119,7 +119,24 @@ robot moves.
    waypoints. `robot_controller` = thread-safe ur-rtde wrapper.
 7. **Export** `path_export.save_bundle` → `paths/<YYYY-MM-DD_HH-MM-SS>/` with
    `path.script` (URScript movel/movep), `path.json` (poses + per-waypoint plane:
-   origin + orthonormal x/y/z axes, z = approach), `preview.png`.
+   origin + orthonormal x/y/z axes, z = approach), `preview.png`, plus the
+   detection stage that produced the path: `mask.png` (thick region) and
+   `skeleton.png` (1-px centrelines), both the CROPPED uint8 arrays stashed by
+   `on_generate_path` as `last_mask`/`last_skeleton` — replaced in lockstep with
+   `strokes`, so a save can never pair a path with another generate's images.
+   Written via `_write_png` (imencode + write_bytes, not `cv2.imwrite`). Any of
+   the three PNGs may be absent; only .script/.json are guaranteed.
+   `preview.png` is the ONE image the server cannot make — three.js draws it on
+   the client's GPU. Developer Mode: the Save click carries it up. Participant
+   Mode: nobody clicks, so any open Developer window volunteers a shot on its
+   own (`preview_image` WS message → `shared_state["last_preview_png"]`) and
+   `on_save_path` falls back to it. Paired to its generate by
+   `shared_state["path_serial"]` — bumped on every Generate Path, echoed in
+   `capture_result`, sent back with the image, and a mismatch is dropped: same
+   lockstep rule as mask/skeleton. Gate = `path_export.is_png_data_url`
+   (prefix + real base64 + PNG signature + PREVIEW_MAX_BYTES), since this is a
+   client-supplied blob. No Developer window open → no preview.png, never a
+   failed save.
 8. **Server/UI** `server.py` (aiohttp) + `viewer/` — MJPEG: /depth /rgb
    /depth/grooves /depth/mask /depth/mask/full /depth/cropped (colorized depth
    restricted to the Developer-Mode crop; composed only while a /depths popup
@@ -155,8 +172,9 @@ robot moves.
     below trigger → **Alerted**; frame clear for PARTICIPANT_CLEAR_S →
     **Sensing** (waits buffer refill, then capture) → **Generating Paths**
     (current Dev-Mode crop/adjustments/spacing/join) → **profanity guard**
-    (below) → **Actuating** (save_bundle, then run if robot connected; skipped
-    otherwise) → back to **Auto On** (**Auto Off** when toggled off). While
+    (below) → **Actuating** (save_bundle — including preview.png when a
+    Developer window pushed one, see stage 7 — then run if robot connected;
+    skipped otherwise) → back to **Auto On** (**Auto Off** when toggled off). While
     Auto is ON the manual
     capture/generate/run WS calls are refused server-side (`_manual_locked`,
     also blocks MCP tools) and the Dev-Mode buttons grey out; automation
@@ -276,6 +294,41 @@ MCP; no main-app API change. Reads settings.json `last_ip` (never writes it).
 Don't run while the main app holds the robot (one RTDE controller per robot);
 never import `main` from these modules.
 
+## Contained tool: Scheduler (NOT part of the two modes)
+`run_scheduler.bat` → `scheduler_main.py` → http://localhost:5008. A READ-ONLY
+ledger of `paths/`: one numbered row per saved bundle, four columns —
+**# / Path executed / Date and time / Mask**. Oldest first, so row 1 is the
+earliest path saved. Modules: `scheduler.py` (pure filesystem logic:
+`ScheduleRow`, `read_schedule`, `parse_folder_time`, `to_csv`),
+`scheduler_server.py` (aiohttp; GET `/`, GET `/schedule.csv`, GET
+`/mask/{name}`, WS `/ws` — in: `refresh`; out: `init`/`schedule` carrying
+`rows[]`+`base`+`count`), `viewer/scheduler.html`/`scheduler.js`.
+The Mask column serves each bundle's `mask.png` through `/mask/{name}`, guarded
+by `_safe_folder` (same rule as `replay_server`: reject `/`, `\`, `..`) and
+`loading="lazy"` in the browser, since a long ledger is a lot of 640×480 PNGs.
+Bundles saved before `mask.png` existed show a dash — `has_mask` on the row,
+never a broken image. The CSV cannot hold a picture, so its Mask column carries
+the file's path instead.
+What counts as a bundle is NOT redefined here: it defers to
+`toolpath_loader.list_toolpaths` so the Scheduler and the replay tool can never
+disagree about what is on disk. The row also carries `files` (the bundle's
+actual contents) which the UI prints under the folder name, so a bundle missing
+`preview.png` (Participant Mode) or `mask.png`/`skeleton.png` (saved before
+those existed) is visible at a glance.
+**The timestamp is when the bundle was SAVED, not a separate execution record**
+— nothing in the pipeline writes one. Sources are tried in order of trust:
+folder name (`YYYY-MM-DD_HH-MM-SS`, `_2` suffix stripped) → `path.json`'s
+`meta.saved` → folder mtime; each row reports its `time_source`, and the UI
+marks anything that is not the folder name. In Participant Mode save happens
+immediately before the run, so save time IS run time to within a second.
+The watch loop re-scans every SCHEDULER_REFRESH_S and pushes ONLY when the
+scan's signature changes, so a path saved in the main app appears without a
+reload. Being read-only and hardware-free, this is the ONE tool that is safe to
+run beside the main app. Deliberately NOT wired into Developer/Participant Mode
+and NOT exposed to MCP; no main-app API change. Never import `main` from these
+modules (a test asserts a fresh interpreter importing `scheduler_server` pulls
+in no `main`/`camera_thread`/`robot_controller`).
+
 ## Conventions
 - Pose = `[x, y, z, rx, ry, rz]`: metres + UR rotation vector (rad), robot base
   frame. Tool approach = tool-frame +Z; outward surface normal = −(R@[0,0,1]).
@@ -313,6 +366,10 @@ never import `main` from these modules.
   `set_trigger{params:{threshold_mm|null}}` (trigger distance; null/empty clears),
   `set_automation{params:{on}}` (Participant Auto toggle; ON locks manual
   capture/generate/run for every other client incl. MCP tools),
+  `preview_image{params:{image,serial}}` (a Developer window handing over a PNG
+  data URL of its 3D canvas so an automated save still gets preview.png; sent
+  unprompted after each `capture_result` while Auto is ON, never lock-gated —
+  it is not a pipeline action),
   `set_exec_params{params:{speed_pct,offset_mm,safety_mm,blend_mm,spacing_mm,
   join_mm}}` (live, debounced sync of the exec bar so Participant Mode +
   reopened windows match; blend_mm = movep corner Radius slider, 0–5;
@@ -321,7 +378,7 @@ never import `main` from these modules.
   `init` carries the same block plus `detect{crop,adjustments,spacing_mm,join_mm}`
   + `exec{speed_pct,offset_mm,safety_mm,blend_mm}` — the browser restores its
   controls from these on (re)open), `capture_result{stroke_count,point_count,strokes,
-  reach_flags,reach_out,skeleton,exec_viz:{blend_m,reach_m,min_reach_m,
+  reach_flags,reach_out,skeleton,path_serial,exec_viz:{blend_m,reach_m,min_reach_m,
   spacing_mm,join_mm}}`, `still`, `preview`,
   `surface_status{loaded,info,pose,offset_mm,mesh,message}` (`info.count` +
   `info.parts[{index,name,faces,bbox}]` = the loaded parts; `mesh` = the
@@ -366,6 +423,13 @@ never import `main` from these modules.
 - The browser preview reads the Radius slider directly (`readBlendMm()` →
   `rebuildToolpathViz`); `exec_viz.blend_m` from capture_result is only the
   session echo.
+- A pushed `preview_image` must never be able to fail a save: bad PNG, wrong
+  serial, no Developer window — all just mean no preview.png, the same as
+  before the push existed. `path_serial` is what keeps it honest; drop the
+  serial check and a slow window's screenshot of the PREVIOUS drawing gets
+  saved beside this one, which is worse than no picture at all. Note the push
+  is gated on `autoLocked` in the browser, so Developer Mode still sends its
+  screenshot the old way (with the Save click) and costs no extra traffic.
 - Exec-bar controls split two ways: Spacing and **Distance Threshold** change
   the path GEOMETRY, so they re-send `generate_path` (server-side rebuild);
   Offset/Safety/Radius only re-draw client-side via `rebuildToolpathViz`. Don't
@@ -430,6 +494,13 @@ never import `main` from these modules.
 - `stitch_server` serves `/static/*` no-store like the main app. A cached
   `stitch.js` against a restarted server is a browser talking a protocol the
   server no longer speaks, and it corrupts placements silently.
-- Test count reference: 365 unit (+6 hardware-gated). The `text_guard` OCR
+- The Scheduler's "Date and time" is a SAVE time, not a proven execution time.
+  Don't relabel the column "executed at" without first making something
+  actually record a run — and don't add that recording to the main app on the
+  Scheduler's behalf; the tool is read-only by design.
+- `scheduler.py` must not grow its own "is this a bundle?" rule. It calls
+  `toolpath_loader.list_toolpaths` precisely so the Scheduler and the replay
+  tool always list the same folders.
+- Test count reference: 399 unit (+6 hardware-gated). The `text_guard` OCR
   tests skip themselves when Tesseract is absent; the text-matching ones always
   run. Keep green.

@@ -167,14 +167,15 @@ async def set_surface_pose(tx: float = 0.4, ty: float = 0.0, tz: float = 0.0,
 @mcp.tool()
 async def save_toolpath(speed_pct: float = 5.0, offset_mm: float = 0.0,
                         safety_mm: float = 50.0, blend_mm: float = 0.5) -> dict:
-    """Save the generated toolpath (URScript + JSON with per-waypoint frames) to a timestamped folder under paths/; returns the folder path. blend_mm = movep corner blend radius (0-5 mm, clamped per stroke)."""
+    """Save the generated toolpath (URScript + JSON with per-waypoint frames, plus mask.png/skeleton.png of the detection it came from) to a timestamped folder under paths/; returns the folder path. blend_mm = movep corner blend radius (0-5 mm, clamped per stroke)."""
     d = await _ws_call({"type": "save_path",
                         "params": {"speed_pct": speed_pct, "offset_mm": offset_mm,
                                    "safety_mm": safety_mm, "blend_mm": blend_mm}},
                        ("save_result",), timeout=30.0)
     if d.get("success"):
         return {"ok": True, "folder": d.get("folder"),
-                "note": "no preview.png (canvas only exists in the browser)"}
+                "note": "mask.png + skeleton.png written; preview.png only if a "
+                        "Developer window pushed one (that canvas is browser-only)"}
     return _err(d.get("error") or "save failed")
 
 

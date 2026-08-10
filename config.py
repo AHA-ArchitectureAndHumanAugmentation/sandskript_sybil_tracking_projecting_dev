@@ -52,6 +52,11 @@ DEPTH_LABELS_MAX         = 150    # cap on labels per frame (declutter + cost)
 TRIGGER_MIN_AREA_PX = 150    # valid pixels below threshold that count as "something in frame"
 PARTICIPANT_TICK_S  = 0.1    # automation poll interval (s)
 PARTICIPANT_CLEAR_S = 1.0    # frame must stay clear this long before triggering
+# preview.png comes from a Developer window's 3D canvas, which nobody clicks Save
+# on during an automated run — so while Auto is ON the browser pushes the shot up
+# by itself after each Generate Path. Cap what we will hold in memory: this is a
+# client-supplied blob, and a ~600x400 canvas encodes well under 1 MB.
+PREVIEW_MAX_BYTES = 8 * 1024 * 1024
 
 # ── Detection-parameter presets ───────────────────────────────────────────────
 # The Save/Load buttons in the Detection Parameters panel write one timestamped
@@ -180,3 +185,11 @@ STITCH_NOMINAL_VFOV_DEG = 58.0
 # ABB GoFa port only adds a backend class + changes REPLAY_BACKEND.
 REPLAY_HTTP_PORT = 5007
 REPLAY_BACKEND   = "ur"     # see replay_robot.make_backend()
+
+# ── Scheduler (contained tool) ────────────────────────────────────────────────
+# A standalone, READ-ONLY tool (run_scheduler.bat → http://localhost:5008) that
+# lists the saved bundles under paths/ as a numbered spreadsheet: which path
+# went out, and when. Touches no hardware and writes nothing, so it is the one
+# tool that is safe to leave running beside the main app.
+SCHEDULER_HTTP_PORT = 5008
+SCHEDULER_REFRESH_S = 2.0   # how often paths/ is re-scanned for new bundles

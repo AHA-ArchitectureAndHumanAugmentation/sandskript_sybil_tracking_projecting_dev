@@ -567,6 +567,7 @@ function handleCaptureResult(data) {
 
   if (data.strokes && data.strokes.length > 0) {
     setPathData(data.strokes, data.skeleton, data.exec_viz);
+    pushPreviewForAutomation(data.path_serial);
     setButtonsForPhase("captured");
     if (data.reach_out > 0) {
       setHeaderStatus("robot", false,
@@ -582,6 +583,24 @@ function handleCaptureResult(data) {
     setHeaderStatus("robot", false,
       "No grooves found — lower Groove depth / adjust detection and try again.");
   }
+}
+
+/* An automated run reaches Save with nobody at the button, and the 3D preview
+   only exists here — three.js draws it on this machine's GPU, the server has
+   just the numbers behind it. So while Participant Mode is running, hand the
+   screenshot over unasked; the server holds it until that run saves.
+
+   The serial ties the shot to the generate it came from: this window may be
+   slow, and a picture of the previous path is worse than no picture. Deferred
+   off the socket handler — rendering and PNG-encoding the canvas is not
+   something to do while the message loop waits, and the automation is busy
+   OCR'ing the mask for the next second anyway. */
+function pushPreviewForAutomation(serial) {
+  if (!autoLocked || serial === undefined) return;
+  setTimeout(() => {
+    const image = capturePreviewPng();
+    if (image) sendWS({ type: "preview_image", params: { image, serial } });
+  }, 50);
 }
 
 /* ── Execution update ───────────────────────────────────────────────────── */
@@ -1638,11 +1657,21 @@ spacingSlider.addEventListener("change", syncExecParams);
 joinBox.addEventListener("change", syncExecParams);
 
 /* ── Save toolpath (URScript + JSON + preview image) ────────────────────── */
+
+/* The 3D preview as a PNG data URL. Renders first: the drawing buffer is not
+   preserved between frames, so reading it without a fresh render can come back
+   blank. Returns null if the canvas refuses (e.g. zero-sized panel). */
+function capturePreviewPng() {
+  try {
+    renderer.render(scene, camera);
+    return renderer.domElement.toDataURL("image/png");
+  } catch (e) {
+    return null;
+  }
+}
+
 document.getElementById("btn-save-path").addEventListener("click", () => {
-  // Capture the 3D preview as a PNG. Render first so the buffer is current.
-  renderer.render(scene, camera);
-  let image = null;
-  try { image = renderer.domElement.toDataURL("image/png"); } catch (e) {}
+  const image = capturePreviewPng();
   sendWS({ type: "save_path", params: {
     speed_pct: parseFloat(document.getElementById("exec-speed").value) || 5,
     offset_mm: parseFloat(document.getElementById("exec-offset").value) || 0,

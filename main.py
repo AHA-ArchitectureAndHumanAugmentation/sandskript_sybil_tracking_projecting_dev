@@ -36,7 +36,7 @@ from depth_extractor import (
 )
 from path_extractor import extract_from_edges, pixels_to_robot_coords
 from path_executor import PathExecutor
-from path_export import save_bundle
+from path_export import is_png_data_url, save_bundle
 from robot_controller import RobotController
 from server import Server
 from settings import load_settings, save_settings
@@ -72,7 +72,14 @@ shared_state: dict = {
     "strokes_surface":     False,      # True when current strokes were surface-projected
     "still_dims":          None,       # (width, height) of the captured still
     "strokes":             [],         # robot-space strokes after Generate Path
-    "last_mask":           None,       # last groove mask — Participant profanity guard only
+    # Detection images from the last Generate Path, saved into the bundle and
+    # (mask only) OCR'd by the Participant-Mode profanity guard.
+    "last_mask":           None,       # thick detected-region mask, cropped
+    "last_skeleton":       None,       # 1-px groove centrelines, cropped
+    # 3D-preview screenshot pushed up by a Developer window (Participant Mode
+    # has nobody to click Save). Paired with the generate that produced it.
+    "last_preview_png":    None,       # PNG data URL | None
+    "path_serial":         0,          # bumped by every Generate Path
     "executing":           False,
     "progress":            0.0,
     # ── Participant Mode (automated pipeline) ──
@@ -619,9 +626,17 @@ async def on_generate_path(ws, params: dict) -> None:
     with state_lock:
         shared_state["strokes"] = robot_strokes
         shared_state["strokes_surface"] = surface_mode
-        # Kept for the Participant-Mode profanity guard, which OCRs the mask
-        # rather than the skeleton. Developer Mode never reads this.
+        # Both go into the saved bundle; the mask is additionally what the
+        # Participant-Mode profanity guard OCRs (never the skeleton — 1-px
+        # hairlines read terribly). Replaced in lockstep with `strokes`, so a
+        # save can never pick up images from a different generate.
         shared_state["last_mask"] = processed.mask
+        shared_state["last_skeleton"] = processed.grooves
+        # The 3D preview belongs to the OLD path until a browser sends a new
+        # shot; drop it now so a stale picture can never reach the bundle.
+        shared_state["last_preview_png"] = None
+        path_serial = shared_state["path_serial"] + 1
+        shared_state["path_serial"] = path_serial
         shared_state["phase"]   = "captured" if robot_strokes else "editing"
         session_blend_mm = (shared_state.get("participant_exec_params") or {}).get(
             "blend_mm", MOVEP_BLEND_M * 1000.0)
@@ -644,6 +659,7 @@ async def on_generate_path(ws, params: dict) -> None:
             "spacing_mm": spacing_mm,
             "join_mm": join_mm,
         },
+        path_serial=path_serial,
     )
     # Mapping owner depends on the run: a loaded mesh uses surface.py, Test Mode
     # falls back to workspace.py — show whichever actually ran.
@@ -730,8 +746,38 @@ async def on_cancel(ws) -> None:
     module_trace.log("cancel", "[executor] cancel requested")
 
 
+async def on_preview_image(params: dict) -> None:
+    """
+    A Developer window's screenshot of its 3D preview, sent unprompted after a
+    Generate Path while Participant Mode is running.
+
+    Participant Mode drives the pipeline server-side, so no Save click ever
+    carries an image up and preview.png would be the one missing file in an
+    automated bundle. The picture only exists in the browser (three.js draws it
+    on the client's GPU), so the browser volunteers it here instead.
+
+    Only kept if it is a real PNG of sane size AND belongs to the generate whose
+    strokes are currently loaded — same lockstep rule as last_mask/last_skeleton.
+    """
+    params = params or {}
+    image = params.get("image")
+    try:
+        serial = int(params.get("serial", -1))
+    except (TypeError, ValueError):
+        return
+    if not is_png_data_url(image):
+        return
+    with state_lock:
+        # A screenshot from an earlier generate is worse than none at all.
+        if serial != shared_state.get("path_serial"):
+            return
+        shared_state["last_preview_png"] = image
+    module_trace.log("save", "[participant] 3D preview received from a Developer window",
+                     extra=("server",))
+
+
 async def on_save_path(ws, params: dict) -> None:
-    """Save the generated toolpath as URScript + JSON + preview image."""
+    """Save the toolpath as URScript + JSON + preview/mask/skeleton images."""
     from datetime import datetime
 
     with state_lock:
@@ -739,6 +785,9 @@ async def on_save_path(ws, params: dict) -> None:
         surface_mode = shared_state.get("strokes_surface", False)
         surface_info = shared_state.get("surface_info")
         surface_pose = shared_state.get("surface_pose")
+        mask         = shared_state.get("last_mask")
+        skeleton     = shared_state.get("last_skeleton")
+        pushed_png   = shared_state.get("last_preview_png")
 
     if not strokes:
         await server.send_save_result(ws, False, error="No path to save — Generate Path first.")
@@ -778,13 +827,20 @@ async def on_save_path(ws, params: dict) -> None:
         "point_count": sum(len(s) for s in strokes),
     }
 
+    # Developer Mode: the Save click carries the screenshot. Participant Mode:
+    # nobody clicked, so fall back to whatever a Developer window pushed up for
+    # this same path. Neither available (no Developer window open) → no
+    # preview.png, exactly as before; a save must never fail over a picture.
+    preview_png = params.get("image") or pushed_png
+
     loop = asyncio.get_running_loop()
     try:
         folder = await loop.run_in_executor(
             None,
             functools.partial(
                 save_bundle, strokes, speed, safety_mm / 1000.0, offset_mm / 1000.0,
-                meta, params.get("image"), blend_m=blend_mm / 1000.0,
+                meta, preview_png, blend_m=blend_mm / 1000.0,
+                mask=mask, skeleton=skeleton,
             ),
         )
     except Exception as exc:
@@ -1027,6 +1083,7 @@ server = Server(
     on_set_trigger=on_set_trigger,
     on_set_automation=on_set_automation,
     on_set_exec_params=on_set_exec_params,
+    on_preview_image=on_preview_image,
 )
 
 # Camera starts immediately so both MJPEG feeds are live from the moment you open the browser

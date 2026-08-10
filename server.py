@@ -99,6 +99,7 @@ class Server:
         on_set_trigger: Optional[Callable] = None,
         on_set_automation: Optional[Callable] = None,
         on_set_exec_params: Optional[Callable] = None,
+        on_preview_image: Optional[Callable] = None,
     ):
         self._state = shared_state
         self._lock = state_lock
@@ -127,6 +128,7 @@ class Server:
         self._on_set_trigger = on_set_trigger
         self._on_set_automation = on_set_automation
         self._on_set_exec_params = on_set_exec_params
+        self._on_preview_image = on_preview_image
         self._broadcast_ws = _BroadcastWS(self)
         self._ws_clients: set[web.WebSocketResponse] = set()
         self._projection_clients: set[web.WebSocketResponse] = set()
@@ -519,6 +521,13 @@ class Server:
             self._overlay_clients.add(ws)
             self._set_overlay_count()
 
+        elif msg_type == "preview_image":
+            # A Developer window volunteering a screenshot of its 3D preview, so
+            # an automated run can still write preview.png with nobody at the
+            # Save button. Not a manual pipeline action — never lock-gated.
+            if self._on_preview_image:
+                asyncio.create_task(self._on_preview_image(data.get("params", {})))
+
         elif msg_type == "set_exec_params":
             # Live sync of the exec-bar values (speed/offset/safety/spacing) so
             # Participant Mode always matches what Developer Mode shows.
@@ -722,6 +731,7 @@ class Server:
         reach_out: int = 0,
         skeleton_data: Optional[list] = None,
         exec_viz: Optional[dict] = None,
+        path_serial: int = 0,
     ) -> None:
         try:
             await ws.send_str(json.dumps({
@@ -731,6 +741,10 @@ class Server:
                 "point_count": point_count,
                 "strokes": strokes_data or [],
                 "error": error,
+                # Which Generate Path these strokes came from. The browser echoes
+                # it back with a pushed preview image so a slow screenshot from
+                # an earlier generate can never be saved beside this path.
+                "path_serial": path_serial,
                 "reach_flags": reach_flags or [],
                 "reach_out": reach_out,
                 # Dense on-surface skeleton polylines ([x,y,z] only) — the white

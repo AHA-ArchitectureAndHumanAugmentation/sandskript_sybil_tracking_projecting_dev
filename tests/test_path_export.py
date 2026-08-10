@@ -5,11 +5,15 @@ import base64
 import json
 import math
 
+import cv2
 import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
-from path_export import build_urscript, build_json, save_bundle, _offset_pose, stroke_blend
+from path_export import (
+    build_urscript, build_json, is_png_data_url, save_bundle, _offset_pose,
+    stroke_blend,
+)
 
 _PI = math.pi
 
@@ -163,3 +167,95 @@ class TestSaveBundle:
         a = save_bundle(STROKES, 0.3, 0.05, 0.0, {}, base_dir=tmp_path)
         b = save_bundle(STROKES, 0.3, 0.05, 0.0, {}, base_dir=tmp_path)
         assert a != b        # same-second saves don't overwrite
+
+
+class TestPngDataUrl:
+    """
+    The gate on a preview screenshot pushed up by a browser. Participant Mode
+    saves whatever a Developer window volunteers, with no Save click behind it,
+    so this is the only thing standing between a client blob and the bundle.
+    """
+
+    # 1×1 transparent PNG, exactly what canvas.toDataURL("image/png") produces.
+    PNG = ("data:image/png;base64,"
+           "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+
+    def test_accepts_a_real_canvas_shot(self):
+        assert is_png_data_url(self.PNG) is True
+
+    def test_rejects_junk(self):
+        for value in (None, "", 42, [], "not a data url", "data:image/png;base64,",
+                      "data:image/png;base64,!!!not base64!!!"):
+            assert is_png_data_url(value) is False
+
+    def test_rejects_another_format_wearing_the_png_label(self):
+        # Right prefix, decodable, but the bytes are not a PNG — the signature
+        # is what stops a JPEG (or anything else) landing in preview.png.
+        jpeg = "data:image/png;base64," + base64.b64encode(b"\xff\xd8\xff\xe0junk").decode()
+        assert is_png_data_url(jpeg) is False
+
+    def test_rejects_a_different_mime(self):
+        assert is_png_data_url(self.PNG.replace("image/png", "image/jpeg")) is False
+
+    def test_rejects_an_oversized_image(self):
+        # A cap on what one message may park in memory until the save.
+        assert is_png_data_url(self.PNG, max_bytes=10) is False
+        assert is_png_data_url(self.PNG, max_bytes=10_000) is True
+
+    def test_what_it_accepts_is_what_save_bundle_writes(self, tmp_path):
+        # The validator and the writer must agree, or a "valid" preview is
+        # silently dropped at save time.
+        assert is_png_data_url(self.PNG)
+        folder = save_bundle(STROKES, 0.3, 0.05, 0.0, {}, preview_png_data_url=self.PNG,
+                             base_dir=tmp_path)
+        assert (folder / "preview.png").stat().st_size > 0
+
+
+class TestSaveDetectionImages:
+    """mask.png + skeleton.png — the detection stage kept beside its path."""
+
+    @staticmethod
+    def _mask(w=32, h=24):
+        m = np.zeros((h, w), np.uint8)
+        m[10:14, 4:28] = 255            # one thick horizontal groove
+        return m
+
+    @staticmethod
+    def _skeleton(w=32, h=24):
+        s = np.zeros((h, w), np.uint8)
+        s[12, 4:28] = 255               # its 1-px centreline
+        return s
+
+    def test_both_images_are_written(self, tmp_path):
+        folder = save_bundle(STROKES, 0.3, 0.05, 0.0, {}, base_dir=tmp_path,
+                             mask=self._mask(), skeleton=self._skeleton())
+        assert (folder / "mask.png").stat().st_size > 0
+        assert (folder / "skeleton.png").stat().st_size > 0
+
+    def test_the_pixels_survive_the_round_trip(self, tmp_path):
+        mask = self._mask()
+        folder = save_bundle(STROKES, 0.3, 0.05, 0.0, {}, base_dir=tmp_path,
+                             mask=mask, skeleton=self._skeleton())
+        # PNG is lossless: the saved mask must be the mask, not a re-rendering.
+        back = cv2.imread(str(folder / "mask.png"), cv2.IMREAD_GRAYSCALE)
+        assert back.shape == mask.shape
+        assert (back == mask).all()
+
+    def test_the_two_images_are_not_the_same_picture(self, tmp_path):
+        folder = save_bundle(STROKES, 0.3, 0.05, 0.0, {}, base_dir=tmp_path,
+                             mask=self._mask(), skeleton=self._skeleton())
+        m = cv2.imread(str(folder / "mask.png"), cv2.IMREAD_GRAYSCALE)
+        s = cv2.imread(str(folder / "skeleton.png"), cv2.IMREAD_GRAYSCALE)
+        assert s.sum() < m.sum()        # the centreline is thinner than the region
+
+    def test_missing_images_are_simply_absent(self, tmp_path):
+        # A save must never fail because a generate left nothing behind.
+        folder = save_bundle(STROKES, 0.3, 0.05, 0.0, {}, base_dir=tmp_path)
+        assert (folder / "path.script").exists()
+        assert not (folder / "mask.png").exists()
+        assert not (folder / "skeleton.png").exists()
+
+    def test_an_empty_array_is_not_written(self, tmp_path):
+        folder = save_bundle(STROKES, 0.3, 0.05, 0.0, {}, base_dir=tmp_path,
+                             mask=np.zeros((0, 0), np.uint8))
+        assert not (folder / "mask.png").exists()
