@@ -288,19 +288,79 @@ def footprint_mm(frame: CameraFrame) -> tuple[float, float]:
             med * 1000.0 * frame.intr.height / frame.intr.fy)
 
 
+def common_footprint_mm(footprints) -> tuple[float, float]:
+    """
+    ONE patch size for the whole rig — the median of what the cameras report.
+    The cameras hang at nominally the same height, so their footprints should
+    agree; the spread that is left is median-depth noise, and letting each
+    camera set its own scale is what used to open the rig as a row of
+    mismatched tiles. The median keeps one odd reading from sizing everybody.
+    """
+    fs = [f for f in footprints if f and f[0] > 0 and f[1] > 0]
+    if not fs:
+        return (800.0, 600.0)
+    return (float(np.median([f[0] for f in fs])),
+            float(np.median([f[1] for f in fs])))
+
+
 def default_quad_mm(footprint: tuple[float, float], crop, index: int
                     ) -> tuple[tuple[float, float], ...]:
     """
-    A camera the calibration has never seen: an upright rectangle the size of
-    the patch it actually covers, parked one patch further right than the
-    previous camera. A fresh rig therefore opens as a readable row of frames
-    that the operator drags together, rather than a pile.
+    Fallback placement for ONE camera in isolation (a folded quad being parked
+    somewhere visible). `default_row_mm` is what lays out a rig; this only has
+    to put a readable rectangle on the canvas.
     """
     fw, fh = footprint
     _, _, cw, ch = _norm_crop(crop)
     w, h = fw * cw, fh * ch
     x0 = index * fw
     return ((x0, 0.0), (x0 + w, 0.0), (x0, h), (x0 + w, h))
+
+
+def default_row_mm(footprints, crops) -> list[tuple[tuple[float, float], ...]]:
+    """
+    The opening layout: every camera at ONE common scale, laid flush left to
+    right in enumeration order, tops aligned.
+
+    Each tile is the common footprint scaled by that camera's own crop, and the
+    next tile starts at the previous one's right edge — so trimming a camera
+    narrows its tile and the row closes up behind it instead of leaving the
+    hole a per-camera offset used to leave. Nothing here claims to match the
+    real rig; it is a clean strip for the operator to reorder and nudge.
+    """
+    n = max(len(footprints), len(crops))
+    if n <= 0:
+        return []
+    tw, th = common_footprint_mm(footprints)
+    out: list[tuple[tuple[float, float], ...]] = []
+    x = 0.0
+    for i in range(n):
+        _, _, cw, ch = _norm_crop(crops[i] if i < len(crops) else None)
+        w, h = tw * cw, th * ch
+        out.append(((x, 0.0), (x + w, 0.0), (x, h), (x + w, h)))
+        x += w
+    return out
+
+
+def quad_centre_x(quad) -> float:
+    """Where a placed quad sits along the row — what left/right order means."""
+    return sum(p[0] for p in quad) / 4.0 if len(quad) == 4 else 0.0
+
+
+def swap_quads_x(qa, qb) -> tuple[tuple[tuple[float, float], ...],
+                                  tuple[tuple[float, float], ...]]:
+    """
+    Trade two cameras' places in the row without touching their shapes: each
+    quad slides in x until the two centres have swapped. Reordering is how the
+    operator makes the canvas match which camera is physically on the left, so
+    the keystone they already dialled into each one has to survive it — which
+    rules out simply exchanging the two quads.
+    """
+    if len(qa) != 4 or len(qb) != 4:
+        return tuple(tuple(p) for p in qa), tuple(tuple(p) for p in qb)
+    d = quad_centre_x(qb) - quad_centre_x(qa)
+    return (tuple((float(p[0] + d), float(p[1])) for p in qa),
+            tuple((float(p[0] - d), float(p[1])) for p in qb))
 
 
 def rotate_quad(quad, steps: int = 1) -> tuple[tuple[float, float], ...]:

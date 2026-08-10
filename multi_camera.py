@@ -35,8 +35,9 @@ from config import (
 from depth_extractor import colorize_depth, encode_jpeg
 from stitcher import (
     CameraFrame, CameraPlacement, Intrinsics, StitchCalib,
-    bind_placements, crop_mask, default_quad_mm, footprint_mm, requad_for_crop,
-    rotate_frame, rotate_quad, stitch, synthetic_scene,
+    bind_placements, common_footprint_mm, crop_mask, default_quad_mm,
+    default_row_mm, footprint_mm, quad_centre_x, requad_for_crop, rotate_frame,
+    rotate_quad, stitch, swap_quads_x, synthetic_scene,
 )
 
 
@@ -59,6 +60,12 @@ class MultiCameraThread:
         # sand one frame covers (to rebuild a default quad on reset).
         self._shapes: list[tuple[int, int]] = []
         self._footprints: list[tuple[float, float]] = []
+        # The rig's tile size, frozen when the camera set was last bound. Median
+        # depth wobbles a few tenths of a percent frame to frame, and deriving
+        # the tile afresh on every reset let that wobble into the layout —
+        # resetting one camera left it a centimetre out of line with its
+        # neighbours, which is exactly what a single-scale row must not do.
+        self._tile_mm: Optional[tuple[float, float]] = None
         self._show_colour = False
 
     @property
@@ -114,6 +121,33 @@ class MultiCameraThread:
         if p.quad_mm:
             changes["quad_mm"] = [list(c) for c in rotate_quad(p.quad_mm, steps)]
         self._calib = self._calib.with_camera(index, p.merged(changes))
+        self._publish_calib()
+
+    def move_camera(self, index: int, steps: int = 1) -> None:
+        """
+        Shift this camera one place left (steps < 0) or right (steps > 0) in
+        the row, swapping with whichever camera is currently there. Order is
+        judged by where the quads actually sit on the canvas, not by USB
+        enumeration — the operator is matching the picture to the rig, and
+        which device happened to enumerate first has nothing to do with it.
+        """
+        cams = self._calib.cams
+        if not 0 <= index < len(cams) or not steps:
+            return
+        placed = sorted((i for i, p in enumerate(cams) if p.quad_mm),
+                        key=lambda i: quad_centre_x(cams[i].quad_mm))
+        if index not in placed:
+            return
+        target = placed.index(index) + (1 if steps > 0 else -1)
+        if not 0 <= target < len(placed):
+            return
+        other = placed[target]
+        qa, qb = swap_quads_x(cams[index].quad_mm, cams[other].quad_mm)
+        calib = self._calib.with_camera(
+            index, cams[index].merged({"quad_mm": [list(c) for c in qa]}))
+        calib = calib.with_camera(
+            other, calib.cams[other].merged({"quad_mm": [list(c) for c in qb]}))
+        self._calib = calib
         self._publish_calib()
 
     def nudge_height(self, index: int, steps: int = 1) -> None:
@@ -283,19 +317,33 @@ class MultiCameraThread:
         if serials == self._serials and len(self._calib.cams) == len(frames):
             return
         self._serials = serials
+        self._tile_mm = common_footprint_mm(self._footprints)
         bound = bind_placements(self._calib, frames)
         # Materialize the default corners now rather than letting stitch() infer
         # them every frame: the browser drags corners RELATIVE to this list, so
         # it must never be empty once a camera is known.
+        row = self._default_row(bound.cams)
         cams = []
-        for i, (p, f) in enumerate(zip(bound.cams, frames)):
-            if not p.quad_mm:
-                p = p.merged({"quad_mm": [list(c) for c in self._default_quad(i, p)]})
+        for i, p in enumerate(bound.cams):
+            if not p.quad_mm and i < len(row):
+                p = p.merged({"quad_mm": [list(c) for c in row[i]]})
             cams.append(p)
         self._calib = StitchCalib(cams=cams, mm_per_px=bound.mm_per_px)
         self._publish_calib()
 
+    def _default_row(self, cams: list[CameraPlacement]):
+        """The flush, single-scale opening row for the cameras present."""
+        tile = self._tile_mm or common_footprint_mm(self._footprints)
+        return default_row_mm([tile] * len(cams), [p.crop for p in cams])
+
     def _default_quad(self, index: int, p: CameraPlacement):
+        """Where camera `index` belongs in that row, with `p`'s crop applied."""
+        cams = list(self._calib.cams)
+        if 0 <= index < len(cams):
+            cams[index] = p
+            row = self._default_row(cams)
+            if index < len(row):
+                return row[index]
         foot = (self._footprints[index] if index < len(self._footprints)
                 else (800.0, 600.0))
         return default_quad_mm(foot, p.crop, index)

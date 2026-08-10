@@ -470,15 +470,18 @@ A **contained** prototype — not part of Developer or Participant Mode — that
 
 - Launch with `run_stitch.bat` → [http://localhost:5006](http://localhost:5006). **Close the main app first** — each RealSense can only be owned by one process. The tool **finds the cameras itself**; with none connected it runs on a **synthetic** three-camera scene (banner shows why) so the workflow can still be tried.
 - **One screen, split in two.** The **top is the result** — the combined picture, always live, look-only. The **bottom is the workbench**, one panel per camera, where every adjustment is made. Drag the **bar between them** to give whichever half you need more room; the size is remembered. On the right are the remaining controls — all of them buttons.
-- **Putting a camera in place.** Click a camera panel (or its name in the list) to select it. A green outline appears on that panel with four numbered handles, **exactly like the projector calibration window**:
-  - **Drag handle 1–4** to shape where that camera lands. This is the fix for a camera mounted at an **angle**: a tilted camera sees the sand as a keystone, and pulling the corners back into shape squares it up. The green outline shows the shape you are making; the top view shows the effect.
+- **Where it starts.** Every camera opens as a tile of **the same size**, laid **flush side by side** in a row, tops level. That is a tidy starting strip, not a guess at your rig — the next two steps are how you make it match reality.
+- **Getting each camera the right way round and in the right place.** Click a camera panel (or its name in the list) to select it, then:
+  - **⟲ / ⟳** turn the camera a quarter turn — for a camera mounted on its side or upside-down. The picture turns without stretching.
+  - **◀ / ▶** move it one place left or right, swapping with the camera that is there. Use this so the on-screen order matches the physical order; which camera happens to be "Cam 1" depends on USB, not on the rig. A camera keeps its own turn, trim and corner shape when it changes places.
+- **Fine placement.** A green outline sits on the selected panel with four numbered handles, **exactly like the projector calibration window**:
+  - **Drag handle 1–4** to shape where that camera lands. This is the fix for a camera mounted at an **angle**: a tilted camera sees the sand as a keystone, and pulling the corners back into shape squares it up. Only the handle you grab moves — the other three stay put. The green outline shows the shape you are making; the top view shows the effect.
   - **Drag inside the green outline** to slide that camera across the combined picture until it lines up with its neighbour.
   - **Arrow keys** nudge the last handle you touched (**Shift** = faster).
-  - **⟲ / ⟳** turn the camera a quarter turn — for a camera mounted on its side or upside-down. The picture turns without stretching.
   - **▲ / ▼** raise or lower just that camera, for when it hangs higher or lower than its neighbour and its sand sits at the wrong level.
-  - **Reset corners** puts one camera back on a plain rectangle; **Reset camera** clears its turn and crop too.
+  - **Reset corners** puts one camera back on its plain rectangle in the row; **Reset camera** clears its turn and crop too.
   - The **eye** next to a camera drops it out of the result without losing its placement.
-- **Trimming a camera.** Drag a **blue edge bar** on that camera's panel to cut away table edges, walls, or anything that is not sand — one edge at a time. Trimming never moves the sand you kept: the placement is re-cut to match.
+- **Trimming a camera.** Drag a **blue edge bar** on that camera's panel to cut away table edges, walls, or anything that is not sand — one edge at a time. Trimming never moves the sand you kept: the placement is re-cut to match. Only the trimmed region reaches the combined view, and the four handles sit on it, so what is inside them is what you get.
 - **Showing depth / colour** flips both halves between the depth image and the colour cameras. The colour view has dark strips — expected: the colour lens has a narrower field of view than the depth sensor, and depth is the product here.
 - **Save layout** → `stitch_calibration.json` (gitignored), reloaded automatically next start and matched back to each camera by **serial number**, so swapping USB ports does not shuffle the rig.
 - **How it merges:** each camera's cropped, turned picture is warped onto one shared top-down canvas through the corner pin you set, at a uniform mm-per-pixel. Where two cameras overlap, the measurements are **averaged** — the seam region ends up *less* noisy than either camera alone, and the overlap is outlined so you can see it.

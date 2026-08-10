@@ -10,11 +10,13 @@
                                    (the keystone fix for a tilted mount)
        drag inside the green     → move that camera across the canvas
        blue edge bars            → trim the picture
+     plus Turn (⟲ ⟳) and Move (◀ ▶) in the sidebar, which are how the row is
+     made to match the physical rig before any fine dragging.
 
    The green outline in a panel is that camera's canvas quad drawn at the
-   panel's own scale, so an unskewed camera shows a plain rectangle and a
-   keystoned one visibly leans. Corner order is TL, TR, BL, BR = handles 1-4,
-   matching viewer/projection.html. */
+   panel's own scale, so an unskewed camera shows a plain rectangle sitting on
+   its crop rectangle and a keystoned one visibly leans. Corner order is
+   TL, TR, BL, BR = handles 1-4, matching viewer/projection.html. */
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -66,9 +68,12 @@ function editCamera(index, changes) {
   flushEdits();
 }
 
-/* Buttons the server owns outright — no local echo to protect. */
+/* Buttons the server owns outright — no local echo to protect. These move the
+   quads wholesale (a turn, a swap, a reset), so the panels re-fit around
+   whatever comes back rather than keeping a mapping built for the old one. */
 function command(type, params) {
   holdUntil = 0;
+  panelMaps.clear();
   send(type, { index: selected, ...(params || {}) });
 }
 
@@ -118,10 +123,14 @@ function renderSidebar() {
                     "btn-reset-corners", "btn-reset-cam"]) {
     $(id).disabled = !cam;
   }
+  // Swapping places needs someone to swap with.
+  for (const id of ["btn-left", "btn-right"]) $(id).disabled = cams.length < 2;
 }
 
 $("btn-ccw").addEventListener("click", () => command("rotate_camera", { steps: -1 }));
 $("btn-cw").addEventListener("click", () => command("rotate_camera", { steps: 1 }));
+$("btn-left").addEventListener("click", () => command("move_camera", { steps: -1 }));
+$("btn-right").addEventListener("click", () => command("move_camera", { steps: 1 }));
 $("btn-lower").addEventListener("click", () => command("nudge_height", { steps: -1 }));
 $("btn-raise").addEventListener("click", () => command("nudge_height", { steps: 1 }));
 $("btn-reset-corners").addEventListener("click", () =>
@@ -259,6 +268,7 @@ const handles = [0, 1, 2, 3].map((k) => {
 function buildStrip(count) {
   if (stripBuilt === count) return;
   stripBuilt = count;
+  panelMaps.clear();          // panel indices are about to mean something else
   const host = $("strip");
   host.innerHTML = "";
   for (let i = 0; i < count; i++) {
@@ -285,25 +295,67 @@ function normalizeCrop(c) {
   return [x, y, w, h];
 }
 
-/* The camera's canvas quad drawn at the panel's scale: centred on the crop
-   rectangle and scaled so an unskewed quad lands exactly on it. What you drag
-   here is the real quad; this is only how it is displayed. */
-function panelShape(cam, box) {
-  const quad = cam.quad_mm;
-  if (!quad || quad.length !== 4) return null;
+/* ── panel ⇄ canvas mapping ──
+   A quad lives in canvas millimetres; a panel draws it in image pixels. The
+   mapping is CACHED per camera and deliberately does NOT depend on the quad:
+   deriving the scale and centre from the corners each repaint is what made
+   dragging one handle rescale and re-centre the other three. It is re-fitted
+   only when something OTHER than the corners changes — a turn, a trim, a
+   resize, a reset — and never mid-gesture. At each fit an unskewed quad lands
+   exactly on the crop rectangle, so the cropped region normally sits inside
+   the four handles, and pulling one handle out is visibly just that. */
+const panelMaps = new Map();      // camera index → {pxPerMm, ox, oy, key}
+
+/* Deliberately NOT keyed on the crop: trimming does not move the sand (the
+   server re-cuts the quad through the old pin), so the outline should sit
+   still while the blue rectangle shrinks. The re-fit comes a moment later,
+   from `applyCalib`, once the re-cut corners have actually arrived. */
+function mapKey(cam, box) {
+  return `${cam.rot_deg}|${box.nw}x${box.nh}`;
+}
+
+function fitMap(cam, box) {
+  const q = cam.quad_mm;
+  if (!q || q.length !== 4) return null;
+  const xs = q.map((p) => p[0]), ys = q.map((p) => p[1]);
+  const qw = Math.max(...xs) - Math.min(...xs);
+  const qh = Math.max(...ys) - Math.min(...ys);
   const [cx, cy, cw, ch] = cam.crop || [0, 0, 1, 1];
-  const cropW = cw * box.nw;
-  const centre = [(cx + cw / 2) * box.nw, (cy + ch / 2) * box.nh];
-  const qc = [(quad[0][0] + quad[1][0] + quad[2][0] + quad[3][0]) / 4,
-              (quad[0][1] + quad[1][1] + quad[2][1] + quad[3][1]) / 4];
-  const quadW = Math.hypot(quad[1][0] - quad[0][0], quad[1][1] - quad[0][1]);
-  if (quadW < 1e-6 || cropW < 1e-6) return null;
-  const pxPerMm = cropW / quadW;
-  return {
-    pxPerMm,
-    pts: quad.map((p) => [centre[0] + (p[0] - qc[0]) * pxPerMm,
-                          centre[1] + (p[1] - qc[1]) * pxPerMm]),
-  };
+  if (qw < 1e-6 || qh < 1e-6 || cw < 1e-6 || ch < 1e-6) return null;
+  // ONE scale for both axes, so a quad is never drawn distorted.
+  const pxPerMm = Math.min((cw * box.nw) / qw, (ch * box.nh) / qh);
+  const mx = (Math.min(...xs) + Math.max(...xs)) / 2;
+  const my = (Math.min(...ys) + Math.max(...ys)) / 2;
+  return { pxPerMm,
+           ox: (cx + cw / 2) * box.nw - mx * pxPerMm,
+           oy: (cy + ch / 2) * box.nh - my * pxPerMm };
+}
+
+function panelPts(cam, m) {
+  const q = cam.quad_mm;
+  if (!m || !q || q.length !== 4) return null;
+  return q.map((p) => [m.ox + p[0] * m.pxPerMm, m.oy + p[1] * m.pxPerMm]);
+}
+
+/* Sliding a camera far enough across the canvas would walk its outline off
+   the panel and leave nothing to grab. */
+function driftedOut(cam, m, box) {
+  const pts = panelPts(cam, m);
+  if (!pts) return false;
+  const cx = (pts[0][0] + pts[1][0] + pts[2][0] + pts[3][0]) / 4;
+  const cy = (pts[0][1] + pts[1][1] + pts[2][1] + pts[3][1]) / 4;
+  return cx < 0 || cy < 0 || cx > box.nw || cy > box.nh;
+}
+
+function panelMap(index, cam, box) {
+  let m = panelMaps.get(index);
+  if (dragging && m) return m;
+  if (m && m.key === mapKey(cam, box) && !driftedOut(cam, m, box)) return m;
+  m = fitMap(cam, box);
+  if (!m) return null;
+  m.key = mapKey(cam, box);
+  panelMaps.set(index, m);
+  return m;
 }
 
 /* Corners move in canvas millimetres; the drag arrives in panel pixels. */
@@ -339,7 +391,6 @@ function drawPanel(vp) {
     const [x, y, w, h] = cam.crop || [0, 0, 1, 1];
     return { x: x * box.nw, y: y * box.nh, w: w * box.nw, h: h * box.nh };
   };
-  const shape = panelShape(cam, box);
   const outline = svgEl("polygon", { class: "shape" });
   const crop = svgEl("rect", { class: "crop" });
   svg.append(outline, crop);
@@ -355,10 +406,10 @@ function drawPanel(vp) {
     const r = cropRect();
     crop.setAttribute("x", r.x); crop.setAttribute("y", r.y);
     crop.setAttribute("width", r.w); crop.setAttribute("height", r.h);
-    const s = panelShape(cam, box);
-    if (s) {
+    const pts = panelPts(cam, panelMap(index, cam, box));
+    if (pts) {
       outline.setAttribute("points",
-        [s.pts[0], s.pts[1], s.pts[3], s.pts[2]].map((p) => p.join(",")).join(" "));
+        [pts[0], pts[1], pts[3], pts[2]].map((p) => p.join(",")).join(" "));
     }
     const t = EDGE_PX / box.scale;
     const geo = [
@@ -370,17 +421,18 @@ function drawPanel(vp) {
     edges.forEach((e, k) => {
       for (const [key, v] of Object.entries(geo[k])) e.setAttribute(key, v);
     });
-    if (sel && s) placeHandles(vp, box, s.pts);
+    if (sel && pts) placeHandles(vp, box, pts);
   };
   repaint();
 
   if (!sel) return;
-  nudgeScale = shape ? shape.pxPerMm : 0;
+  const m0 = panelMap(index, cam, box);
+  nudgeScale = m0 ? m0.pxPerMm : 0;
 
   // Drag inside the green outline: slide this camera across the canvas.
   onDrag(outline, box.scale, (dx, dy) => {
-    const s = panelShape(cam, box);
-    shiftCorners(-1, dx, dy, s && s.pxPerMm);
+    const m = panelMap(index, cam, box);
+    shiftCorners(-1, dx, dy, m && m.pxPerMm);
     repaint();
   });
 
@@ -411,9 +463,9 @@ function drawPanel(vp) {
       const panel = $("strip").querySelector(".vp.sel");
       if (!panel) return;
       const b = contentBox(panel.querySelector("img"));
-      const s = b && panelShape(cams[selected], b);
-      if (!s) return;
-      shiftCorners(k, dx / b.scale, dy / b.scale, s.pxPerMm);
+      const m = b && panelMap(selected, cams[selected], b);
+      if (!m) return;
+      shiftCorners(k, dx / b.scale, dy / b.scale, m.pxPerMm);
       drawPanel(panel);
     });
   });
@@ -470,9 +522,22 @@ function claimStreams() {
 }
 
 /* ── incoming ── */
+function quadsMatch(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  return a.every((p, k) => Math.abs(p[0] - b[k][0]) < 1e-3 &&
+                           Math.abs(p[1] - b[k][1]) < 1e-3);
+}
+
 function applyCalib(c) {
   if (!c || !Array.isArray(c.cams)) return;
   if (dragging || Date.now() < holdUntil) return;   // a local edit is in flight
+  // Corners the SERVER moved — a trim re-cut, a saved layout, a reset — leave
+  // the panel fitted to geometry that no longer exists, so drop the mapping and
+  // let it re-fit onto the crop rectangle. A plain corner drag echoes back
+  // identical, which is what keeps this from re-fitting under a live gesture.
+  c.cams.forEach((p, i) => {
+    if (cams[i] && !quadsMatch(cams[i].quad_mm, p.quad_mm)) panelMaps.delete(i);
+  });
   cams = c.cams.map((p) => ({ ...p }));
   if (selected >= cams.length) selected = 0;
   renderSidebar();

@@ -1,14 +1,19 @@
 """Unit tests for the multi-camera stitching math (stitcher.py). No hardware."""
 
+import threading
+
 import cv2
 import numpy as np
 import pytest
 
+from multi_camera import MultiCameraThread
+
 from stitcher import (
     CameraFrame, CameraPlacement, Intrinsics, StitchCalib,
-    bind_placements, crop_corners_px, crop_mask, default_quad_mm,
-    fill_small_holes, footprint_mm, quad_area_mm2, requad_for_crop,
-    rotate_frame, rotate_quad, stitch, synthetic_scene,
+    bind_placements, common_footprint_mm, crop_corners_px, crop_mask,
+    default_quad_mm, default_row_mm, fill_small_holes, footprint_mm,
+    quad_area_mm2, quad_centre_x, requad_for_crop, rotate_frame, rotate_quad,
+    stitch, swap_quads_x, synthetic_scene,
 )
 
 UNIT_QUAD = ((0.0, 0.0), (400.0, 0.0), (0.0, 300.0), (400.0, 300.0))   # TL TR BL BR
@@ -111,19 +116,84 @@ class TestPlacement:
         folded = (UNIT_QUAD[1], UNIT_QUAD[0], UNIT_QUAD[2], UNIT_QUAD[3])
         assert quad_area_mm2(folded) <= 0
 
-    def test_default_quads_sit_side_by_side(self):
+    def test_fallback_quads_sit_side_by_side(self):
         a = default_quad_mm((800.0, 600.0), (0, 0, 1, 1), 0)
         b = default_quad_mm((800.0, 600.0), (0, 0, 1, 1), 1)
         assert a[0] == (0.0, 0.0) and a[3] == (800.0, 600.0)
         assert b[0][0] == pytest.approx(800.0)      # parked one footprint right
 
-    def test_default_quad_shrinks_with_the_crop(self):
+    def test_fallback_quad_shrinks_with_the_crop(self):
         q = default_quad_mm((800.0, 600.0), (0.0, 0.0, 0.5, 0.5), 0)
         assert quad_area_mm2(q) == pytest.approx(400 * 300)
 
     def test_footprint_scales_with_distance(self):
         near, far = _flat_frame(depth=0.5), _flat_frame(depth=1.0)
         assert footprint_mm(far)[0] == pytest.approx(2.0 * footprint_mm(near)[0], rel=1e-6)
+
+
+class TestDefaultRow:
+    """The opening layout: one scale for the whole rig, laid flush."""
+
+    def test_every_camera_gets_the_same_tile_size(self):
+        # Two cameras whose median-depth readings disagree by ~12%.
+        row = default_row_mm([(800.0, 600.0), (900.0, 675.0)],
+                             [(0, 0, 1, 1), (0, 0, 1, 1)])
+        widths = [q[1][0] - q[0][0] for q in row]
+        heights = [q[2][1] - q[0][1] for q in row]
+        assert widths[0] == pytest.approx(widths[1])
+        assert heights[0] == pytest.approx(heights[1])
+
+    def test_tiles_are_flush_with_no_gap_or_overlap(self):
+        row = default_row_mm([(800.0, 600.0)] * 3, [(0, 0, 1, 1)] * 3)
+        for left, right in zip(row, row[1:]):
+            assert right[0][0] == pytest.approx(left[1][0])
+
+    def test_tops_are_aligned(self):
+        row = default_row_mm([(800.0, 600.0), (900.0, 675.0)], [(0, 0, 1, 1)] * 2)
+        assert all(q[0][1] == pytest.approx(0.0) and q[1][1] == pytest.approx(0.0)
+                   for q in row)
+
+    def test_one_odd_reading_does_not_set_the_scale(self):
+        assert common_footprint_mm(
+            [(800.0, 600.0), (800.0, 600.0), (2400.0, 1800.0)])[0] == pytest.approx(800.0)
+
+    def test_a_trimmed_camera_narrows_its_tile_and_the_row_closes_up(self):
+        row = default_row_mm([(800.0, 600.0)] * 3,
+                             [(0, 0, 1, 1), (0.0, 0.0, 0.5, 1.0), (0, 0, 1, 1)])
+        assert row[1][1][0] - row[1][0][0] == pytest.approx(400.0)
+        assert row[1][0][0] == pytest.approx(800.0)
+        assert row[2][0][0] == pytest.approx(1200.0)     # no hole left behind
+
+    def test_missing_footprints_still_produce_a_readable_row(self):
+        row = default_row_mm([None, None], [(0, 0, 1, 1)] * 2)
+        assert len(row) == 2 and row[0][1][0] > 0.0
+
+    def test_empty_rig(self):
+        assert default_row_mm([], []) == []
+
+
+class TestSwapQuadsX:
+    SKEWED = ((400.0, 0.0), (900.0, 20.0), (400.0, 300.0), (880.0, 320.0))
+
+    def test_the_two_trade_places(self):
+        qa, qb = swap_quads_x(UNIT_QUAD, self.SKEWED)
+        assert quad_centre_x(qa) == pytest.approx(quad_centre_x(self.SKEWED))
+        assert quad_centre_x(qb) == pytest.approx(quad_centre_x(UNIT_QUAD))
+
+    def test_each_keeps_its_own_shape(self):
+        # The keystone the operator dialled in must survive a reorder.
+        for old, new in zip((UNIT_QUAD, self.SKEWED),
+                            swap_quads_x(UNIT_QUAD, self.SKEWED)):
+            o = np.asarray(old) - np.asarray(old).mean(axis=0)
+            n = np.asarray(new) - np.asarray(new).mean(axis=0)
+            assert np.allclose(o, n, atol=1e-6)
+
+    def test_only_x_moves(self):
+        qa, _ = swap_quads_x(UNIT_QUAD, self.SKEWED)
+        assert [p[1] for p in qa] == [p[1] for p in UNIT_QUAD]
+
+    def test_malformed_quads_pass_through(self):
+        assert swap_quads_x((), UNIT_QUAD)[1] == UNIT_QUAD
 
 
 class TestRotateQuad:
@@ -307,6 +377,23 @@ class TestStitch:
         assert r.mm_per_px == pytest.approx(fw / frames[0].intr.width, rel=0.05)
 
 
+class TestCropReachesTheCanvas:
+    def test_only_the_cropped_region_lands(self):
+        # A near band down the left quarter, exactly the part the crop drops.
+        f = _flat_frame()
+        f.depth_m[:, :40] = 0.5
+        p = CameraPlacement(crop=(0.25, 0.0, 0.75, 1.0), quad_mm=UNIT_QUAD)
+        r = stitch([f], StitchCalib(cams=[p]), mm_per_px=1.0)
+        assert r.valid.any()
+        assert float(r.depth_m[r.valid].min()) > 0.7
+
+    def test_the_kept_region_fills_the_quad(self):
+        p = CameraPlacement(crop=(0.25, 0.0, 0.5, 1.0), quad_mm=UNIT_QUAD)
+        r = stitch([_flat_frame()], StitchCalib(cams=[p]), mm_per_px=1.0)
+        # UNIT_QUAD is 400 mm wide and the crop is pinned to all of it.
+        assert _covered_width_mm(r) == pytest.approx(400.0, abs=2.0)
+
+
 class TestBindPlacements:
     def test_matches_saved_placements_by_serial(self):
         frames, _ = synthetic_scene(2)
@@ -349,6 +436,94 @@ class TestBindPlacements:
         other = calib.with_camera(0, calib.cams[0].merged({"height_mm": 4.0}))
         assert calib.cams[0].height_mm == 0.0 and other.cams[0].height_mm == 4.0
         assert calib.with_camera(9, CameraPlacement()) is calib
+
+
+class TestMoveCamera:
+    """Shift left/right — the control that makes the row match the real rig."""
+
+    @staticmethod
+    def _rig(n=3):
+        row = default_row_mm([(800.0, 600.0)] * n, [(0, 0, 1, 1)] * n)
+        cam = MultiCameraThread({}, threading.Lock())
+        cam.set_calib(StitchCalib(cams=[
+            CameraPlacement(serial=f"S{i}", quad_mm=row[i]) for i in range(n)]))
+        return cam
+
+    @staticmethod
+    def _centres(cam):
+        return [quad_centre_x(p.quad_mm) for p in cam.get_calib().cams]
+
+    def test_moving_right_swaps_with_the_next_camera(self):
+        cam = self._rig()
+        before = self._centres(cam)
+        cam.move_camera(0, 1)
+        after = self._centres(cam)
+        assert after[0] == pytest.approx(before[1])
+        assert after[1] == pytest.approx(before[0])
+        assert after[2] == pytest.approx(before[2])     # untouched
+
+    def test_the_end_of_the_row_is_a_wall(self):
+        cam = self._rig()
+        before = cam.get_calib().to_dict()
+        cam.move_camera(0, -1)
+        cam.move_camera(2, 1)
+        assert cam.get_calib().to_dict() == before
+
+    def test_order_follows_the_canvas_not_the_usb_index(self):
+        # Camera 3 dragged to the far left: moving it right must swap it with
+        # whoever is actually next along (camera 1), not with camera 4.
+        cam = self._rig()
+        cams = list(cam.get_calib().cams)
+        cams[2] = cams[2].merged({"quad_mm": [[-800.0, 0.0], [0.0, 0.0],
+                                              [-800.0, 600.0], [0.0, 600.0]]})
+        cam.set_calib(StitchCalib(cams=cams))
+        before = self._centres(cam)
+        cam.move_camera(2, 1)
+        after = self._centres(cam)
+        assert after[2] == pytest.approx(before[0])
+        assert after[0] == pytest.approx(before[2])
+        assert after[1] == pytest.approx(before[1])
+
+    def test_a_swap_keeps_each_camera_its_own_keystone(self):
+        cam = self._rig(2)
+        cams = list(cam.get_calib().cams)
+        leaned = [[0.0, 0.0], [800.0, 40.0], [0.0, 600.0], [770.0, 640.0]]
+        cams[0] = cams[0].merged({"quad_mm": leaned})
+        cam.set_calib(StitchCalib(cams=cams))
+        cam.move_camera(0, 1)
+        moved = np.asarray(cam.get_calib().cams[0].quad_mm)
+        want = np.asarray(leaned)
+        assert np.allclose(moved - moved.mean(axis=0), want - want.mean(axis=0),
+                           atol=1e-6)
+
+    def test_resetting_one_camera_keeps_the_row_flush(self):
+        # The live footprints wobble with the median depth; the tile frozen when
+        # the rig was bound has to win, or each reset lands a centimetre out.
+        cam = self._rig(3)
+        cam._tile_mm = (800.0, 600.0)
+        cam._footprints = [(812.0, 609.0), (795.0, 596.0), (804.0, 603.0)]
+        for i in range(3):
+            cam.reset_camera(i)
+        quads = [p.quad_mm for p in cam.get_calib().cams]
+        assert all(q[1][0] - q[0][0] == pytest.approx(800.0) for q in quads)
+        for left, right in zip(quads, quads[1:]):
+            assert right[0][0] == pytest.approx(left[1][0])
+
+    def test_no_ops_leave_the_rig_alone(self):
+        cam = self._rig()
+        before = cam.get_calib().to_dict()
+        cam.move_camera(9, 1)          # out of range
+        cam.move_camera(0, 0)          # no direction
+        assert cam.get_calib().to_dict() == before
+
+    def test_an_unplaced_camera_has_no_place_to_swap(self):
+        cam = self._rig(2)
+        cams = list(cam.get_calib().cams)
+        cams[1] = CameraPlacement(serial="S1")          # never placed
+        cam.set_calib(StitchCalib(cams=cams))
+        before = cam.get_calib().to_dict()
+        cam.move_camera(0, 1)
+        assert cam.get_calib().to_dict() == before
 
 
 class TestFillHoles:

@@ -131,6 +131,9 @@ class StitchServer:
         elif mtype == "rotate_camera":
             if index is not None:
                 self._camera.rotate_camera(index, _as_steps(params.get("steps"), 1))
+        elif mtype == "move_camera":
+            if index is not None:
+                self._camera.move_camera(index, _as_steps(params.get("steps"), 1))
         elif mtype == "nudge_height":
             if index is not None:
                 self._camera.nudge_height(index, _as_steps(params.get("steps"), 1))

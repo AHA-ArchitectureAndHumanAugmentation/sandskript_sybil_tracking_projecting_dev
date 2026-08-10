@@ -195,13 +195,22 @@ live, split by a drag bar into RESULT on top (the combined canvas, look-only,
 `pointer-events:none`; only the selected camera's footprint is outlined so you
 can tell the pictures apart) and WORKBENCH underneath (one panel per camera —
 every edit happens here). Splitter height persists in localStorage.
+Sidebar per camera: **Turn** (⟲ ⟳ quarter turns), **Move** (◀ ▶ = swap places
+with the neighbour to that side), Height (▼ ▲), Reset corners / Reset camera,
+depth-vs-colour, Save layout. Turn + Move are how the row is made to match the
+physical rig BEFORE any fine dragging.
 Per panel: green numbered handles 1-4 on the corners shape where that camera
 lands, dragging inside the green outline moves it, blue EDGE bars trim the
 picture (edges not corners, so the two never fight for the same hit area).
 The green outline is the camera's canvas quad drawn at the panel's own scale
-(`panelShape`: centred on the crop rect, scaled crop-width/quad-width), so an
-unskewed camera reads as a plain rectangle and a keystoned one visibly leans;
-drag deltas convert panel px → canvas mm through that same `pxPerMm`.
+through a **cached** mm→px map (`panelMaps`/`fitMap`/`panelPts`): at each fit
+an unskewed quad lands exactly on the crop rect, so the cropped region normally
+sits inside the four handles. The map deliberately does NOT depend on the quad
+— deriving scale + centre from the corners every repaint is what made dragging
+ONE handle rescale and re-centre the other three. It re-fits only on a turn, a
+panel resize, a `command()` button, when the shape drifts off-panel, or when
+`applyCalib` sees the SERVER move corners we did not (a trim re-cut); a plain
+corner drag echoes back identical, so nothing shifts under the operator's hand.
 Handles live on `<body>`, positioned from the panel's client rect, so a short
 workbench never clips them.
 Per camera (`stitcher.CameraPlacement`): `rot_deg` 0/90/180/270 mounting
@@ -222,15 +231,22 @@ Helpers worth knowing: `rotate_quad` (turn a quad about its centre AND
 re-label its corners, so the picture turns unstretched — pair it with
 `rot_deg`, `MultiCameraThread.rotate_camera` does both plus `_rotate_crop`),
 `requad_for_crop` (push a new crop through the OLD pin so trimming an edge
-never slides the sand that was kept), `default_quad_mm` (unplaced camera =
-upright rect parked one footprint right of the last), `bind_placements`
-(match a saved calib to the cameras present, serial first then position).
+never slides the sand that was kept), **`default_row_mm`** (the opening layout:
+ONE tile size for the whole rig — `common_footprint_mm`, the MEDIAN of what the
+cameras report — laid FLUSH left to right, tops aligned, each tile scaled by its
+own crop so trimming closes the row up instead of leaving a hole;
+`default_quad_mm` is only the single-camera fallback for a folded quad),
+**`swap_quads_x`** (trade two cameras' places in x while each keeps its own
+shape — the keystone must survive a reorder; `quad_centre_x` is what "left"
+means), `bind_placements` (match a saved calib to the cameras present, serial
+first then position).
 Modules: `stitcher.py` (pure math + `synthetic_scene(n)`), `multi_camera.py`
 (`MultiCameraThread` owns every RealSense pipeline; 0 cameras → SYNTHETIC
 scene of STITCH_SYNTHETIC_CAMERAS), `stitch_server.py` +
 `viewer/stitch.html`/`stitch.js` (MJPEG: `/canvas` = the result view with
 overlap outlined, `/cam/{index}` = one workbench panel per camera carrying the
 crop rectangle; WS in: set_camera{index,…}, rotate_camera{index,steps},
+move_camera{index,steps} (±1 = one place left/right in the row),
 nudge_height{index,steps}, reset_camera{index,corners_only},
 set_grid{mm_per_px}, set_colour{on}, save_calib → `stitch_calibration.json`,
 gitignored; out: init/state carry `calib{cams[],mm_per_px}` and
@@ -392,12 +408,28 @@ never import `main` from these modules.
 - `stitch.js` ignores the server's `calib` echo for ~700 ms after sending an
   edit. Drags are relative, so a stale echo would not just flicker the outline,
   it would make the NEXT delta start from the wrong corner.
+- The panel's mm→px map (`panelMaps`) must NOT be keyed on the quad, and must
+  not be re-fit mid-gesture. Both were the same bug: dragging one handle
+  changed the quad's width and centroid, the panel re-derived its scale and
+  centre from them, and all four handles moved. Keyed on `rot_deg` + panel
+  size only; the crop is deliberately absent because trimming does not move the
+  sand (requad), so the outline should sit still and re-fit when the re-cut
+  corners land.
+- The opening row's tile is FROZEN in `MultiCameraThread._tile_mm` when the
+  camera set is bound, not re-derived per reset. Median depth wobbles a few
+  tenths of a percent frame to frame; letting that into the layout put a
+  reset camera ~1 cm out of line with neighbours reset a second earlier.
+- `move_camera` orders cameras by `quad_centre_x`, NOT by index. Once the
+  operator has dragged things around, USB enumeration order says nothing about
+  which camera is on the left, and swapping by index would move the wrong pair.
+  It also swaps POSITIONS, not quads — exchanging the quads outright would
+  hand each camera the other's keystone.
 - Keep the result view non-interactive. Handles used to live on the combined
   canvas and it read as two competing workspaces; the split is result-on-top,
   edits-below, and the top's SVG is `pointer-events:none` to enforce it.
 - `stitch_server` serves `/static/*` no-store like the main app. A cached
   `stitch.js` against a restarted server is a browser talking a protocol the
   server no longer speaks, and it corrupts placements silently.
-- Test count reference: 345 unit (+6 hardware-gated). The `text_guard` OCR
+- Test count reference: 365 unit (+6 hardware-gated). The `text_guard` OCR
   tests skip themselves when Tesseract is absent; the text-matching ones always
   run. Keep green.
