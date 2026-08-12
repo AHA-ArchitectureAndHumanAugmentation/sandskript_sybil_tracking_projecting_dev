@@ -3,7 +3,7 @@
 
    Required ids: #stage-wrap #stage #feed #overlay
                  #interval #interval-val #textsize #textsize-val
-                 #auto-toggle #trigger #status-chip #status-msg
+                 #auto-toggle #trigger #maxtime #status-chip #status-msg #countdown
 
    What it does:
    - keeps a stage fitted to the window in the CROP's aspect ratio, drawing the
@@ -15,8 +15,13 @@
      the manual Capture/Generate/Run buttons in Developer Mode;
    - Trigger box (mm) → `set_trigger` (empty = none) — the distance that arms
      the trigger; both are server-side state shared by every open window;
+   - Max drawing time box (min) → `set_max_draw_time` (empty = no limit) — how
+     long one participant may draw before the drawing is refused;
    - shows the automation status (Auto Off/Auto On/Alerted/Sensing/Generating
-     Paths/Actuating) big in the stage's top-right corner, from `state`. */
+     Paths/Actuating) big in the stage's top-right corner, from `state`, and
+     the drawing-time countdown in the top-left corner. Both numbers come from
+     the server — the countdown is never run client-side, so what the
+     participant reads is the clock that actually judges the drawing. */
 
 (function () {
   let srcW = 640, srcH = 480;   // size of the cropped region (updates with labels)
@@ -103,6 +108,43 @@
     else if (mm != null && cur !== mm) triggerEl.value = mm;
   }
 
+  /* ── Max drawing time box + countdown ───────────────────────────────────── */
+  const maxTimeEl = document.getElementById("maxtime");
+  const cdEl      = document.getElementById("countdown");
+  let maxTimer = null;
+  maxTimeEl.addEventListener("input", () => {
+    if (maxTimer) clearTimeout(maxTimer);
+    maxTimer = setTimeout(() => {
+      const v = parseFloat(maxTimeEl.value);
+      send({ type: "set_max_draw_time",
+             params: { minutes: Number.isFinite(v) && v > 0 ? v : null } });
+    }, 400);
+  });
+
+  function syncMaxTime(min) {
+    if (document.activeElement === maxTimeEl) return;   // never fight the typist
+    const cur = parseFloat(maxTimeEl.value);
+    if (min == null && maxTimeEl.value !== "") maxTimeEl.value = "";
+    else if (min != null && cur !== min) maxTimeEl.value = min;
+  }
+
+  function mmss(seconds) {
+    const t = Math.max(0, Math.round(seconds));
+    return Math.floor(t / 60) + ":" + String(t % 60).padStart(2, "0");
+  }
+
+  function updateCountdown(p) {
+    // No limit set, or automation off → no clock to show.
+    if (p.max_draw_min == null || p.remaining_s == null || !p.auto) {
+      cdEl.className = "hidden";
+      return;
+    }
+    const counting = p.status === "Alerted";     // only ticks while a hand is in
+    const warn = counting && p.remaining_s <= (p.warn_s || 10);
+    cdEl.textContent = mmss(p.remaining_s);
+    cdEl.className = warn ? "warn" : (counting ? "counting" : "");
+  }
+
   /* ── Auto toggle ────────────────────────────────────────────────────────── */
   const autoEl = document.getElementById("auto-toggle");
   let autoOn = false;
@@ -134,6 +176,8 @@
     msgEl.textContent = p.message || "";
     syncAuto(p.auto);
     syncTrigger(p.trigger_mm);
+    syncMaxTime(p.max_draw_min);
+    updateCountdown(p);
   }
 
   /* ── WebSocket: register as an overlay client; receive labels + state ───── */

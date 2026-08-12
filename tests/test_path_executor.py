@@ -76,7 +76,7 @@ class TestPathExecutorLifecycle:
         ex.start(strokes)  # second call must be no-op
         _wait_done(ex)
         # lift + travel + land-on-start + final pen-up = 4 move_to calls;
-        # the rest of the stroke goes via one movep (move_process_path)
+        # the rest of the stroke goes via one blended run (move_process_path)
         assert robot.move_to.call_count == 4
         assert robot.move_process_path.call_count == 1
 
@@ -98,7 +98,7 @@ class TestBlendRadius:
         ex.start(strokes)
         _wait_done(ex)
         blend = robot.move_process_path.call_args_list[0][0][3]
-        assert blend == pytest.approx(0.0005)       # MOVEP_BLEND_M
+        assert blend == pytest.approx(0.0005)       # BLEND_ZONE_M
 
     def test_custom_blend_clamped_per_stroke(self, one_stroke):
         ex, robot, state, strokes = one_stroke
@@ -126,7 +126,7 @@ class TestMoveSequence:
         ex.start(strokes)
         _wait_done(ex)
         # lift + travel + land-on-start + final pen-up = 4 move_to calls;
-        # the remaining waypoints go via one movep (move_process_path)
+        # the remaining waypoints go via one blended run (move_process_path)
         assert robot.move_to.call_count == 4
         assert robot.move_process_path.call_count == 1
 
@@ -198,12 +198,12 @@ class TestMoveSequence:
             assert speed == 0.2
             assert accel == TRAVEL_ACCEL
 
-    def test_draw_passes_remaining_waypoints_to_movep(self, one_stroke):
+    def test_draw_passes_remaining_waypoints_to_the_blended_run(self, one_stroke):
         ex, robot, state, strokes = one_stroke
         ex.start(strokes)
         _wait_done(ex)
         # First waypoint is landed on via move_to; the rest go through one
-        # movep process path.
+        # blended process path.
         robot.move_process_path.assert_called_once()
         waypoints = robot.move_process_path.call_args_list[0][0][0]
         assert len(waypoints) == len(strokes[0]) - 1
@@ -262,7 +262,7 @@ class TestStateTransitions:
 
     def test_exception_sets_error_phase(self, mock_robot, shared_state_and_lock):
         state, lock = shared_state_and_lock
-        mock_robot.move_to.side_effect = RuntimeError("RTDE disconnected")
+        mock_robot.move_to.side_effect = RuntimeError("robot link lost")
         ex = PathExecutor(mock_robot, state, lock)
         ex.start([_make_stroke(2)])
         _wait_done(ex)
@@ -278,17 +278,17 @@ class TestStateTransitions:
             with lock:
                 progress_snapshots.append(state["progress"])
 
-        def recording_movep(*args, **kwargs):
+        def recording_run(*args, **kwargs):
             with lock:
                 progress_snapshots.append(state["progress"])
 
         mock_robot.move_to.side_effect = recording_move
-        mock_robot.move_process_path.side_effect = recording_movep
+        mock_robot.move_process_path.side_effect = recording_run
         ex = PathExecutor(mock_robot, state, lock)
         strokes = [_make_stroke(2)]
         ex.start(strokes)
         _wait_done(ex)
-        # lift + travel + land (3 move_to) + movep + final pen-up (1 move_to)
+        # lift + travel + land (3 move_to) + blended run + final pen-up (1 move_to)
         assert len(progress_snapshots) >= 4
         for i in range(1, len(progress_snapshots)):
             assert progress_snapshots[i] >= progress_snapshots[i - 1]

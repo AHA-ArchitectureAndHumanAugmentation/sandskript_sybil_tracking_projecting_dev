@@ -2,7 +2,7 @@
 REM -- Saved-toolpath replay launcher ----------------------------------------
 REM Connect the robot, pick a saved bundle under paths\ and re-run it.
 REM CONTAINED tool: close the main app first if it is connected to the robot
-REM (one RTDE controller per robot). No camera needed.
+REM (one RRC client per controller task). No camera needed.
 
 set PYTHONUTF8=1
 chcp 65001 >nul

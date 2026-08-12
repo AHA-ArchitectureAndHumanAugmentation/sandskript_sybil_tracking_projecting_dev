@@ -2,18 +2,20 @@
 replay_robot.py — robot-brand abstraction for the saved-toolpath replay tool.
 
 The replay server/UI only ever talk to the ReplayBackend interface, so porting
-to another robot brand touches nothing else. To add an ABB GoFa 10 backend:
+to another robot brand touches nothing else. The shipped backend is the ABB
+GoFa 10 over compas_rrc; it reuses the main app's RobotController and
+PathExecutor, so a replayed path.json actuates exactly like a live run.
 
-  1. Subclass ReplayBackend (e.g. ``ABBGofaBackend``) — via compas_rrc the
-     mapping is roughly: connect → AbbClient + ping, run → one MoveL per
-     waypoint (approach/retract like URReplayBackend does via PathExecutor),
-     cancel → stop/clear the instruction queue.
-  2. Orientation: UR poses are rotation vectors; ABB wants quaternions. Convert
-     with scipy (``Rotation.from_rotvec(pose[3:6]).as_quat()``) — or load
-     path.json, whose per-waypoint ``plane`` (origin + x/y/z axes) maps
-     directly to a compas Frame.
-  3. Register the class in ``make_backend()`` and set REPLAY_BACKEND = your key
-     in config.py.
+To add another brand:
+
+  1. Subclass ReplayBackend and implement connect/disconnect/run/cancel plus
+     the connected/running properties.
+  2. Convert poses at the boundary. Everything above this module is metres +
+     an axis-angle rotation vector; RobotController.pose_to_frame shows the
+     conversion the ABB backend uses, and path.json's per-waypoint ``plane``
+     (origin + x/y/z axes) is already a frame if that suits the target better.
+  3. Register the class in ``make_backend()`` and set REPLAY_BACKEND to your
+     key in config.py.
 
 Progress reporting: a backend writes ``executing`` (bool), ``phase``
 ("executing" | "done" | "captured"=cancelled | "error"), ``progress`` (0..1)
@@ -64,11 +66,11 @@ class ReplayBackend(ABC):
     def cancel(self) -> None: ...
 
 
-class URReplayBackend(ReplayBackend):
-    """UR via ur-rtde — reuses the main app's RobotController + PathExecutor,
-    so a replayed path.json actuates exactly like the sibling path.script."""
+class ABBGofaBackend(ReplayBackend):
+    """ABB GoFa 10 via compas_rrc — reuses the main app's RobotController +
+    PathExecutor, so a replayed path.json actuates exactly like a live run."""
 
-    name = "UR (ur-rtde)"
+    name = "ABB GoFa 10 (compas_rrc)"
 
     def __init__(self, shared_state: dict, state_lock: threading.Lock,
                  robot: RobotController | None = None) -> None:
@@ -76,6 +78,7 @@ class URReplayBackend(ReplayBackend):
         self._executor = PathExecutor(self._robot, shared_state, state_lock)
 
     def connect(self, ip: str) -> None:
+        """``ip`` is the ROS bridge host, not the robot — see RobotController."""
         self._robot.connect(ip)
 
     def disconnect(self) -> None:
@@ -109,10 +112,6 @@ class URReplayBackend(ReplayBackend):
 def make_backend(kind: str, shared_state: dict,
                  state_lock: threading.Lock) -> ReplayBackend:
     """Backend factory — config.REPLAY_BACKEND selects the brand."""
-    if kind == "ur":
-        return URReplayBackend(shared_state, state_lock)
     if kind == "abb_gofa":
-        raise NotImplementedError(
-            "ABB GoFa backend not implemented yet — subclass ReplayBackend "
-            "(see the replay_robot module docstring for the port recipe)")
-    raise ValueError(f"unknown REPLAY_BACKEND {kind!r} (known: 'ur')")
+        return ABBGofaBackend(shared_state, state_lock)
+    raise ValueError(f"unknown REPLAY_BACKEND {kind!r} (known: 'abb_gofa')")

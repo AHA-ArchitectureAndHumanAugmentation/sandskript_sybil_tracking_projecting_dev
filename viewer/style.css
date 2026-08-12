@@ -234,6 +234,11 @@ main {
 
 #exec-speed { width: 90px; }
 #exec-speed-val { min-width: 30px; color: #ddd; }
+/* Drawn length readout beside the Max Total Length box. Turns red when the
+   path is over the limit — the same answer Run and Save will give. */
+#exec-length-val { min-width: 48px; color: #ddd; font-variant-numeric: tabular-nums; }
+#exec-length-val.over { color: #ff6b5e; font-weight: 600; }
+#exec-max-length { width: 62px; }
 #exec-bar input[type="number"] {
   width: 52px;
   background: #222;

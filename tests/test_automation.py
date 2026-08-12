@@ -2,11 +2,11 @@
 Unit tests for automation.py — the Participant-Mode state machine. Pure logic,
 no hardware: main.py feeds it the camera's below-threshold flag via tick().
 """
-from automation import ParticipantAutomation
+from automation import ParticipantAutomation, format_duration
 
 
-def make(clear_ticks: int = 3) -> ParticipantAutomation:
-    a = ParticipantAutomation(clear_ticks=clear_ticks)
+def make(clear_ticks: int = 3, max_draw_s=None) -> ParticipantAutomation:
+    a = ParticipantAutomation(clear_ticks=clear_ticks, max_draw_s=max_draw_s)
     a.set_enabled(True)
     return a
 
@@ -148,3 +148,101 @@ class TestProfanityRejection:
         a.tick(True); a.tick(False)
         a.finish("Done.")
         assert a.status == "Auto On"
+
+
+class TestMaxDrawingTime:
+    """The Max Drawing Time box: hand-in → hand-out, or the drawing is Invalid.
+
+    Every tick takes an explicit ``now`` (monotonic seconds), so the clock is
+    tested without sleeping.
+    """
+
+    def test_no_limit_never_times_out(self):
+        a = make(clear_ticks=1)                       # box empty = no limit
+        a.tick(True, now=0)
+        assert a.tick(False, now=10_000) is True      # an hour of drawing is fine
+        assert a.remaining_s(now=10_000) is None
+
+    def test_remaining_is_the_full_allowance_while_nobody_draws(self):
+        a = make(clear_ticks=1, max_draw_s=300)
+        assert a.remaining_s(now=0) == 300            # armed: shows what you get
+
+    def test_remaining_counts_down_while_drawing(self):
+        a = make(clear_ticks=3, max_draw_s=300)
+        a.tick(True, now=0)
+        a.tick(True, now=60)
+        assert a.remaining_s(now=60) == 240
+
+    def test_countdown_is_off_when_disabled(self):
+        a = ParticipantAutomation(clear_ticks=1, max_draw_s=300)
+        assert a.remaining_s(now=0) is None           # Auto Off shows no clock
+
+    def test_overrun_is_invalid_and_saves_nothing(self):
+        a = make(clear_ticks=2, max_draw_s=10)
+        a.tick(True, now=0)
+        assert a.tick(True, now=11) is False          # never starts the pipeline
+        assert a.status == "Invalid"
+        assert a.busy is False
+        assert "0:10" in a.message                    # says what the limit was
+
+    def test_overrun_holds_the_verdict_until_the_sand_is_clear(self):
+        """The hand is still in frame — re-Alerting on it would hide the verdict."""
+        a = make(clear_ticks=2, max_draw_s=10)
+        a.tick(True, now=0)
+        a.tick(True, now=11)                          # timed out → Invalid
+        a.tick(True, now=12)
+        assert a.status == "Invalid"
+        a.tick(False, now=13); a.tick(False, now=14)  # sand clear again
+        assert a.status == "Invalid"                  # still sticky, still armed
+
+    def test_next_participant_gets_a_fresh_clock(self):
+        a = make(clear_ticks=2, max_draw_s=10)
+        a.tick(True, now=0)
+        a.tick(True, now=11)                          # timed out
+        a.tick(False, now=12); a.tick(False, now=13)  # clear
+        a.tick(True, now=20)                          # next participant
+        assert a.status == "Alerted"
+        assert a.remaining_s(now=20) == 10
+        assert a.tick(False, now=21) is False
+        assert a.tick(False, now=22) is True          # runs normally
+
+    def test_finishing_just_in_time_is_accepted(self):
+        """The clock stops when the hand LEAVES, not when the debounce expires."""
+        a = make(clear_ticks=3, max_draw_s=10)
+        a.tick(True, now=0)
+        a.tick(False, now=9)                          # hand out with 1 s to spare
+        a.tick(False, now=10.5)                       # debounce runs past the limit
+        assert a.tick(False, now=12) is True          # still a valid drawing
+        assert a.status == "Sensing"
+
+    def test_hand_returning_resumes_the_clock(self):
+        a = make(clear_ticks=3, max_draw_s=10)
+        a.tick(True, now=0)
+        a.tick(False, now=5)                          # paused at 5 s
+        assert a.remaining_s(now=8) == 5
+        a.tick(True, now=8)                           # back in → counting again
+        assert a.remaining_s(now=9) == 1
+
+    def test_limit_can_be_changed_or_cleared_live(self):
+        a = make(clear_ticks=1, max_draw_s=10)
+        a.set_max_draw_s(None)
+        a.tick(True, now=0)
+        assert a.tick(True, now=999) is False and a.status == "Alerted"
+        a.set_max_draw_s(0)                           # 0 = off, same as empty
+        assert a.max_draw_s is None
+        a.set_max_draw_s(60)
+        assert a.max_draw_s == 60
+
+    def test_toggling_auto_resets_the_clock(self):
+        a = make(clear_ticks=1, max_draw_s=10)
+        a.tick(True, now=0)
+        a.set_enabled(False)
+        a.set_enabled(True)
+        assert a.remaining_s(now=100) == 10           # not "9:50 overdue"
+
+
+def test_format_duration():
+    assert format_duration(0) == "0:00"
+    assert format_duration(9.4) == "0:09"
+    assert format_duration(300) == "5:00"
+    assert format_duration(3661) == "61:01"

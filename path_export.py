@@ -1,11 +1,12 @@
 """
-path_export.py — save a generated toolpath to disk in robot-native + open formats.
+path_export.py — save a generated toolpath to disk in an open, robot-neutral form.
 
 Each save produces a timestamped subfolder under ``paths/`` containing:
-  - path.script  URScript program (movel travels + movep drawing), directly
-                 runnable on a UR controller.
-  - path.json    the same strokes as 6-DOF poses PLUS a full plane/frame per
+  - path.json    the strokes as 6-DOF poses PLUS a full plane/frame per
                  waypoint (origin + x/y/z axes), for frame-guided workflows.
+                 This is the EXECUTABLE file: the replay tool reads it back and
+                 the ABB frames the robot moves through come straight from it.
+  - path.script  URScript (movel travels + movep drawing) of the same strokes.
   - preview.png  the 3D Path Preview image, so an operator can identify the file.
   - mask.png     the thick detected-region mask the path came from.
   - skeleton.png the 1-px groove centrelines the strokes were traced along.
@@ -14,9 +15,16 @@ The last two are the detection stage as it stood at save time, cropped to the
 same region the strokes were extracted from — what the sand actually looked
 like to the detector, kept alongside the path it produced.
 
+⚠ path.script is a UR-format file kept for continuity — a GoFa cannot run it,
+and nothing in this program reads it back any more. It records the same poses
+as path.json in a second, human-readable form; treat it as a record, not as
+something to load onto a controller. Motion on the GoFa is sent live over RRC
+from path.json, whose per-waypoint plane is exactly what an ABB frame needs.
+
 Strokes are the robot-space poses from Generate Path: a list of strokes, each a
-list of ``[x, y, z, rx, ry, rz]`` (metres, UR rotation vector). The run-time
-normal offset is baked in on save so the saved path matches what would execute.
+list of ``[x, y, z, rx, ry, rz]`` (metres + axis-angle rotation vector). The
+run-time normal offset is baked in on save so the saved path matches what would
+execute.
 """
 from __future__ import annotations
 
@@ -31,7 +39,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from config import (
-    PATHS_DIR, DRAW_ACCEL, TRAVEL_ACCEL, MOVEP_BLEND_M, PREVIEW_MAX_BYTES,
+    BLEND_ZONE_M, DRAW_ACCEL, PATHS_DIR, PREVIEW_MAX_BYTES, TRAVEL_ACCEL,
 )
 
 Pose = list           # [x, y, z, rx, ry, rz]
@@ -58,11 +66,11 @@ def _retract(pose: Pose, dist: float) -> Pose:
 
 def stroke_blend(waypoints: Strokes, blend_m: float) -> float:
     """
-    Clamp a requested movep blend radius for one stroke: the UR controller
-    rejects a path when a blend reaches half the distance to the next waypoint,
-    and resampling can leave one short tail segment, so cap at 45% of the
-    stroke's SHORTEST segment. Shared by the live executor and the URScript
-    export so both actuate identically.
+    Clamp a requested corner zone radius for one stroke. A zone that reaches
+    half the distance to the next waypoint has nothing left to round — the
+    controller starts cutting the corner off rather than following it — and
+    resampling can leave one short tail segment, so cap at 45% of the stroke's
+    SHORTEST segment.
     """
     blend = max(float(blend_m), 0.0)
     if blend <= 0.0 or len(waypoints) < 2:
@@ -73,15 +81,20 @@ def stroke_blend(waypoints: Strokes, blend_m: float) -> float:
     return min(blend, 0.45 * min_seg)
 
 
-# ── URScript ──────────────────────────────────────────────────────────────────
+# ── URScript (record only — see the module docstring) ─────────────────────────
 def build_urscript(strokes: Strokes, speed: float, safety: float,
                    header: str = "", name: str = "draw_path",
-                   blend_m: float = MOVEP_BLEND_M) -> str:
+                   blend_m: float = BLEND_ZONE_M) -> str:
     """
     URScript program: for each stroke, retract-approach → start → movep through
     the waypoints → retract. ``speed`` m/s is used for travels and drawing so the
     motion is uniform; ``safety`` m is the retract distance along the tool axis;
     ``blend_m`` is the movep corner radius (clamped per stroke by stroke_blend).
+
+    A UR-format record of the same poses path.json carries — kept for continuity
+    and readability, NOT what the GoFa executes. The accelerations here are the
+    config values; on the ABB side acceleration is a controller setting, so the
+    two are not expected to match instruction for instruction.
     """
     def ps(p: Pose) -> str:
         return "p[" + ", ".join(f"{v:.5f}" for v in p) + "]"
@@ -162,11 +175,11 @@ def save_bundle(
     meta: dict,
     preview_png_data_url: str | None = None,
     base_dir: Path | None = None,
-    blend_m: float = MOVEP_BLEND_M,
+    blend_m: float = BLEND_ZONE_M,
     mask=None,
     skeleton=None,
 ) -> Path:
-    """Write path.script + path.json (+ preview/mask/skeleton .png) into a
+    """Write path.json + path.script (+ preview/mask/skeleton .png) into a
     timestamped folder. `mask` and `skeleton` are the cropped uint8 detection
     images from Generate Path; either may be None (nothing is written for it)."""
     base = Path(base_dir) if base_dir is not None else PATHS_DIR
@@ -182,6 +195,16 @@ def save_bundle(
     final = ([[_offset_pose(p, offset_m) for p in s] for s in strokes]
              if abs(offset_m) > 1e-9 else strokes)
 
+    # The run parameters go in meta as well as the script header, so path.json
+    # alone is enough to reproduce the run — the replay tool reads them there.
+    meta = dict(meta)
+    meta.setdefault("saved", ts)
+    meta["speed_mps"] = round(float(speed), 4)
+    meta["safety_mm"] = round(safety_m * 1000.0, 1)
+    meta["blend_mm"] = round(blend_m * 1000.0, 2)
+    (folder / "path.json").write_text(
+        json.dumps(build_json(final, meta), indent=2), encoding="utf-8")
+
     header = (
         f"depth-cam-to-robot toolpath — {meta.get('saved', ts)}\n"
         f"mode: {meta.get('mode', '?')}  surface: {meta.get('surface_name', '-')}\n"
@@ -189,13 +212,11 @@ def save_bundle(
         f"safety: {meta.get('safety_mm', 0):.0f} mm  "
         f"blend: {blend_m * 1000:.1f} mm  "
         f"strokes: {meta.get('stroke_count', len(final))}\n"
-        f"Verify TCP + payload on the pendant; run at reduced speed first."
+        f"UR-format record of the poses in path.json — NOT what the GoFa runs."
     )
     (folder / "path.script").write_text(
         build_urscript(final, speed, safety_m, header=header, blend_m=blend_m),
         encoding="utf-8")
-    (folder / "path.json").write_text(
-        json.dumps(build_json(final, meta), indent=2), encoding="utf-8")
 
     png = _decode_png(preview_png_data_url)
     if png:

@@ -1,5 +1,6 @@
 """
-Unit tests for path_export.py — URScript + JSON + bundle saving. No hardware.
+Unit tests for path_export.py — JSON + URScript record + bundle saving.
+No hardware.
 """
 import base64
 import json
@@ -11,7 +12,7 @@ import pytest
 from scipy.spatial.transform import Rotation
 
 from path_export import (
-    build_urscript, build_json, is_png_data_url, save_bundle, _offset_pose,
+    build_json, build_urscript, is_png_data_url, save_bundle, _offset_pose,
     stroke_blend,
 )
 
@@ -25,14 +26,13 @@ STROKES = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# URScript
+# URScript — a record of the same poses, not what the GoFa executes
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestUrscript:
 
     def test_structure(self):
         s = build_urscript(STROKES, speed=0.3, safety=0.05)
-        assert s.startswith("# ") or s.startswith("def ")  # header or def
         assert "def draw_path():" in s
         assert s.strip().endswith("draw_path()")
         assert "end" in s
@@ -40,7 +40,6 @@ class TestUrscript:
     def test_travels_use_movel_draws_use_movep(self):
         s = build_urscript(STROKES, speed=0.3, safety=0.05)
         assert s.count("movel(") == len(STROKES) * 3   # approach + start + lift each
-        # movep for every drawing point after the start of each stroke
         assert s.count("movep(") == sum(len(st) - 1 for st in STROKES)
 
     def test_poses_formatted(self):
@@ -52,7 +51,25 @@ class TestUrscript:
         # tool-down retract adds +Z; first movel target should be z = 0.2 + 0.05
         s = build_urscript([STROKES[0]], speed=0.3, safety=0.05)
         first = s.split("movel(")[1]
-        assert "0.25000" in first   # 0.20 + 0.05 safety on Z
+        assert "0.25000" in first
+
+    def test_it_carries_the_same_poses_as_the_json(self, tmp_path):
+        # The two files are one record in two forms; if they ever disagree the
+        # .script stops being a usable reference for what was drawn.
+        folder = save_bundle(STROKES, 0.3, 0.05, 0.0, {}, base_dir=tmp_path)
+        script = (folder / "path.script").read_text(encoding="utf-8")
+        data = json.loads((folder / "path.json").read_text(encoding="utf-8"))
+        for stroke in data["strokes"]:
+            for wp in stroke:
+                x, y, z = wp["pose"][:3]
+                assert f"{x:.5f}, {y:.5f}, {z:.5f}" in script
+
+    def test_the_header_says_it_is_not_executable(self, tmp_path):
+        # Nothing here runs this file; the header is what stops someone
+        # loading it onto a controller and expecting the GoFa to obey.
+        folder = save_bundle(STROKES, 0.3, 0.05, 0.0, {}, base_dir=tmp_path)
+        head = (folder / "path.script").read_text(encoding="utf-8")[:400]
+        assert "NOT what the GoFa runs" in head
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -61,14 +78,13 @@ class TestUrscript:
 
 class TestBlendRadius:
 
-    def test_default_blend_in_script(self):
-        s = build_urscript(STROKES, speed=0.3, safety=0.05)
-        assert "r=0.0005" in s                      # MOVEP_BLEND_M default
-
-    def test_custom_blend_in_script(self):
-        s = build_urscript(STROKES, speed=0.3, safety=0.05, blend_m=0.003)
-        assert "r=0.0030" in s
-        assert "r=0.0005" not in s
+    def test_blend_is_recorded_in_the_saved_meta(self, tmp_path):
+        # The Radius the run used has to survive into the bundle, or a replay
+        # cannot reproduce the same corners.
+        folder = save_bundle(STROKES, 0.3, 0.05, 0.0, {}, base_dir=tmp_path,
+                             blend_m=0.003)
+        meta = json.loads((folder / "path.json").read_text())["meta"]
+        assert meta["blend_mm"] == pytest.approx(3.0)
 
     def test_stroke_blend_passthrough_when_small(self):
         # 50 mm segments: a 3 mm request is far below the 45% cap.
@@ -86,12 +102,14 @@ class TestBlendRadius:
         assert stroke_blend(STROKES[0], -1.0) == 0.0
         assert stroke_blend([STROKES[0][0]], 0.005) == 0.005  # 1 pt: nothing to clamp
 
-    def test_clamped_blend_lands_in_script(self):
+    def test_clamp_survives_a_stroke_with_one_short_tail_segment(self):
+        # Resampling regularly leaves a short final segment; the clamp has to
+        # follow the SHORTEST one, not the average.
         stroke = [[0.4, 0.0, 0.2, 0.0, _PI, 0.0],
-                  [0.41, 0.0, 0.2, 0.0, _PI, 0.0],
-                  [0.414, 0.0, 0.2, 0.0, _PI, 0.0]]
-        s = build_urscript([stroke], speed=0.3, safety=0.05, blend_m=0.005)
-        assert "r=0.0018" in s                      # 0.45 × 4 mm = 1.8 mm
+                  [0.45, 0.0, 0.2, 0.0, _PI, 0.0],
+                  [0.50, 0.0, 0.2, 0.0, _PI, 0.0],
+                  [0.504, 0.0, 0.2, 0.0, _PI, 0.0]]
+        assert stroke_blend(stroke, 0.005) == pytest.approx(0.45 * 0.004)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,15 +157,15 @@ class TestOffset:
 
 class TestSaveBundle:
 
-    def test_creates_three_files(self, tmp_path):
+    def test_creates_the_bundle_files(self, tmp_path):
         # 1×1 transparent PNG
         png_b64 = ("data:image/png;base64,"
                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
         folder = save_bundle(STROKES, speed=0.3, safety_m=0.05, offset_m=0.0,
                              meta={"mode": "surface"}, preview_png_data_url=png_b64,
                              base_dir=tmp_path)
-        assert (folder / "path.script").exists()
         assert (folder / "path.json").exists()
+        assert (folder / "path.script").exists()
         assert (folder / "preview.png").exists()
         assert (folder / "preview.png").stat().st_size > 0
 
@@ -251,7 +269,7 @@ class TestSaveDetectionImages:
     def test_missing_images_are_simply_absent(self, tmp_path):
         # A save must never fail because a generate left nothing behind.
         folder = save_bundle(STROKES, 0.3, 0.05, 0.0, {}, base_dir=tmp_path)
-        assert (folder / "path.script").exists()
+        assert (folder / "path.json").exists()
         assert not (folder / "mask.png").exists()
         assert not (folder / "skeleton.png").exists()
 

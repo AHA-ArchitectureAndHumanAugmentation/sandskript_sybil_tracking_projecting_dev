@@ -21,8 +21,11 @@ from config import (
     DRAW_Z, DRAW_SPEED, TRAVEL_Z, MAX_TCP_SPEED,
     RESAMPLE_SPACING_MM, RESAMPLE_SPACING_MIN_MM, RESAMPLE_SPACING_MAX_MM,
     JOIN_DISTANCE_MM, JOIN_DISTANCE_MIN_MM, JOIN_DISTANCE_MAX_MM,
-    UR_REACH_M, UR_MIN_REACH_M, MOVEP_BLEND_M,
+    MAX_PATH_LENGTH_MM, MAX_PATH_LENGTH_MIN_MM, MAX_PATH_LENGTH_MAX_MM,
+    GOFA_REACH_M, GOFA_MIN_REACH_M, BLEND_ZONE_M,
     PARTICIPANT_TICK_S, PARTICIPANT_CLEAR_S,
+    PARTICIPANT_MAX_DRAW_MIN, PARTICIPANT_MAX_DRAW_MIN_MIN,
+    PARTICIPANT_MAX_DRAW_MAX_MIN,
     PROFANITY_CHECK_ENABLED,
 )
 import text_guard
@@ -37,6 +40,7 @@ from depth_extractor import (
 from path_extractor import extract_from_edges, pixels_to_robot_coords
 from path_executor import PathExecutor
 from path_export import is_png_data_url, save_bundle
+from path_length import exceeds_limit, total_length_mm
 from robot_controller import RobotController
 from server import Server
 from settings import load_settings, save_settings
@@ -80,12 +84,21 @@ shared_state: dict = {
     # has nobody to click Save). Paired with the generate that produced it.
     "last_preview_png":    None,       # PNG data URL | None
     "path_serial":         0,          # bumped by every Generate Path
+    # Drawn length of the current path (mm, corner zone applied) and the ceiling
+    # the Max Total Length box sets. Over it, Run/Save refuse and Participant
+    # Mode calls the drawing Invalid. 0 = no limit.
+    "path_length_mm":      0.0,
+    "max_length_mm":       MAX_PATH_LENGTH_MM,
     "executing":           False,
     "progress":            0.0,
     # ── Participant Mode (automated pipeline) ──
     "auto_on":             False,      # Participant popup Auto toggle
     "trigger_mm":          None,       # trigger distance (mm from camera); None = off
     "trigger_below":       None,       # camera thread: something closer than trigger_mm?
+    # Max Drawing Time: minutes one participant may occupy the sand (hand in →
+    # hand out). None = off. remaining_s is what the popup counts down.
+    "max_draw_min":        PARTICIPANT_MAX_DRAW_MIN or None,
+    "participant_remaining_s": None,
     "participant_status":  "Auto Off", # Auto Off|Auto On|Alerted|Sensing|Generating Paths|Actuating|Invalid
     "participant_msg":     "",         # last automation outcome/message
     "participant_gen_params":  {},     # last crop/adjustments/spacing from Developer Mode
@@ -98,7 +111,8 @@ robot         = RobotController()
 camera_thread = DepthCameraThread(shared_state, state_lock)
 path_executor = PathExecutor(robot, shared_state, state_lock)
 automation    = ParticipantAutomation(
-    clear_ticks=round(PARTICIPANT_CLEAR_S / PARTICIPANT_TICK_S))
+    clear_ticks=round(PARTICIPANT_CLEAR_S / PARTICIPANT_TICK_S),
+    max_draw_s=(PARTICIPANT_MAX_DRAW_MIN or 0.0) * 60.0)
 
 
 # ── Robot connection callbacks ────────────────────────────────────────────────
@@ -123,8 +137,9 @@ async def on_robot_connect(ip: str, ws) -> None:
         with state_lock:
             shared_state["robot_connected"] = False
         msg = (
-            f"Timeout: no RTDE response from {ip} after 10 s. "
-            "Is the robot in Remote Control mode?"
+            f"Timeout: no answer from the ROS bridge at {ip} after 10 s. "
+            "Is `docker compose up` running, and the RRC task started on the "
+            "pendant?"
         )
         await server.send_connection_result(ws, False, msg)
         module_trace.log("connect", msg)
@@ -362,12 +377,18 @@ async def on_clear_surface() -> None:
 
 
 # ── Corner→TCP surface registration ──────────────────────────────────────────
-# Optional touch-off placement: pick a mesh corner in the Path Preview,
-# freedrive the tool tip onto the physical corner, confirm. 1-point for now
-# (translation only — rotation stays on the sliders); registration.py already
-# solves ≥3 points (full pose) for the future multi-point flow.
+# Optional touch-off placement: pick a mesh corner in the Path Preview, guide
+# the tool tip onto the physical corner, confirm. 1-point for now (translation
+# only — rotation stays on the sliders); registration.py already solves
+# ≥3 points (full pose) for the future multi-point flow.
+#
+# Hand-guiding is NOT software-controlled on the GoFa: RRC has no freedrive
+# instruction, and lead-through is armed with the button on the arm itself.
+# The toggle therefore only arms the touch-off in the UI and tells the operator
+# what to do with their hands — the position is still read back with GetFrame,
+# so registration works exactly as before.
 async def on_register_freedrive(ws, params: dict) -> None:
-    """Toggle freedrive for the touch-off (registration popup button)."""
+    """Arm/disarm the touch-off (registration popup button)."""
     on = bool((params or {}).get("on"))
     with state_lock:
         connected = shared_state.get("robot_connected", False)
@@ -376,14 +397,22 @@ async def on_register_freedrive(ws, params: dict) -> None:
         await server.send_register_result(ws, False, error="Robot not connected.")
         return
     if executing:
-        await server.send_register_result(ws, False, error="Cannot freedrive while executing.")
+        await server.send_register_result(
+            ws, False, error="Cannot hand-guide while executing.")
         return
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(
         None, robot.start_freedrive if on else robot.end_freedrive)
     with state_lock:
         shared_state["freedrive"] = on
-    module_trace.log("register", f"[register] freedrive {'ON — move the tool tip to the corner' if on else 'off'}")
+    if on and not getattr(robot, "FREEDRIVE_IS_SOFTWARE_CONTROLLED", True):
+        await server.send_register_result(
+            ws, True,
+            message="Hold the lead-through button on the arm and guide the tool "
+                    "tip onto the corner, then confirm.")
+    module_trace.log(
+        "register",
+        f"[register] touch-off {'armed — guide the tool tip to the corner' if on else 'disarmed'}")
 
 
 async def on_register_corner(ws, params: dict) -> None:
@@ -639,7 +668,15 @@ async def on_generate_path(ws, params: dict) -> None:
         shared_state["path_serial"] = path_serial
         shared_state["phase"]   = "captured" if robot_strokes else "editing"
         session_blend_mm = (shared_state.get("participant_exec_params") or {}).get(
-            "blend_mm", MOVEP_BLEND_M * 1000.0)
+            "blend_mm", BLEND_ZONE_M * 1000.0)
+        max_length_mm = shared_state.get("max_length_mm", MAX_PATH_LENGTH_MM)
+
+    # How far the tool will travel while drawing. Measured on the projected
+    # robot-space strokes, so spacing, joining and the surface's real scale are
+    # already in the number; the corner zone is applied on top.
+    length_mm = total_length_mm(robot_strokes, session_blend_mm)
+    with state_lock:
+        shared_state["path_length_mm"] = length_mm
 
     await server.send_capture_result(
         ws,
@@ -654,12 +691,14 @@ async def on_generate_path(ws, params: dict) -> None:
         # client-side when the exec-bar Offset/Safety inputs change.
         exec_viz={
             "blend_m": session_blend_mm / 1000.0,
-            "reach_m": UR_REACH_M,
-            "min_reach_m": UR_MIN_REACH_M,
+            "reach_m": GOFA_REACH_M,
+            "min_reach_m": GOFA_MIN_REACH_M,
             "spacing_mm": spacing_mm,
             "join_mm": join_mm,
         },
         path_serial=path_serial,
+        length_mm=length_mm,
+        max_length_mm=max_length_mm,
     )
     # Mapping owner depends on the run: a loaded mesh uses surface.py, Test Mode
     # falls back to workspace.py — show whichever actually ran.
@@ -682,6 +721,36 @@ async def on_retake(ws) -> None:
     if not camera_thread.running:
         camera_thread.start()
     module_trace.log("capture", "Retake — back to live preview")
+
+
+def _length_check(strokes, blend_mm: float, params: dict) -> tuple[bool, str]:
+    """
+    Enforce the Max Total Length box. Returns ``(ok, message)``.
+
+    The limit is read from the request when it carries one and from shared state
+    otherwise, so a Developer window's box and Participant Mode's synced copy
+    both land here. The length is recomputed from the strokes about to be used
+    with the blend about to be used — not the value cached at Generate time —
+    because Radius changes the drawn length and never triggers a regenerate.
+    """
+    limit = params.get("max_length_mm")
+    if limit is None:
+        with state_lock:
+            limit = shared_state.get("max_length_mm", MAX_PATH_LENGTH_MM)
+    try:
+        limit = min(max(float(limit), MAX_PATH_LENGTH_MIN_MM), MAX_PATH_LENGTH_MAX_MM)
+    except (TypeError, ValueError):
+        limit = MAX_PATH_LENGTH_MM
+
+    over, actual = exceeds_limit(strokes, blend_mm, limit)
+    with state_lock:
+        shared_state["path_length_mm"] = actual
+        shared_state["max_length_mm"] = limit
+    if not over:
+        return True, ""
+    return False, (f"Path too long: {actual:.0f} mm of drawing exceeds the "
+                   f"{limit:.0f} mm Max Total Length. Rake a smaller drawing, "
+                   f"or raise the limit.")
 
 
 async def on_run(ws, params: dict | None = None) -> None:
@@ -714,8 +783,14 @@ async def on_run(ws, params: dict | None = None) -> None:
     speed_pct = _num("speed_pct", (DRAW_SPEED / MAX_TCP_SPEED) * 100.0, 1.0, 100.0)
     offset_mm = _num("offset_mm", 0.0, -20.0, 200.0)
     safety_mm = _num("safety_mm", TRAVEL_Z * 1000.0, 5.0, 300.0)
-    blend_mm  = _num("blend_mm", MOVEP_BLEND_M * 1000.0, 0.0, 5.0)
+    blend_mm  = _num("blend_mm", BLEND_ZONE_M * 1000.0, 0.0, 5.0)
     draw_speed = (speed_pct / 100.0) * MAX_TCP_SPEED
+
+    ok, why = _length_check(strokes, blend_mm, params)
+    if not ok:
+        await server.send_capture_result(ws, False, error=why)
+        module_trace.log("run", f"[executor] refused — {why}")
+        return
 
     with state_lock:
         shared_state["participant_exec_params"] = {
@@ -777,7 +852,7 @@ async def on_preview_image(params: dict) -> None:
 
 
 async def on_save_path(ws, params: dict) -> None:
-    """Save the toolpath as URScript + JSON + preview/mask/skeleton images."""
+    """Save the toolpath as JSON + preview/mask/skeleton images."""
     from datetime import datetime
 
     with state_lock:
@@ -804,10 +879,17 @@ async def on_save_path(ws, params: dict) -> None:
     speed_pct = _num("speed_pct", (DRAW_SPEED / MAX_TCP_SPEED) * 100.0, 1.0, 100.0)
     offset_mm = _num("offset_mm", 0.0, -20.0, 200.0)
     safety_mm = _num("safety_mm", TRAVEL_Z * 1000.0, 5.0, 300.0)
-    blend_mm  = _num("blend_mm", MOVEP_BLEND_M * 1000.0, 0.0, 5.0)
+    blend_mm  = _num("blend_mm", BLEND_ZONE_M * 1000.0, 0.0, 5.0)
     speed = (speed_pct / 100.0) * MAX_TCP_SPEED
 
+    ok, why = _length_check(strokes, blend_mm, params)
+    if not ok:
+        await server.send_save_result(ws, False, error=why)
+        module_trace.log("save", f"[save] refused — {why}")
+        return
+
     with state_lock:
+        length_mm = shared_state.get("path_length_mm", 0.0)
         shared_state["participant_exec_params"] = {
             "speed_pct": speed_pct, "offset_mm": offset_mm,
             "safety_mm": safety_mm, "blend_mm": blend_mm}
@@ -823,6 +905,9 @@ async def on_save_path(ws, params: dict) -> None:
         "offset_mm": round(offset_mm, 2),
         "safety_mm": round(safety_mm, 1),
         "blend_mm": round(blend_mm, 2),
+        # Drawn length of what was saved — the number the Max Total Length box
+        # judges, recorded so a bundle says how much it lays down.
+        "path_length_mm": round(length_mm, 1),
         "stroke_count": len(strokes),
         "point_count": sum(len(s) for s in strokes),
     }
@@ -920,17 +1005,29 @@ async def on_set_exec_params(params: dict) -> None:
     speed_pct = _num("speed_pct", (DRAW_SPEED / MAX_TCP_SPEED) * 100.0, 1.0, 100.0)
     offset_mm = _num("offset_mm", 0.0, -20.0, 200.0)
     safety_mm = _num("safety_mm", TRAVEL_Z * 1000.0, 5.0, 300.0)
-    blend_mm  = _num("blend_mm", MOVEP_BLEND_M * 1000.0, 0.0, 5.0)
+    blend_mm  = _num("blend_mm", BLEND_ZONE_M * 1000.0, 0.0, 5.0)
     spacing_mm = _num("spacing_mm", RESAMPLE_SPACING_MM,
                       RESAMPLE_SPACING_MIN_MM, RESAMPLE_SPACING_MAX_MM)
     join_mm    = _num("join_mm", JOIN_DISTANCE_MM,
                       JOIN_DISTANCE_MIN_MM, JOIN_DISTANCE_MAX_MM)
+    max_length_mm = _num("max_length_mm", MAX_PATH_LENGTH_MM,
+                         MAX_PATH_LENGTH_MIN_MM, MAX_PATH_LENGTH_MAX_MM)
     with state_lock:
         shared_state["participant_exec_params"] = {
             "speed_pct": speed_pct, "offset_mm": offset_mm,
             "safety_mm": safety_mm, "blend_mm": blend_mm}
         shared_state["participant_gen_params"]["spacing_mm"] = spacing_mm
         shared_state["participant_gen_params"]["join_mm"]    = join_mm
+        shared_state["max_length_mm"] = max_length_mm
+        strokes = shared_state.get("strokes", [])
+
+    # Radius changes the drawn length but never regenerates the path, so the
+    # readout would go stale on a slider drag. Recompute here — this is already
+    # debounced by the browser, and it keeps ONE implementation of the maths.
+    if strokes:
+        length_mm = total_length_mm(strokes, blend_mm)
+        with state_lock:
+            shared_state["path_length_mm"] = length_mm
 
 
 async def on_set_trigger(params: dict) -> None:
@@ -950,6 +1047,35 @@ async def on_set_trigger(params: dict) -> None:
     _update_trigger_hint()
     _sync_participant_state()
     module_trace.log("participant", f"[participant] trigger {'set to %.0f mm' % mm if mm is not None else 'off'}", extra=("camera_thread",))
+
+
+async def on_set_max_draw_time(params: dict) -> None:
+    """
+    Set (or clear with null/empty) the Participant-Mode Max Drawing Time, in
+    MINUTES — how long one participant may keep the sand occupied, measured
+    from the trigger tripping to the frame going clear. Running out is judged
+    by the state machine itself (an Invalid verdict), not by the pipeline: the
+    point is to stop a drawing that never ends, so it cannot wait for one.
+    """
+    raw = (params or {}).get("minutes")
+    minutes = None
+    try:
+        if raw is not None and str(raw).strip() != "":
+            value = float(raw)
+            if value > 0:
+                minutes = min(max(value, PARTICIPANT_MAX_DRAW_MIN_MIN),
+                              PARTICIPANT_MAX_DRAW_MAX_MIN)
+    except (TypeError, ValueError):
+        minutes = None
+    automation.set_max_draw_s(None if minutes is None else minutes * 60.0)
+    with state_lock:
+        shared_state["max_draw_min"] = minutes
+        shared_state["participant_remaining_s"] = automation.remaining_s()
+    module_trace.log(
+        "participant",
+        "[participant] max drawing time "
+        + (f"set to {minutes:g} min" if minutes is not None else "off"),
+        extra=("automation",))
 
 
 async def _participant_pipeline() -> None:
@@ -987,8 +1113,29 @@ async def _participant_pipeline() -> None:
             strokes = shared_state.get("strokes", [])
             connected = shared_state.get("robot_connected", False)
             mask = shared_state.get("last_mask")
+            exec_blend_mm = (shared_state.get("participant_exec_params") or {}).get(
+                "blend_mm", BLEND_ZONE_M * 1000.0)
+            max_length_mm = shared_state.get("max_length_mm", MAX_PATH_LENGTH_MM)
         if not strokes:
             automation.finish("No grooves detected — nothing to draw.")
+            return
+
+        # ── Max Total Length: too much drawing to lay down. Refused like a
+        # profanity hit — Invalid, nothing saved, nothing run — because both
+        # are "this drawing is not acceptable", not "something went wrong".
+        over, actual_mm = exceeds_limit(strokes, exec_blend_mm, max_length_mm)
+        with state_lock:
+            shared_state["path_length_mm"] = actual_mm
+        if over:
+            automation.reject(
+                f"Drawing too long ({actual_mm / 1000.0:.2f} m of "
+                f"{max_length_mm / 1000.0:.2f} m allowed) — please rake it over "
+                "and draw something smaller.")
+            module_trace.log(
+                "run",
+                f"[participant] REJECTED: path {actual_mm:.0f} mm exceeds the "
+                f"{max_length_mm:.0f} mm Max Total Length",
+                extra=("automation",))
             return
 
         # ── Profanity guard: OCR the mask and stop here if it reads as
@@ -1044,6 +1191,10 @@ async def _participant_loop() -> None:
         with state_lock:
             below = shared_state.get("trigger_below")
             executing = shared_state.get("executing", False)
+            # The countdown the popup shows is the state machine's own clock,
+            # republished each tick — one implementation, so what the
+            # participant reads is exactly what judges the drawing.
+            shared_state["participant_remaining_s"] = automation.remaining_s()
         # A manually-started run owns the robot — don't trigger on top of it.
         if executing and not automation.busy:
             continue
@@ -1081,6 +1232,7 @@ server = Server(
     on_register_freedrive=on_register_freedrive,
     on_register_corner=on_register_corner,
     on_set_trigger=on_set_trigger,
+    on_set_max_draw_time=on_set_max_draw_time,
     on_set_automation=on_set_automation,
     on_set_exec_params=on_set_exec_params,
     on_preview_image=on_preview_image,
@@ -1092,7 +1244,7 @@ camera_thread.start()
 
 # ── Live TCP poller ───────────────────────────────────────────────────────────
 # Nothing else writes shared_state["ee"], so without this the preview's TCP dot
-# would sit at the origin forever. Poll the RTDE receive buffer at 10 Hz while
+# would sit at the origin forever. Poll the robot's TCP frame at 10 Hz while
 # connected; the broadcast loop relays it to the browser.
 def _ee_poller() -> None:
     import time

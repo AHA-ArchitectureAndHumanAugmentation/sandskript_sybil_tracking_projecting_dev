@@ -9,7 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from replay_robot import URReplayBackend, make_backend
+from replay_robot import ABBGofaBackend, ReplayBackend, make_backend
 
 _PI = math.pi
 
@@ -26,7 +26,7 @@ def _backend():
     robot = Mock()
     robot.connected = True
     robot.get_ee_position.return_value = [0.0] * 6
-    return URReplayBackend(state, threading.Lock(), robot=robot), robot, state
+    return ABBGofaBackend(state, threading.Lock(), robot=robot), robot, state
 
 
 def _wait_done(backend, timeout=3.0):
@@ -36,7 +36,7 @@ def _wait_done(backend, timeout=3.0):
     assert not backend.running, "replay run did not finish in time"
 
 
-class TestURReplayBackend:
+class TestABBGofaBackend:
 
     def test_run_executes_saved_waypoints_literally(self):
         backend, robot, state = _backend()
@@ -68,13 +68,20 @@ class TestURReplayBackend:
 
 class TestMakeBackend:
 
-    def test_ur(self):
-        be = make_backend("ur", {}, threading.Lock())
-        assert isinstance(be, URReplayBackend)
+    def test_abb_gofa(self):
+        be = make_backend("abb_gofa", {}, threading.Lock())
+        assert isinstance(be, ABBGofaBackend)
 
-    def test_abb_gofa_documented_stub(self):
-        with pytest.raises(NotImplementedError, match="ReplayBackend"):
-            make_backend("abb_gofa", {}, threading.Lock())
+    def test_config_default_resolves(self):
+        # config.REPLAY_BACKEND is what replay_main actually passes; a typo
+        # there would only show up when someone tried to connect.
+        from config import REPLAY_BACKEND
+        assert isinstance(make_backend(REPLAY_BACKEND, {}, threading.Lock()),
+                          ReplayBackend)
+
+    def test_the_retired_ur_key_is_gone(self):
+        with pytest.raises(ValueError, match="REPLAY_BACKEND"):
+            make_backend("ur", {}, threading.Lock())
 
     def test_unknown_raises(self):
         with pytest.raises(ValueError, match="REPLAY_BACKEND"):

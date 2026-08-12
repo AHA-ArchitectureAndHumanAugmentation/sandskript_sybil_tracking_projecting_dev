@@ -12,7 +12,7 @@ the virtualenv and per-rig files don't survive the copy. Get it running again:
    Use `<env python> -m pip`, never bare pip.exe.
 
 2. Verify every runtime dep imports in the new env:
-     pyrealsense2, skimage, cv2, aiohttp, numpy, rtde_control
+     pyrealsense2, skimage, cv2, aiohttp, numpy, compas_rrc
    Report any that fail.
 
 3. Delete stale generated files: __pycache__, tests/__pycache__, .pytest_cache, *.log.

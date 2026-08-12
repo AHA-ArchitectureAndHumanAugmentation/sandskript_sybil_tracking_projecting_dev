@@ -3,7 +3,7 @@ Entry point for the saved-toolpath replay tool.
 
 Run with run_replay.bat (or the sandskript conda env's python replay_main.py) →
 http://localhost:5007. CONTAINED from the main app: do not run both while
-connected to the robot — one RTDE controller per robot. No camera involved.
+connected to the robot — one RRC client per controller task. No camera involved.
 
 The robot brand comes from config.REPLAY_BACKEND via replay_robot.make_backend
 (currently "ur"); the rest of this tool is brand-neutral.

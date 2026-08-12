@@ -20,7 +20,7 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 
 from config import (
-    DRAW_SPEED, HTTP_HOST, MAX_TCP_SPEED, MOVEP_BLEND_M, PATHS_DIR,
+    DRAW_SPEED, HTTP_HOST, MAX_TCP_SPEED, BLEND_ZONE_M, PATHS_DIR,
     REPLAY_HTTP_PORT, TRAVEL_Z,
 )
 from replay_robot import ReplayBackend
@@ -157,7 +157,9 @@ class ReplayServer:
         if folder is None:
             await self._result(ws, "toolpath", False, f"Unknown toolpath {name!r}.")
             return
-        prefer = source if source in ("json", "script") else None
+        # path.json is the only format left; anything else falls back to it
+        # rather than erroring, so an old bookmark still loads.
+        prefer = "json" if source == "json" else None
         try:
             self._selected = load_toolpath(folder, prefer=prefer)
         except ValueError as exc:
@@ -191,7 +193,7 @@ class ReplayServer:
         safety_mm = _clamp(params, "safety_mm",
                            meta.get("safety_mm", TRAVEL_Z * 1000.0), 5.0, 300.0)
         blend_mm = _clamp(params, "blend_mm",
-                          meta.get("blend_mm", MOVEP_BLEND_M * 1000.0), 0.0, 5.0)
+                          meta.get("blend_mm", BLEND_ZONE_M * 1000.0), 0.0, 5.0)
         self._backend.run(self._selected.strokes,
                           speed_mps=speed_pct / 100.0 * MAX_TCP_SPEED,
                           safety_m=safety_mm / 1000.0,

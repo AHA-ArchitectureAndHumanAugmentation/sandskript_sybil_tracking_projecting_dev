@@ -7,7 +7,7 @@ from scheduler import (
 )
 
 
-def _bundle(base, name, files=("path.script",), meta=None):
+def _bundle(base, name, files=("path.json",), meta=None):
     """A folder that list_toolpaths will accept as a bundle."""
     folder = base / name
     folder.mkdir(parents=True, exist_ok=True)
@@ -53,9 +53,9 @@ class TestReadSchedule:
 
     def test_lists_the_files_the_bundle_holds(self, tmp_path):
         _bundle(tmp_path, "2026-08-10_14-42-31",
-                files=("path.script", "path.json", "mask.png", "skeleton.png"))
+                files=("path.json", "mask.png", "skeleton.png"))
         (row,) = read_schedule(tmp_path)
-        assert row.files == ["mask.png", "path.json", "path.script", "skeleton.png"]
+        assert row.files == ["mask.png", "path.json", "skeleton.png"]
 
     def test_folder_name_wins_over_path_json(self, tmp_path):
         # A bundle copied under a new name must report the name, not the meta.
@@ -73,7 +73,7 @@ class TestReadSchedule:
         assert row.when == "2026-08-10 14:42:31"
 
     def test_falls_back_to_the_file_date(self, tmp_path):
-        _bundle(tmp_path, "renamed-by-hand", files=("path.script",))
+        _bundle(tmp_path, "renamed-by-hand", files=("path.json",))
         (row,) = read_schedule(tmp_path)
         assert row.time_source == FILE_DATE
         assert row.when                     # something, from the filesystem
@@ -87,7 +87,7 @@ class TestReadSchedule:
 
     def test_ignores_folders_that_are_not_bundles(self, tmp_path):
         _bundle(tmp_path, "2026-08-10_14-42-31")
-        (tmp_path / "notes").mkdir()                     # no path.json/.script
+        (tmp_path / "notes").mkdir()                     # no path.json
         (tmp_path / "2026-08-10_15-00-00").mkdir()       # empty
         (tmp_path / "stray.txt").write_text("x", encoding="utf-8")
         rows = read_schedule(tmp_path)
@@ -118,7 +118,7 @@ class TestReadSchedule:
 class TestMaskColumn:
     def test_a_bundle_with_a_mask_reports_one(self, tmp_path):
         _bundle(tmp_path, "2026-08-10_14-42-31",
-                files=("path.script", "mask.png"))
+                files=("path.json", "mask.png"))
         (row,) = read_schedule(tmp_path)
         assert row.has_mask is True
         assert row.mask_path == str(tmp_path / "2026-08-10_14-42-31" / "mask.png")
@@ -127,7 +127,7 @@ class TestMaskColumn:
     def test_an_older_bundle_has_no_mask(self, tmp_path):
         # Everything saved before mask.png existed: a blank cell, not an error.
         _bundle(tmp_path, "2026-07-13_16-56-25",
-                files=("path.script", "path.json", "preview.png"))
+                files=("path.json", "preview.png"))
         (row,) = read_schedule(tmp_path)
         assert row.has_mask is False
         assert row.mask_path == ""
@@ -135,7 +135,7 @@ class TestMaskColumn:
 
     def test_skeleton_alone_is_not_a_mask(self, tmp_path):
         _bundle(tmp_path, "2026-08-10_14-42-31",
-                files=("path.script", "skeleton.png"))
+                files=("path.json", "skeleton.png"))
         (row,) = read_schedule(tmp_path)
         assert row.has_mask is False
 
@@ -149,7 +149,7 @@ class TestMaskRoute:
         return SchedulerServer(base_dir=base)
 
     def test_finds_a_real_bundle(self, tmp_path):
-        _bundle(tmp_path, "2026-08-10_14-42-31", files=("path.script", "mask.png"))
+        _bundle(tmp_path, "2026-08-10_14-42-31", files=("path.json", "mask.png"))
         folder = self._server(tmp_path)._safe_folder("2026-08-10_14-42-31")
         assert folder is not None and (folder / "mask.png").is_file()
 
@@ -166,7 +166,7 @@ class TestMaskRoute:
 class TestCsv:
     def test_header_and_rows(self, tmp_path):
         _bundle(tmp_path, "2026-08-09_18-30-00")
-        _bundle(tmp_path, "2026-08-10_14-42-31", files=("path.script", "mask.png"))
+        _bundle(tmp_path, "2026-08-10_14-42-31", files=("path.json", "mask.png"))
         lines = to_csv(read_schedule(tmp_path)).strip().split("\n")
         assert lines[0] == "#,Path executed,Date and time,Mask"
         assert lines[1] == "1,2026-08-09_18-30-00,2026-08-09 18:30:00,"
@@ -195,7 +195,7 @@ class TestContainment:
         code = (
             "import sys, scheduler, scheduler_server;"
             "bad=[m for m in ('main','camera_thread','robot_controller',"
-            "'pyrealsense2','rtde_control') if m in sys.modules];"
+            "'pyrealsense2','compas_rrc') if m in sys.modules];"
             "print(','.join(bad))"
         )
         out = subprocess.run([sys.executable, "-c", code],

@@ -128,6 +128,13 @@ async def generate_path(adjustments: dict | None = None,
         "point_count": d.get("point_count", 0),
         "reach_out": d.get("reach_out", 0),
         "unreachable_strokes": bad_strokes[:20],
+        # How far the tool will travel while drawing, and the Max Total Length
+        # ceiling it is judged against (0 = off). Reported here so a caller can
+        # see a refusal coming instead of being surprised by save_toolpath.
+        "length_mm": d.get("length_mm", 0.0),
+        "max_length_mm": d.get("max_length_mm", 0.0),
+        "over_length": bool(d.get("max_length_mm", 0.0) > 0
+                            and d.get("length_mm", 0.0) > d.get("max_length_mm", 0.0)),
         "note": "reach check is envelope-only (no IK/collision model)",
     }
 
@@ -166,11 +173,14 @@ async def set_surface_pose(tx: float = 0.4, ty: float = 0.0, tz: float = 0.0,
 
 @mcp.tool()
 async def save_toolpath(speed_pct: float = 5.0, offset_mm: float = 0.0,
-                        safety_mm: float = 50.0, blend_mm: float = 0.5) -> dict:
-    """Save the generated toolpath (URScript + JSON with per-waypoint frames, plus mask.png/skeleton.png of the detection it came from) to a timestamped folder under paths/; returns the folder path. blend_mm = movep corner blend radius (0-5 mm, clamped per stroke)."""
-    d = await _ws_call({"type": "save_path",
-                        "params": {"speed_pct": speed_pct, "offset_mm": offset_mm,
-                                   "safety_mm": safety_mm, "blend_mm": blend_mm}},
+                        safety_mm: float = 50.0, blend_mm: float = 0.5,
+                        max_length_mm: float | None = None) -> dict:
+    """Save the generated toolpath (JSON with per-waypoint frames, plus mask.png/skeleton.png of the detection it came from) to a timestamped folder under paths/; returns the folder path. blend_mm = corner zone radius (0-5 mm, clamped per stroke). max_length_mm = Max Total Length ceiling on the DRAWN length (0 = off); omit it to use whatever the app currently has set. Saving is REFUSED when the path is longer — generate_path reports length_mm/over_length, so check there first."""
+    params = {"speed_pct": speed_pct, "offset_mm": offset_mm,
+              "safety_mm": safety_mm, "blend_mm": blend_mm}
+    if max_length_mm is not None:
+        params["max_length_mm"] = max_length_mm
+    d = await _ws_call({"type": "save_path", "params": params},
                        ("save_result",), timeout=30.0)
     if d.get("success"):
         return {"ok": True, "folder": d.get("folder"),

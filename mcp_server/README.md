@@ -13,7 +13,10 @@ part. The loaded surfaces then act as ONE target: the drawing spans them all
 and a single pose moves them together. The reply carries `count` = parts now
 loaded. Removing one part / clearing them all is browser-only),
 set_surface_pose, save_toolpath (speed_pct, offset_mm, safety_mm, blend_mm
-0–5 = movep corner radius; the bundle also gets mask.png + skeleton.png of the
+0–5 = corner zone radius, max_length_mm = Max Total Length ceiling on the DRAWN
+length, 0 = off, omit to use the app's current setting — a longer path is
+REFUSED, and generate_path reports length_mm/max_length_mm/over_length so the
+refusal is visible one step earlier; the bundle also gets mask.png + skeleton.png of the
 detection the path came from. preview.png appears only when an open Developer
 window has pushed a shot of its 3D canvas for this same path — that canvas is
 browser-only, so a save with no browser behind it simply has no preview),
@@ -23,6 +26,8 @@ executing robot motion stays a human action in the browser.
 Note: while the Participant-Mode **Auto toggle is ON** (the ⧉ popup in the
 browser), the app refuses manual `capture_image`/`generate_path` calls — the
 automation owns the pipeline. `app_status` shows `participant_status`, which
-includes **`Invalid`** — the profanity guard rejected that drawing, so it was
-neither saved nor run. The guard is Participant-Mode only and has no MCP tool:
-`generate_path` via MCP is never gated by it.
+includes **`Invalid`** — that drawing was refused (profanity guard, Max Total
+Length, or the Max Drawing Time running out), so it was neither saved nor run.
+`app_status` also reports `trigger_mm` and `max_draw_min` (the Max Drawing Time
+limit in minutes, `null` = off). All three checks are Participant-Mode only and
+have no MCP tool: `generate_path` via MCP is never gated by them.

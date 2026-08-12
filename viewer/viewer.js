@@ -192,9 +192,9 @@ function applySurfacePose(p) {
 /* Two layers:
    - skelGroup: the detected skeleton projected onto the surface — a dense
      WHITE line lying exactly ON the surface (zero offset). Pure geometry.
-   - pathGroup: the actual movep toolpath — waypoints at the chosen Spacing,
+   - pathGroup: the actual toolpath — waypoints at the chosen Spacing,
      lifted by the exec-bar Offset along each waypoint's tool axis, corners
-     rounded by the movep blend radius, with waypoint dots, amber safety
+     rounded by the corner zone radius, with waypoint dots, amber safety
      (retract) points and gray travel/approach moves. Rebuilt client-side
      whenever Offset or Safety change; Spacing re-generates on the server. */
 let pathGroup  = null;
@@ -267,7 +267,7 @@ function buildSkeletonViz() {
 }
 
 /* Corner-blended colored segments for one stroke: interior corners are
-   trimmed by the movep blend radius and rounded with a small quadratic arc —
+   trimmed by the corner zone radius and rounded with a small quadratic arc —
    the shape the controller actually drives. Pushes [a,b] segment pairs. */
 function pushBlendedStroke(pts, flags, blend, okPts, badPts) {
   const n = pts.length;
@@ -539,6 +539,8 @@ function restoreSessionSettings(data) {
     document.getElementById("exec-speed-val").textContent =
       document.getElementById("exec-speed").value + "%";
   }
+  if (Number.isFinite(e.max_length_mm))
+    document.getElementById("exec-max-length").value = e.max_length_mm;
   if (Number.isFinite(e.offset_mm)) document.getElementById("exec-offset").value = e.offset_mm;
   if (Number.isFinite(e.safety_mm)) document.getElementById("exec-safety").value = e.safety_mm;
   if (Number.isFinite(e.blend_mm)) {
@@ -564,6 +566,7 @@ function handleCaptureResult(data) {
   }
 
   document.getElementById("val-strokes").textContent = data.stroke_count;
+  showPathLength(data.length_mm, data.max_length_mm);
 
   if (data.strokes && data.strokes.length > 0) {
     setPathData(data.strokes, data.skeleton, data.exec_viz);
@@ -624,7 +627,7 @@ function updateScene(data) {
   }
 
   // Live TCP marker: bright blue + enlarged while the path is executing, so
-  // the dot visibly travels along the strokes during actuation (RTDE, 20 Hz).
+  // the dot visibly travels along the strokes during actuation (20 Hz poll).
   eeMat.color.setHex(data.executing ? 0x2e9fff : 0x4488ff);
   eeMat.emissive.setHex(data.executing ? 0x1a5acc : 0x223366);
   const s = data.executing ? 1.5 : 1.0;
@@ -639,6 +642,10 @@ function updateFooter(data) {
   if (typeof data.robot_connected === "boolean") robotConnected = data.robot_connected;
   if (typeof data.freedrive === "boolean") updateRegisterFreedrive(data.freedrive);
   if (data.participant) autoLocked = !!data.participant.auto;
+  // The server recomputes this whenever the Radius slider moves, so the
+  // readout follows a drag even though Radius never regenerates the path.
+  if (Number.isFinite(data.path_length_mm))
+    showPathLength(data.path_length_mm, data.max_length_mm);
 
   document.getElementById("val-phase").textContent   = data.phase || "idle";
   document.getElementById("val-strokes").textContent = data.stroke_count ?? 0;
@@ -909,8 +916,34 @@ function readJoinMm() {
   return Number.isFinite(v) ? Math.min(Math.max(v, 0), 200) : 0;
 }
 
+function readMaxLengthMm() {
+  const v = parseFloat(document.getElementById("exec-max-length").value);
+  return Number.isFinite(v) ? Math.min(Math.max(v, 0), 100000) : 0;
+}
+
 function buildGenerateParams() {
   return { ...buildParams(), spacing_mm: readSpacing(), join_mm: readJoinMm() };
+}
+
+/* The drawn length of the current path, next to the Max Total Length box.
+   The number is the SERVER's — computed from the projected strokes with the
+   corner zone applied — so what is shown here is exactly what Run and Save
+   judge, rather than a second implementation that could drift from it. */
+function showPathLength(mm, limitMm) {
+  const el = document.getElementById("exec-length-val");
+  if (!el) return;
+  if (!Number.isFinite(mm) || mm <= 0) {
+    el.textContent = "—";
+    el.classList.remove("over");
+    el.title = "Drawn length of the current path";
+    return;
+  }
+  el.textContent = mm >= 1000 ? (mm / 1000).toFixed(2) + " m" : mm.toFixed(0) + " mm";
+  const over = Number.isFinite(limitMm) && limitMm > 0 && mm > limitMm;
+  el.classList.toggle("over", over);
+  el.title = over
+    ? `Drawn length ${mm.toFixed(0)} mm exceeds the ${limitMm.toFixed(0)} mm limit — Run and Save will refuse this path`
+    : `Drawn length of the current path (${mm.toFixed(0)} mm)`;
 }
 
 /* Spacing lives in the Path Preview bar. Update the label live; re-generate on
@@ -1158,7 +1191,7 @@ function handleReferenceStatus(data) {
 
 /* ── Register Corner → TCP (touch-off surface placement) ──────────────────
    Optional popup: pick a numbered mesh corner (markers appear in the Path
-   Preview), freedrive the tool tip onto the physical corner, confirm — the
+   Preview), hand-guide the tool tip onto the physical corner, confirm — the
    server recomputes the surface pose (1-point: translation only) and the
    sliders/preview update via the normal surface_status broadcast. Closing
    the popup without confirming changes nothing. */
@@ -1187,7 +1220,7 @@ function openRegisterPopup() {
   regOverlay.classList.remove("hidden");
   regStatus(robotConnected
     ? `Pick a corner: click a numbered marker in the Path Preview, or a row below.`
-    : "Robot NOT connected — you can look at the corners, but freedrive/confirm need a connection.");
+    : "Robot NOT connected — you can look at the corners, but touch-off/confirm need a connection.");
 }
 
 function closeRegisterPopup() {
@@ -1204,7 +1237,7 @@ function selectCorner(i) {
   [...regList.children].forEach((el, j) => el.classList.toggle("sel", j === i));
   updateCornerHighlight();
   btnRegConfirm.disabled = !robotConnected;
-  regStatus(`Corner ${i + 1} selected (green in the preview). Freedrive the tool tip onto it, then Confirm.`);
+  regStatus(`Corner ${i + 1} selected (green in the preview). Hand-guide the tool tip onto it, then Confirm.`);
 }
 
 function setHoveredCorner(i) {
@@ -1301,10 +1334,10 @@ function handleRegisterResult(data) {
   }
 }
 
-/* Keep the freedrive toggle button in sync with the robot (state broadcast). */
+/* Keep the touch-off toggle button in sync with the robot (state broadcast). */
 function updateRegisterFreedrive(on) {
   regFreedrive = !!on;
-  btnRegFreedrive.textContent = regFreedrive ? "Freedrive ON — click to stop" : "Start Freedrive";
+  btnRegFreedrive.textContent = regFreedrive ? "Touch-off armed — click to disarm" : "Arm touch-off";
   btnRegFreedrive.classList.toggle("active", regFreedrive);
 }
 
@@ -1611,6 +1644,7 @@ document.getElementById("btn-run").addEventListener("click", () => {
     offset_mm: parseFloat(document.getElementById("exec-offset").value) || 0,
     safety_mm: parseFloat(document.getElementById("exec-safety").value) || 50,
     blend_mm: readBlendMm(),
+    max_length_mm: readMaxLengthMm(),
   }});
   setButtonsForPhase("executing");
   setProgress(0);
@@ -1649,6 +1683,7 @@ function syncExecParams() {
     blend_mm: readBlendMm(),
     spacing_mm: readSpacing(),
     join_mm: readJoinMm(),
+    max_length_mm: readMaxLengthMm(),
   }}), 300);
 }
 ["exec-speed", "exec-offset", "exec-safety", "exec-blend"].forEach((id) =>
@@ -1656,7 +1691,14 @@ function syncExecParams() {
 spacingSlider.addEventListener("change", syncExecParams);
 joinBox.addEventListener("change", syncExecParams);
 
-/* ── Save toolpath (URScript + JSON + preview image) ────────────────────── */
+/* Max Total Length is a LIMIT, not geometry — it changes nothing about the
+   path, so unlike Spacing and Distance Threshold it never regenerates. It only
+   has to reach the server, which re-judges the length on Run/Save. */
+const maxLenBox = document.getElementById("exec-max-length");
+maxLenBox.addEventListener("change", syncExecParams);
+maxLenBox.addEventListener("input", syncExecParams);
+
+/* ── Save toolpath (JSON + preview image) ───────────────────────────── */
 
 /* The 3D preview as a PNG data URL. Renders first: the drawing buffer is not
    preserved between frames, so reading it without a fresh render can come back
@@ -1677,6 +1719,7 @@ document.getElementById("btn-save-path").addEventListener("click", () => {
     offset_mm: parseFloat(document.getElementById("exec-offset").value) || 0,
     safety_mm: parseFloat(document.getElementById("exec-safety").value) || 50,
     blend_mm: readBlendMm(),
+    max_length_mm: readMaxLengthMm(),
     image,
   }});
   setHeaderStatus("robot", true, "Saving toolpath…");

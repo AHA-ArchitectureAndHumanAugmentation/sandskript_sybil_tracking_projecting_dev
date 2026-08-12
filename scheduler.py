@@ -18,7 +18,7 @@ then the folder's own modification date — and every row reports which one it
 used, so a reader is never left guessing how solid the time is.
 
 What counts as a bundle is NOT decided here: `toolpath_loader.list_toolpaths`
-already owns that rule (a folder holding path.json and/or path.script), and the
+already owns that rule (a folder holding path.json), and the
 Scheduler defers to it so the two tools can never disagree about what is on
 disk.
 """

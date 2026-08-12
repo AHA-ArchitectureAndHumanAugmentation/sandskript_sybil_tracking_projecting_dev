@@ -222,7 +222,7 @@
         <button id="btn-register" class="adj-btn" title="Touch one corner of the physical surface with the tool tip to place the mesh exactly (optional)">Register Corner → TCP…</button>
       </div>
       <p class="adj-note">Optional touch-off: instead of guessing X/Y/Z with the sliders,
-        pick a corner of the mesh, freedrive the tool tip onto that physical corner and
+        pick a corner of the mesh, hand-guide the tool tip onto that physical corner and
         confirm — the surface snaps there. Rotation keeps the slider values.
         Needs the robot connected; cancel keeps the current placement.</p>
 
@@ -253,7 +253,7 @@
         <input type="range" id="exec-spacing" min="10" max="100" step="1" value="10" />
         <span id="exec-spacing-val">10 mm</span>
 
-        <label for="exec-blend" title="movep corner blend radius — how far before each waypoint the robot starts curving into the next segment. Rounded corners show live in the Path Preview; clamped per stroke so the controller never rejects the path">Radius</label>
+        <label for="exec-blend" title="corner zone radius — how far before each waypoint the robot starts curving into the next segment. Rounded corners show live in the Path Preview; clamped per stroke so the controller never rejects the path">Radius</label>
         <input type="range" id="exec-blend" min="0" max="5" step="0.1" value="0.5" />
         <span id="exec-blend-val">0.5 mm</span>
         <span class="legend-sep"></span>
@@ -271,7 +271,12 @@
         <label for="exec-join" title="Distance Threshold — when the endpoints of two different strokes are closer than this, they are connected and the strokes merge into one continuous toolpath. If another stroke crosses the line that would close the gap, the threshold doubles for that pair. Each endpoint joins only its nearest eligible neighbour. 0 = off; re-generates the path">Distance Threshold</label>
         <input type="number" id="exec-join" value="0" step="1" min="0" max="200" /> mm
         <span class="legend-sep"></span>
-        <button id="btn-save-path" title="Save this toolpath (URScript + JSON + preview image) to a dated folder under paths/">💾 Save Path</button>
+
+        <label for="exec-max-length" title="Max Total Length — a ceiling on how far the tool travels WHILE DRAWING (the green line, measured on the projected surface at real scale, with Spacing, Radius and Distance Threshold all applied). Pen-up travels and retracts do not count. Over the limit the path is refused: Run and Save Path both decline, and in Participant Mode the drawing is marked Invalid. 0 = off">Max Total Length</label>
+        <input type="number" id="exec-max-length" value="0" step="50" min="0" max="100000" /> mm
+        <span id="exec-length-val" title="Drawn length of the current path">—</span>
+        <span class="legend-sep"></span>
+        <button id="btn-save-path" title="Save this toolpath (JSON + preview image) to a dated folder under paths/">💾 Save Path</button>
       </div>
       <canvas id="threejs-canvas"></canvas>
     </div>
@@ -320,14 +325,14 @@
           below — hovering either highlights the marker <b style="color:#66d9ff">cyan</b>;
           the selected one turns <b style="color:#00e5a0">green</b>. The preview stays
           visible and orbitable while this dialog is open.
-          <b>2.</b> <b>Start Freedrive</b> and move the robot by hand until
+          <b>2.</b> <b>Arm touch-off</b>, then hold the lead-through button on the arm and move it by hand until
           the <b>tool tip touches that physical corner</b>. <b>3.</b> <b>Confirm</b> — the
           surface moves so the selected corner sits exactly at the TCP. Rotation keeps the
           slider values (set those first). Closing without confirming keeps the current
           placement.</p>
         <ul id="register-list"></ul>
         <div id="register-actions">
-          <button id="btn-register-freedrive" class="adj-btn">Start Freedrive</button>
+          <button id="btn-register-freedrive" class="adj-btn">Arm touch-off</button>
           <button id="btn-register-confirm" class="adj-btn" disabled>Confirm: corner = TCP</button>
         </div>
         <p class="adj-note" id="register-status">No corner selected.</p>

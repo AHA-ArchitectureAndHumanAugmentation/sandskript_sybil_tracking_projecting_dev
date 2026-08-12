@@ -11,11 +11,11 @@ to match; (3) update README.md user docs. Do this in the same commit as the chan
 depth-cam-to-robot: a browser-controlled pipeline that watches a sandbox with an
 Intel RealSense **D435i** depth camera, detects hand-raked grooves (mm-deep — raw
 metric depth, no RGB vision), converts them to strokes, projects them onto a
-Rhino-authored 3D target surface, and has a **UR10e** (ur-rtde) retrace them with
+Rhino-authored 3D target surface, and has an **ABB GoFa 10** (compas_rrc) retrace them with
 the TCP perpendicular to the surface. Artistic context: gestures in sand guide a
 robot depositing a living seeded substrate — the code's job ends at toolpath
 execution/export. Includes a projector subsystem that shines the detected mask
-back onto the sand, and a Save feature exporting URScript + JSON toolpaths.
+back onto the sand, and a Save feature exporting JSON toolpaths.
 Two modes: **Developer Mode** (`/`, all manual controls) and **Participant
 Mode** (the ⧉ popup on the Depth viewport, `/depths`): an Auto toggle + depth
 trigger run the whole pipeline automatically and lock the manual buttons —
@@ -37,13 +37,19 @@ robot moves.
   Never bare `pip` (broken launcher risk — use `<ENVPY> -m pip`). The Intel
   RealSense USB driver is an OS-level install, outside the env. The old
   `.venv` is retired.
-- Unit tests: `<ENVPY> -m pytest -q -m "not integration"` (399, no
+- Unit tests: `<ENVPY> -m pytest -q -m "not integration"` (444, no
   hardware). Integration: `-m integration`, needs RealSense/robot + TEST_ROBOT_IP.
 - No CLI modes. Hardware vs no-robot is in the UI: "Test Mode (no robot)" button
   unlocks capture with a synthetic workspace; Run stays gated on a robot connection.
-- Robot bring-up: UR10e in **Remote Control** mode, pendant speed slider 100%
-  (or programmed speeds scale down), static link-local IP (e.g. 169.254.10.10),
-  TCP+payload set on pendant. PC on same subnet.
+- Robot bring-up: the GoFa link is NOT a direct socket. compas_rrc talks to a
+  **ROS bridge** which talks to the **RRC RAPID task** on the controller, so
+  three things must be up: (1) the RRC task loaded and running on the pendant,
+  controller in Auto; (2) the bridge — `docker compose up`, see README; (3) the
+  app, where the "IP" you enter is the machine running the BRIDGE (normally
+  127.0.0.1), not the robot. Set TCP + payload on the pendant first.
+  `RobotController.connect` sends a `Noop` as part of connecting: a live
+  websocket does not prove the RAPID task is running, and finding that out
+  mid-stroke is worse.
 
 ## Pipeline (stage → owner → I/O)
 1. **Capture** `camera_thread.DepthCameraThread` — RealSense depth+RGB 640×480@30,
@@ -98,7 +104,8 @@ robot moves.
    set by UI sliders OR by corner→TCP touch-off (`registration.py`: pick a mesh
    corner — click its marker in the 3D preview or the dialog list, hover
    highlights it cyan (dialog is non-modal, preview stays visible) — then
-   freedrive the tool tip onto it, confirm —
+   hand-guide the tool tip onto it (lead-through button ON THE ARM — RRC has
+   no freedrive instruction, so the UI toggle only arms the touch-off), confirm —
    1-point = translation only, keeps slider rotation; Kabsch ≥3-point solver
    already implemented for a future multi-point UI; corners = mesh vertices
    nearest the bbox corners, shipped in `mesh_payload()["corners"]`, same
@@ -107,18 +114,43 @@ robot moves.
    The mm→px scale for all mm-based filters/spacings = `workspace.scene_mm_per_px`:
    surface first, workspace fallback — SAME precedence as stroke mapping, so a mm
    in the UI is a mm on whatever the strokes land on (Test Mode + surface included).
-5. **Reach check** `reach.reach_flags` — envelope only (1.30 m sphere − 0.18 m axis
+5. **Reach check** `reach.reach_flags` — envelope only (1.62 m sphere − 0.18 m axis
    cylinder). No IK/joint-limit/collision model. Red segments in preview.
+5b. **Length limit** `path_length.blended_length` — how far the tool travels
+   WHILE DRAWING (the green/red line; travels and retracts excluded, since the
+   limit bounds material laid down, not motion). Measured on the PROJECTED
+   robot-space strokes, so surface shape, real scale, Spacing and the join
+   Distance Threshold are already in the number — a join's closed gap is a real
+   segment because `join_strokes` concatenates point lists. The corner zone is
+   then subtracted per interior vertex: the controller replaces 2r of straight
+   line with an arc, so `saving = 2r − r·tan(θ/2)·(π−θ)` (θ = interior angle),
+   which correctly gives 0 for a straight-through waypoint and the whole 2r for
+   a doubling-back. Radius is clamped by the SAME `path_export.stroke_blend` the
+   executor uses, so the number describes the robot and not an ideal path.
+   Ceiling = the exec-bar **Max Total Length** box (mm, 0 = off,
+   MAX_PATH_LENGTH_MM). Over it: `on_run` and `on_save_path` both refuse
+   (`main._length_check`), and Participant Mode calls the drawing **Invalid**
+   via `automation.reject` — the same treatment as a profanity hit, because
+   both mean "this drawing is not acceptable", not "something broke".
 6. **Execution** `path_executor.PathExecutor` — per stroke: retract along tool axis
-   (Safety mm) → movel travel → movel onto the first waypoint → **movep** blended
-   process path through the rest (blend = exec-bar Radius slider 0–5 mm, default
-   MOVEP_BLEND_M=0.5 mm, clamped per stroke by `path_export.stroke_blend` to
-   45% of the shortest segment; async movePath, polled so cancel stays
-   responsive) — same actuation as the saved path.script; uniform
-   speed = UI % of MAX_TCP_SPEED (1.0 m/s); run-time normal offset baked into
-   waypoints. `robot_controller` = thread-safe ur-rtde wrapper.
+   (Safety mm) → linear travel → land exactly on the first waypoint → one
+   **zone-blended run** of linear moves through the rest (zone = exec-bar Radius
+   slider 0–5 mm, default BLEND_ZONE_M=0.5 mm, clamped per stroke by
+   `path_export.stroke_blend` to 45% of the shortest segment). The whole stroke
+   is queued at once and ONLY the last move asks for feedback — waiting per
+   waypoint would stop the arm on each point and defeat the blending the zone
+   data exists to produce; the wait happens outside the lock so cancel stays
+   responsive. Uniform speed = UI % of MAX_TCP_SPEED (1.0 m/s; the GoFa 10 is
+   the GoFa 10's rated tool speed — note every Speed percentage is relative
+   to it, so a pre-port bundle saved at "50%" now replays twice as fast);
+   run-time normal offset baked into waypoints.
+   `robot_controller` = thread-safe compas_rrc wrapper, and the ONE place the
+   unit seam lives: everything above it is metres + axis-angle rotation vector,
+   RAPID wants mm + a frame (`pose_to_frame`/`frame_to_pose`).
 7. **Export** `path_export.save_bundle` → `paths/<YYYY-MM-DD_HH-MM-SS>/` with
-   `path.script` (URScript movel/movep), `path.json` (poses + per-waypoint plane:
+   `path.script` (URScript movel/movep — a readable RECORD of the same
+   poses, NOT what the GoFa runs and never parsed back), `path.json` (poses
+   + per-waypoint plane:
    origin + orthonormal x/y/z axes, z = approach), `preview.png`, plus the
    detection stage that produced the path: `mask.png` (thick region) and
    `skeleton.png` (1-px centrelines), both the CROPPED uint8 arrays stashed by
@@ -153,8 +185,8 @@ robot moves.
    exposed to MCP tools); /projection (+?cal);
    /depths (the Participant Mode popup: the CROPPED live depth view — the
    /depth/cropped stream, same region as the skeleton/mask views — with
-   absolute mm-from-camera labels + Auto toggle + trigger box + big status
-   chip; labels computed on the crop in camera_thread ONLY while a popup is
+   absolute mm-from-camera labels + Auto toggle + trigger box + Max Drawing
+   Time box + big status chip (top-right) + drawing-time countdown (top-left); labels computed on the crop in camera_thread ONLY while a popup is
    connected, gated by `depth_overlay_clients`, throttled DEPTH_LABELS_EVERY;
    the popup never changes the crop — only users adjust it in Developer Mode). viewer.js =
    Developer-Mode single-page app w/ three.js preview; projection.html =
@@ -181,6 +213,23 @@ robot moves.
     itself calls the SAME handlers via `server.broadcast_ws()` (a ws shim
     fanning out to all browser clients), so Developer windows watch it live.
     Statuses shown big top-right in the popup via `state.participant`.
+10b. **Max Drawing Time** — the popup's second threshold, beside the trigger:
+    minutes (`set_max_draw_time{minutes|null}`, empty = off, clamped
+    PARTICIPANT_MAX_DRAW_MIN_MIN…MAX_MIN). Measured **Alerted → frame clear**
+    (hand in → hand out), NOT including the pipeline, and the clock FREEZES at
+    the first clear frame, so a drawing finished just in time is not failed by
+    the PARTICIPANT_CLEAR_S debounce. Running out is judged inside
+    `ParticipantAutomation.tick` (it must stop a drawing that never ends, so it
+    cannot wait for the pipeline) → `reject()` → **Invalid**, nothing saved,
+    nothing run, plus an internal `_await_clear` latch: the still-present hand
+    must NOT re-Alert the machine or the verdict would vanish before it is read.
+    Countdown = the SERVER's clock (`automation.remaining_s()`, republished by
+    `_participant_loop` into `shared_state["participant_remaining_s"]`, shipped
+    in `state.participant`), drawn top-LEFT in the popup — dim when idle
+    (showing the full allowance), blue while counting, red+blinking for the last
+    PARTICIPANT_WARN_S seconds (`warn_s` travels with the state, so the CSS and
+    the config can't drift apart). The browser never runs its own timer: one
+    clock shows and judges.
 11. **Profanity guard** `text_guard` — Participant Mode ONLY. Between Generating
     Paths and Actuating, OCRs the groove MASK (`shared_state["last_mask"]`,
     stashed by `on_generate_path`) and, on a wordlist hit, calls
@@ -280,8 +329,8 @@ RealSense). Never import `main` or `camera_thread` from these modules.
 pick a saved bundle under `paths/`, see its preview.png + meta, Run/Cancel with
 Speed/Safety/Radius prefilled from the file. Modules: `toolpath_loader.py`
 (pure parsing: `list_toolpaths`, `load_toolpath` → `Toolpath`; path.json read
-verbatim, path.script parsed back via the exporter's "# stroke N (M pts)"
-block layout — movep-run heuristic fallback for scripts without markers;
+verbatim; the sibling path.script is ignored, so a folder with no
+path.json is not a bundle;
 meta reconstructed from v=/r=/approach distance), `replay_robot.py`
 (**`ReplayBackend` ABC = the robot-brand seam**: connect/disconnect/run/cancel
 + connected/running; `URReplayBackend` reuses RobotController + PathExecutor
@@ -291,7 +340,7 @@ recipe in the module docstring), `replay_server.py` (WS: connect, disconnect,
 refresh, select{name,source}, run{params}, cancel; GET /preview/{name}),
 `viewer/replay.html`/`replay.js`. Deliberately NOT wired into the two modes or
 MCP; no main-app API change. Reads settings.json `last_ip` (never writes it).
-Don't run while the main app holds the robot (one RTDE controller per robot);
+Don't run while the main app holds the robot (one RRC client per controller task);
 never import `main` from these modules.
 
 ## Contained tool: Scheduler (NOT part of the two modes)
@@ -362,8 +411,12 @@ in no `main`/`camera_thread`/`robot_controller`).
   out-of-range/missing is a no-op; removing the last part clears the scene),
   `projection_hello`, `projection_corners{corners}`,
   `depth_overlay_hello`, `depth_overlay_params{params:{interval_mm}}`,
-  `register_freedrive{params:{on}}`, `register_corner{params:{corner_index}}`,
+  `register_freedrive{params:{on}}` (arms the touch-off; on the GoFa it does
+  NOT move the robot into a compliant mode — see stage 4),
+  `register_corner{params:{corner_index}}`,
   `set_trigger{params:{threshold_mm|null}}` (trigger distance; null/empty clears),
+  `set_max_draw_time{params:{minutes|null}}` (Max Drawing Time; null/empty = no
+  limit — see stage 10b),
   `set_automation{params:{on}}` (Participant Auto toggle; ON locks manual
   capture/generate/run for every other client incl. MCP tools),
   `preview_image{params:{image,serial}}` (a Developer window handing over a PNG
@@ -371,15 +424,20 @@ in no `main`/`camera_thread`/`robot_controller`).
   unprompted after each `capture_result` while Auto is ON, never lock-gated —
   it is not a pipeline action),
   `set_exec_params{params:{speed_pct,offset_mm,safety_mm,blend_mm,spacing_mm,
-  join_mm}}` (live, debounced sync of the exec bar so Participant Mode +
-  reopened windows match; blend_mm = movep corner Radius slider, 0–5;
-  join_mm = Distance Threshold box, 0–200).
-- out: `state` (20 Hz, incl. `participant{auto,status,message,trigger_mm,below}`;
+  join_mm,max_length_mm}}` (live, debounced sync of the exec bar so Participant
+  Mode + reopened windows match; blend_mm = corner zone Radius slider, 0–5;
+  join_mm = Distance Threshold box, 0–200; max_length_mm = Max Total Length
+  box, 0–100000, 0 = off). `run` and `save_path` also carry `max_length_mm`, so
+  the click is judged against what that window currently shows.
+- out: `state` (20 Hz, incl. `path_length_mm` + `max_length_mm` — the drawn
+  length of the current path and its ceiling — and
+  `participant{auto,status,message,trigger_mm,below,max_draw_min,remaining_s,
+  warn_s}`;
   `init` carries the same block plus `detect{crop,adjustments,spacing_mm,join_mm}`
   + `exec{speed_pct,offset_mm,safety_mm,blend_mm}` — the browser restores its
   controls from these on (re)open), `capture_result{stroke_count,point_count,strokes,
-  reach_flags,reach_out,skeleton,path_serial,exec_viz:{blend_m,reach_m,min_reach_m,
-  spacing_mm,join_mm}}`, `still`, `preview`,
+  reach_flags,reach_out,skeleton,path_serial,length_mm,max_length_mm,
+  exec_viz:{blend_m,reach_m,min_reach_m,spacing_mm,join_mm}}`, `still`, `preview`,
   `surface_status{loaded,info,pose,offset_mm,mesh,message}` (`info.count` +
   `info.parts[{index,name,faces,bbox}]` = the loaded parts; `mesh` = the
   COMBINED geometry + union corners), `save_result`,
@@ -395,9 +453,9 @@ in no `main`/`camera_thread`/`robot_controller`).
 ## Don't touch / gotchas
 - **Never `import main` from tools/scripts** — import starts the camera thread and
   pollers (hardware side effects). Import the stage modules instead.
-- One process per RealSense; one RTDE controller per robot. The running app owns
+- One process per RealSense; one RRC client per controller task. The running app owns
   both — external tools must go through HTTP/WS, not open hardware directly.
-- Safety constants (`MAX_TCP_SPEED`, `UR_REACH_M`, speeds/accels, `DRAW_Z`) only
+- Safety constants (`MAX_TCP_SPEED`, `GOFA_REACH_M`, speeds/accels, `DRAW_Z`) only
   change on explicit user request.
 - Projection windows intentionally open on `127.0.0.1` (not localhost): Chrome
   caps 6 HTTP/1.1 connections per host and MJPEG streams hold theirs forever.
@@ -406,8 +464,8 @@ in no `main`/`camera_thread`/`robot_controller`).
 - Participant Sensing waits DEPTH_AVERAGE_FRAMES/DEPTH_FPS before capturing:
   the averaged still uses the PAST second, which would contain the hand
   otherwise. Keep that wait ≥ the buffer length.
-- `movep` orientation interp assumes neighbouring waypoints don't flip the
-  wrist — surface projection chains tool-X for minimal twist; keep that property.
+- Blended linear motion assumes neighbouring waypoints don't flip the wrist —
+  surface projection chains tool-X for minimal twist; keep that property.
 - Multi-surface parts are NEVER re-centred — preserving the authored coordinates
   is the whole point (that is what keeps a multi-part Rhino export assembled).
   Don't "helpfully" normalize a part's origin, and don't give parts individual
@@ -415,11 +473,12 @@ in no `main`/`camera_thread`/`robot_controller`).
   move the whole assembly. Note the drawing still fits the UNION bbox aspect, so
   parts placed far apart leave the centred drawing hovering over the gap between
   them (rays miss → empty path); that is correct "contain" behaviour, not a bug.
-- Live drawing and the saved path.script both use movep with the exec-bar
-  Radius blend — keep them in sync (that equivalence is the point of the movep
-  executor). Both clamp via `path_export.stroke_blend` (45% of the stroke's
-  shortest segment) because the UR rejects any path where a blend reaches half
-  a segment; don't bypass that clamp. `MOVEP_BLEND_M` is only the default.
+- A live run and a replayed bundle both go through PathExecutor with the same
+  exec-bar Radius, so they trace identically — keep it that way. The clamp in
+  `path_export.stroke_blend` (45% of the stroke's shortest segment) stays
+  because a zone reaching half a segment has nothing left to round and the
+  controller starts cutting the corner off; don't bypass it. `BLEND_ZONE_M` is
+  only the default.
 - The browser preview reads the Radius slider directly (`readBlendMm()` →
   `rebuildToolpathViz`); `exec_viz.blend_m` from capture_result is only the
   session echo.
@@ -430,14 +489,35 @@ in no `main`/`camera_thread`/`robot_controller`).
   saved beside this one, which is worse than no picture at all. Note the push
   is gated on `autoLocked` in the browser, so Developer Mode still sends its
   screenshot the old way (with the Save click) and costs no extra traffic.
-- Exec-bar controls split two ways: Spacing and **Distance Threshold** change
+- Exec-bar controls split THREE ways: Spacing and **Distance Threshold** change
   the path GEOMETRY, so they re-send `generate_path` (server-side rebuild);
-  Offset/Safety/Radius only re-draw client-side via `rebuildToolpathViz`. Don't
-  wire Distance Threshold into the client-side path — the browser has no copy
-  of the pre-join chains.
+  Offset/Safety/Radius only re-draw client-side via `rebuildToolpathViz`; and
+  **Max Total Length** changes nothing at all — it is a limit, so it only has to
+  reach the server (`set_exec_params`) to be re-judged on Run/Save. Don't wire
+  Distance Threshold into the client-side path — the browser has no copy of the
+  pre-join chains.
+- The drawn-length readout is the SERVER's number, pushed in `state` and
+  `capture_result`, never recomputed in the browser. One implementation means
+  what the box shows is exactly what Run/Save judge; a JS copy would drift the
+  moment either side changed. It follows the Radius slider because
+  `on_set_exec_params` recomputes on every (debounced) sync — Radius changes
+  the drawn length but deliberately never regenerates the path.
+- `_length_check` recomputes from the strokes and blend about to be USED, not
+  the value cached at Generate time. Trusting the cached number would let a
+  Radius change between Generate and Run slip an over-length path through.
 - `_segments_cross` deliberately requires strictly opposite orientation signs,
   so a stroke that merely touches or ends ON the connecting line (a T junction)
   does NOT earn the doubled join threshold — only one that truly passes through.
+- The Max Drawing Time clock lives in `automation.py` and nowhere else: every
+  method takes an optional `now` (monotonic s) so it is testable without
+  sleeping, and the popup only RENDERS `remaining_s`. Don't add a JS timer —
+  a browser-side countdown would drift from the clock that actually rejects the
+  drawing, which is the one number a participant is watching. Same rule as the
+  drawn-length readout.
+- Don't drop the `_await_clear` latch after a time-out. The hand that ran out of
+  time is still over the sand, and "Invalid" is in `_ARMED`, so without the
+  latch the very next tick re-Alerts and the verdict disappears before anyone
+  reads it — and the clock restarts on a drawing already refused.
 - The profanity guard must FAIL OPEN, never closed: a missing Tesseract, a
   missing wordlist or an OCR exception all return `available=False,
   profane=False`. Blocking every drawing because an optional OCR install is
@@ -501,6 +581,6 @@ in no `main`/`camera_thread`/`robot_controller`).
 - `scheduler.py` must not grow its own "is this a bundle?" rule. It calls
   `toolpath_loader.list_toolpaths` precisely so the Scheduler and the replay
   tool always list the same folders.
-- Test count reference: 399 unit (+6 hardware-gated). The `text_guard` OCR
+- Test count reference: 444 unit (+6 hardware-gated). The `text_guard` OCR
   tests skip themselves when Tesseract is absent; the text-matching ones always
   run. Keep green.
