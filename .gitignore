@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+workspace.json
+settings.json
+paths/
+surfaces/
+presets/
+.DS_Store
+.coverage
+htmlcov/
+
+# Local virtualenv backup and stray debug logs
+.venv-py313-bak/
+*.log
+
+# Claude Code PreCompact hook transcript backups
+.claude/transcript-backups/
+.claude/settings.local.json
+stitch_calibration.json

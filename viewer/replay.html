@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Toolpath Replay</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #101114; color: #d8d8d8;
+    font-family: "Segoe UI", system-ui, sans-serif; font-size: 14px;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 14px;
+    padding: 10px 16px; background: #17181c; border-bottom: 1px solid #2a2b30;
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  header .tag {
+    font-size: 11px; color: #4a9eff; border: 1px solid #4a9eff66;
+    border-radius: 4px; padding: 1px 6px;
+  }
+  #backend { font-size: 12px; color: #8a8f98; }
+  #conn-chip {
+    margin-left: auto; font-size: 12px; padding: 2px 10px; border-radius: 10px;
+    background: #3a2225; color: #ff9d94;
+  }
+  #conn-chip.on { background: #1f3a2c; color: #7ec8a8; }
+  main { flex: 1; display: flex; min-height: 0; }
+  aside {
+    width: 300px; flex: none; display: flex; flex-direction: column; min-height: 0;
+    padding: 10px 12px; background: #15161a; border-right: 1px solid #2a2b30;
+  }
+  fieldset {
+    border: 1px solid #2a2b30; border-radius: 6px;
+    margin: 0 0 12px; padding: 8px 10px 10px;
+  }
+  legend { font-size: 12px; color: #9aa0aa; padding: 0 4px; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .row label { flex: 1; font-size: 12.5px; color: #b8bcc4; }
+  .row output { width: 48px; text-align: right; font-size: 12px; color: #8a8f98; }
+  input[type=text], input[type=number] {
+    background: #0d0e11; color: #d8d8d8;
+    border: 1px solid #33353b; border-radius: 4px; padding: 3px 6px;
+  }
+  input[type=text] { flex: 1; }
+  input[type=number] { width: 76px; }
+  input[type=range] { flex: 1.4; accent-color: #4a9eff; }
+  button {
+    background: #23262c; color: #d8d8d8; border: 1px solid #3a3d44;
+    border-radius: 5px; padding: 5px 10px; cursor: pointer; font-size: 13px;
+  }
+  button:hover:enabled { background: #2c3038; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  #paths-box { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  #paths-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  #paths-head span { flex: 1; font-size: 12px; color: #9aa0aa; }
+  #path-list { flex: 1; overflow-y: auto; margin: 0; padding: 0; list-style: none; }
+  #path-list li {
+    padding: 6px 8px; border-radius: 5px; cursor: pointer; font-size: 12.5px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  #path-list li:hover { background: #1d1f24; }
+  #path-list li.sel { background: #22303f; outline: 1px solid #4a9eff55; }
+  #path-list .fmts { margin-left: auto; font-size: 10px; color: #6d727c; }
+  #path-list .fmts a { color: #6d727c; cursor: pointer; }
+  #path-list .fmts a:hover { color: #4a9eff; text-decoration: underline; }
+  section {
+    flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 10px;
+  }
+  #preview-wrap {
+    flex: 1; min-height: 0; background: #000; border: 1px solid #2a2b30;
+    border-radius: 6px; display: flex; align-items: center; justify-content: center;
+    position: relative;
+  }
+  #preview-wrap img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  #preview-empty { color: #6d727c; font-size: 13px; }
+  #details {
+    font-size: 12px; color: #9aa0aa; padding: 8px 2px; min-height: 20px;
+    white-space: pre-wrap;
+  }
+  #runbar {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 10px; background: #15161a; border: 1px solid #2a2b30; border-radius: 6px;
+  }
+  #runbar .ctl { display: flex; align-items: center; gap: 6px; }
+  #runbar label { font-size: 12.5px; color: #b8bcc4; }
+  #btn-run { border-color: #2f6f4f; padding: 5px 22px; font-weight: 600; }
+  #btn-cancel { border-color: #7a3b36; }
+  #progress-wrap {
+    flex: 1; min-width: 120px; height: 8px; background: #0d0e11;
+    border: 1px solid #33353b; border-radius: 4px; overflow: hidden;
+  }
+  #progress { height: 100%; width: 0; background: #4a9eff; transition: width 0.2s; }
+  #phase { font-size: 12px; color: #8a8f98; min-width: 70px; }
+  #msg { font-size: 12px; min-height: 18px; margin-top: 6px; color: #7ec8a8; white-space: pre-wrap; }
+  #msg.err { color: #ff7a6e; }
+  #robot-msg { font-size: 11.5px; min-height: 16px; color: #7ec8a8; white-space: pre-wrap; }
+  #robot-msg.err { color: #ff7a6e; }
+  .hint { font-size: 11px; color: #6d727c; margin: 4px 0 0; line-height: 1.4; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Toolpath Replay</h1><span class="tag">CONTAINED TOOL</span>
+    <span id="backend"></span>
+    <span id="conn-chip">robot disconnected</span>
+  </header>
+  <main>
+    <aside>
+      <fieldset>
+        <legend>Robot</legend>
+        <div class="row">
+          <input type="text" id="robot-ip" placeholder="169.254.10.10" spellcheck="false">
+          <button id="btn-connect">Connect</button>
+        </div>
+        <div id="robot-msg"></div>
+        <p class="hint">Close the main app first — one controller per robot.
+        UR: Remote Control mode, speed slider 100%.</p>
+      </fieldset>
+      <div id="paths-box">
+        <div id="paths-head">
+          <span>Saved toolpaths (paths/)</span>
+          <button id="btn-refresh" title="Re-scan the paths folder">↻</button>
+        </div>
+        <ul id="path-list"></ul>
+      </div>
+    </aside>
+    <section>
+      <div id="preview-wrap">
+        <img id="preview" alt="" hidden>
+        <span id="preview-empty">Select a saved toolpath on the left.</span>
+      </div>
+      <div id="details"></div>
+      <div id="runbar">
+        <div class="ctl"><label for="run-speed">Speed</label>
+          <input type="range" id="run-speed" min="1" max="100" step="1" value="5">
+          <output for="run-speed">5%</output></div>
+        <div class="ctl"><label for="run-safety">Safety</label>
+          <input type="number" id="run-safety" min="5" max="300" step="5" value="50"> mm</div>
+        <div class="ctl"><label for="run-blend">Radius</label>
+          <input type="number" id="run-blend" min="0" max="5" step="0.1" value="0.5"> mm</div>
+        <button id="btn-run" disabled>Run</button>
+        <button id="btn-cancel" disabled>Cancel</button>
+        <div id="progress-wrap"><div id="progress"></div></div>
+        <span id="phase">idle</span>
+      </div>
+      <div id="msg"></div>
+    </section>
+  </main>
+  <script src="/static/replay.js"></script>
+</body>
+</html>

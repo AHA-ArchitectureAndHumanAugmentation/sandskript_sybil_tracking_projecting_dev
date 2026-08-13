@@ -1,0 +1,20 @@
+# Conda environment recipe for depth-cam-to-robot.
+# Recreate on any machine with:  conda env create -f environment.yml
+# (Python packages only. The Intel RealSense USB driver is an OS-level
+#  install and lives OUTSIDE this environment — install it separately:
+#  https://github.com/IntelRealSense/librealsense/releases)
+name: sandskript
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  # OCR engine for the Participant-Mode profanity guard (text_guard.py). Kept
+  # as conda packages so it lives INSIDE the env — no OS-level install needed.
+  # libcurl is not optional: tesseract55.dll fails to load without it, and the
+  # tesseract package does not pull it in on Windows.
+  - tesseract
+  - libcurl
+  - pip:
+      - -r requirements.txt
+      - -r requirements-dev.txt

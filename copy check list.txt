@@ -1,0 +1,33 @@
+This is a copy of a Python depth-camera→robot app (RealSense D435i + UR robot,
+aiohttp web UI) moved from another Windows PC. The source is path-portable, but
+the virtualenv and per-rig files don't survive the copy. Get it running again:
+
+1. The project now uses a conda env (recipe committed as environment.yml).
+   Any copied .venv / .venv-py313-bak is broken and unused — delete both.
+   With Miniconda installed, recreate the env:
+     conda env create -f environment.yml
+   Then update the hardcoded python path (CONDA_PY in run*.bat, and the
+   "command" in .mcp.json) to this PC's env, e.g.
+   C:\Users\<user>\miniconda3\envs\sandskript\python.exe.
+   Use `<env python> -m pip`, never bare pip.exe.
+
+2. Verify every runtime dep imports in the new env:
+     pyrealsense2, skimage, cv2, aiohttp, numpy, rtde_control
+   Report any that fail.
+
+3. Delete stale generated files: __pycache__, tests/__pycache__, .pytest_cache, *.log.
+
+4. workspace.json and settings.json (if present) hold the OLD rig's 3-point
+   calibration and robot IP. Ask me whether this PC drives the same robot/camera
+   setup: if different, delete them so I recalibrate; if same, keep them.
+
+5. Do NOT change the HTTP port or touch git — this is a straight copy, not a variant.
+   Confirm run.bat's CONDA_PY points at this PC's sandskript env python.
+
+6. Verify: run `<env python> -m pytest -q -m "not integration"` (should
+   pass). Then, if I confirm the RealSense is plugged in, launch main.py briefly and
+   confirm it prints "started RealSense ... depth+colour" and "GUI ready"; otherwise
+   note that the camera must be connected.
+
+Report a short summary of what you fixed and anything I still need to do
+(connect RealSense, set robot IP, recalibrate).
