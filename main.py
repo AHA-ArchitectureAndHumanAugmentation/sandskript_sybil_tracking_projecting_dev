@@ -98,6 +98,7 @@ shared_state: dict = {
 state_lock = threading.Lock()
 
 EMULATE_CAPTURE = True  # True = no camera -- auto-generate + save + send after every tile switch. Set False once the camera's reconnected.
+STARTUP_TILE_ID = 1  # tile used immediately on startup, before any message arrives. None = wait for a real message like before.
 
 # ── Singletons ────────────────────────────────────────────────────────────────
 robot         = RobotController()
@@ -385,6 +386,15 @@ async def _emulate_capture_and_save(tile_id: int) -> None:
 
 async def _tile_switch_watcher() -> None:
     last_seq = None
+
+    if STARTUP_TILE_ID is not None:
+        module_trace.log("surface", f"[startup] using tile {STARTUP_TILE_ID} immediately")
+        with state_lock:
+            shared_state["next_tile_id"] = STARTUP_TILE_ID
+        await switch_to_tile(STARTUP_TILE_ID)
+        if EMULATE_CAPTURE:
+            await _emulate_capture_and_save(STARTUP_TILE_ID)
+
     while True:
         await asyncio.sleep(1.0)
         with state_lock:
@@ -396,6 +406,7 @@ async def _tile_switch_watcher() -> None:
             if EMULATE_CAPTURE:
                 await _emulate_capture_and_save(tile_id)
 
+                
 async def on_remove_surface(params: dict) -> None:
     """Drop ONE loaded surface from the scene (the ✕ next to it in the list)."""
     try:
