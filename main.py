@@ -1,5 +1,7 @@
 import asyncio
 import functools
+import math
+import random
 import os
 import signal
 import sys
@@ -47,6 +49,7 @@ from settings import load_settings, save_settings
 from surface import SurfaceModel, SurfacePose, SurfaceScene
 from view_rotation import norm_deg, rotate_crop, rotate_image
 from workspace import WorkspaceConfig, scene_mm_per_px
+from zmq_bridge import send_path_to_charlotte, TileReceiver
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 shared_state: dict = {
@@ -117,8 +120,11 @@ shared_state: dict = {
     "participant_msg":     "",         # last automation outcome/message
     "participant_gen_params":  {},     # last crop/adjustments/spacing from Developer Mode
     "participant_exec_params": {},     # last speed_pct/offset_mm/safety_mm from Developer Mode
+    "next_tile_id": None,   # set by zmq_bridge.TileReceiver; the tile Charlotte wants next
 }
 state_lock = threading.Lock()
+
+EMULATE_CAPTURE = True  # True = no camera -- auto-generate + save + send after every tile switch. Set False once the camera's reconnected.
 
 # ── Singletons ────────────────────────────────────────────────────────────────
 robot         = RobotController()
@@ -375,6 +381,96 @@ async def on_surface_upload(filename: str, blob: bytes) -> dict:
     module_trace.log("surface", f"[surface] {added}; scene bbox {info['bbox']['size']} m")
     return {"info": info}
 
+
+async def switch_to_tile(tile_id: int) -> None:
+    """Loads surfaces/tile_{tile_id}.obj as the ONLY active surface."""
+    path = SURFACE_DIR / f"tile_{tile_id:03d}.obj"
+    if not path.is_file():
+        module_trace.log("surface", f"[zmq_bridge] tile {tile_id} not found: {path}")
+        return
+
+    loop = asyncio.get_running_loop()
+    model = await loop.run_in_executor(None, SurfaceModel.load, path)
+    async with _surface_lock:
+        scene = await loop.run_in_executor(None, SurfaceScene.combine, None, model)
+        info = scene.info()
+        mesh_payload = await loop.run_in_executor(None, scene.mesh_payload)
+        with state_lock:
+            shared_state["surface_model"] = scene
+            shared_state["surface_info"] = info
+            shared_state["surface_mesh_payload"] = mesh_payload
+            pose = shared_state["surface_pose"]
+            offset = shared_state["surface_offset_mm"]
+
+    await server.broadcast_surface_status(
+        loaded=True, info=info, pose=pose, offset_mm=offset, mesh=mesh_payload,
+        message=f"Switched to tile {tile_id}",
+    )
+    module_trace.log("surface", f"[zmq_bridge] switched to tile {tile_id}")
+
+
+def _emulate_pixel_stroke(width: int, height: int) -> list:
+    """Synthetic 2D drawing -- a sine wave, randomized a bit each call so
+    successive emulated captures aren't identical."""
+    margin = 0.15
+    amplitude = height * 0.3
+    frequency = random.uniform(2.0, 4.0)
+    phase = random.uniform(0, 2 * math.pi)
+    n_points = 80
+
+    points = []
+    for i in range(n_points):
+        t = i / (n_points - 1)
+        x = width * margin + t * width * (1 - 2 * margin)
+        y = height / 2.0 + amplitude * math.sin(t * frequency * math.pi + phase)
+        points.append((int(x), int(y)))
+
+    return [points]
+
+
+async def _emulate_capture_and_save(tile_id: int) -> None:
+    """Emulates ONLY capture + groove detection. Everything after this --
+    projection, save, send, next-tile selection -- is the same real code
+    a live capture would use."""
+    with state_lock:
+        surface_model = shared_state.get("surface_model")
+        surface_pose = SurfacePose.from_dict(shared_state.get("surface_pose"))
+    if surface_model is None:
+        module_trace.log("surface", f"[emulate] tile {tile_id}: no surface loaded, skipping")
+        return
+
+    fake_strokes = _emulate_pixel_stroke(DEPTH_WIDTH, DEPTH_HEIGHT)
+    loop = asyncio.get_running_loop()
+    try:
+        robot_strokes = await loop.run_in_executor(
+            None, surface_model.project_strokes,
+            fake_strokes, DEPTH_WIDTH, DEPTH_HEIGHT, surface_pose, 0.0,
+        )
+    except Exception as exc:
+        module_trace.log("surface", f"[emulate] projection failed: {exc}")
+        return
+
+    with state_lock:
+        shared_state["strokes"] = robot_strokes
+        shared_state["strokes_surface"] = True
+        shared_state["path_serial"] = shared_state.get("path_serial", 0) + 1
+
+    module_trace.log("surface", f"[emulate] tile {tile_id}: {len(robot_strokes[0])} points -- saving")
+    await on_save_path(server.broadcast_ws(), {})
+
+
+async def _tile_switch_watcher() -> None:
+    last_seq = None
+    while True:
+        await asyncio.sleep(1.0)
+        with state_lock:
+            tile_id = shared_state.get("next_tile_id")
+            seq = shared_state.get("next_tile_seq")
+        if tile_id is not None and seq is not None and seq != last_seq:
+            last_seq = seq
+            await switch_to_tile(tile_id)
+            if EMULATE_CAPTURE:
+                await _emulate_capture_and_save(tile_id)
 
 async def on_remove_surface(params: dict) -> None:
     """Drop ONE loaded surface from the scene (the ✕ next to it in the list)."""
@@ -1076,6 +1172,13 @@ async def on_save_path(ws, params: dict) -> None:
     await server.send_save_result(ws, True, folder=str(folder))
     module_trace.log("save", f"[save] toolpath saved to {folder}")
 
+    with state_lock:
+        tile_id = shared_state.get("next_tile_id")
+    if tile_id is not None:
+        await loop.run_in_executor(None, functools.partial(send_path_to_charlotte, folder, tile_id))
+        module_trace.log("save", f"[zmq_bridge] sent tile {tile_id} to Charlotte")
+    else:
+        module_trace.log("save", "[zmq_bridge] no tile_id yet -- not sent")
 
 # ── Participant Mode (automated pipeline) ────────────────────────────────────
 # The Auto toggle + trigger threshold come from the ⧉ Participant popup; the
@@ -1419,6 +1522,8 @@ def _ee_poller() -> None:
 
 
 threading.Thread(target=_ee_poller, daemon=True, name="ee_poller").start()
+tile_receiver = TileReceiver(shared_state, state_lock)
+tile_receiver.start()
 
 
 async def _open_browser() -> None:
@@ -1431,6 +1536,7 @@ async def _main() -> None:
     module_trace.print_banner()
     asyncio.create_task(_open_browser())
     asyncio.create_task(_participant_loop())
+    asyncio.create_task(_tile_switch_watcher())
     await server.start()
 
 

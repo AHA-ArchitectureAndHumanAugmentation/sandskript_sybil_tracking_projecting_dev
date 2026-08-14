@@ -12,3 +12,4 @@ trimesh>=4.0.0
 rtree>=1.0.0
 scipy>=1.11.0
 pytesseract>=0.3.10
+pyzmq>=25.0.0

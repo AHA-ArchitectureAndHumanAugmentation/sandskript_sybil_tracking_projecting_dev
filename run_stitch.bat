@@ -14,7 +14,7 @@ echo.
 
 REM Hardcoded conda environment (see run.bat / environment.yml).
 REM RealSense USB driver = OS-level install, not part of the env.
-set "CONDA_PY=C:\Users\linfo\miniconda3\envs\sandskript\python.exe"
+set "CONDA_PY=C:\Users\cthorn\AppData\Local\miniconda3\envs\sandskript\python.exe"
 if exist "%CONDA_PY%" (
     "%CONDA_PY%" stitch_main.py
 ) else (
