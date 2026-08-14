@@ -8,12 +8,14 @@ getting that wrong is a robot moving to the wrong place by a factor of 1000.
 """
 import math
 import threading
+import time
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 
+from config import RRC_ACCEL_PCT, RRC_ACCEL_RAMP_PCT
 from robot_controller import RobotController, frame_to_pose, pose_to_frame
 
 _POSE = [0.1, 0.2, 0.3, 0.0, math.pi, 0.0]
@@ -43,8 +45,9 @@ def _make_rrc():
     rrc.FeedbackLevel.DONE = 1
     rrc.FeedbackLevel.NONE = 0
     # Instruction constructors just record their arguments.
-    for name in ("Noop", "SetTool", "SetWorkObject", "MoveToFrame",
-                 "MoveToJoints", "GetFrame", "Stop"):
+    for name in ("Noop", "SetTool", "SetWorkObject", "SetAcceleration",
+                 "SetDigital", "MoveToFrame", "MoveToJoints", "GetFrame",
+                 "Stop"):
         getattr(rrc, name).side_effect = (
             lambda *a, _n=name, **k: {"instruction": _n, "args": a, "kwargs": k})
     return rrc
@@ -137,6 +140,20 @@ class TestConnectionState:
         with _connected_robot() as (rc, rrc, abb, _):
             assert _sent_instructions(abb, "SetTool")
             assert _sent_instructions(abb, "SetWorkObject")
+
+    def test_connect_sets_acceleration(self):
+        # RAPID acceleration is a controller-wide setting, so connect is the
+        # only place it can be applied — and it must be applied every time,
+        # because it persists on the controller between sessions.
+        with _connected_robot() as (rc, rrc, abb, _):
+            (acc,) = _sent_instructions(abb, "SetAcceleration")
+            assert acc["args"] == (RRC_ACCEL_PCT, RRC_ACCEL_RAMP_PCT)
+
+    def test_acceleration_is_a_percentage_not_metres_per_second_squared(self):
+        # Guards against someone "helpfully" passing DRAW_ACCEL (0.3 m/s²)
+        # through: 0.3 would be read as 0.3% and the arm would barely move.
+        assert 1.0 <= RRC_ACCEL_PCT <= 100.0
+        assert 1.0 <= RRC_ACCEL_RAMP_PCT <= 100.0
 
     def test_no_bridge_raises_with_a_docker_hint(self):
         roslibpy = MagicMock()
@@ -291,6 +308,82 @@ class TestDisconnect:
             abb.send.side_effect = RuntimeError("bridge gone")
             rc.disconnect()           # must not raise
             assert rc.connected is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Material dispenser (RAPID digital output)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@contextmanager
+def _dispenser_on(signal="doDispenser"):
+    """Pretend the valve is wired and its output named."""
+    with patch("robot_controller.DISPENSER_ENABLED", True), \
+         patch("robot_controller.DISPENSER_SIGNAL", signal):
+        yield
+
+
+class TestDispenser:
+
+    def test_disabled_by_default_sends_nothing(self):
+        # The valve does not exist on the rig yet; until DISPENSER_ENABLED is
+        # turned on, not one instruction may reach the controller.
+        with _connected_robot() as (rc, rrc, abb, _):
+            rc.set_dispenser(True)
+            assert not _sent_instructions(abb, "SetDigital")
+
+    def test_open_sets_the_output_high(self):
+        with _dispenser_on(), _connected_robot() as (rc, rrc, abb, _):
+            rc.set_dispenser(True)
+            (sig,) = _sent_instructions(abb, "SetDigital")
+            assert sig["args"] == ("doDispenser", 1)
+
+    def test_close_sets_the_output_low(self):
+        with _dispenser_on(), _connected_robot() as (rc, rrc, abb, _):
+            rc.set_dispenser(False)
+            (sig,) = _sent_instructions(abb, "SetDigital")
+            assert sig["args"] == ("doDispenser", 0)
+
+    def test_blank_signal_name_sends_nothing(self):
+        with _dispenser_on(signal=""), _connected_robot() as (rc, rrc, abb, _):
+            rc.set_dispenser(True)
+            assert not _sent_instructions(abb, "SetDigital")
+
+    def test_silent_when_not_connected(self):
+        with _dispenser_on():
+            RobotController().set_dispenser(True)      # must not raise
+
+    def test_a_failed_switch_raises(self):
+        # Material failing to flow is a real failure of the drawing, so it must
+        # reach the executor's error phase rather than be swallowed here.
+        with _dispenser_on(), _connected_robot() as (rc, rrc, abb, _):
+            abb.send_and_wait.side_effect = RuntimeError("no such signal")
+            with pytest.raises(RuntimeError):
+                rc.set_dispenser(True)
+
+    def test_prime_delay_is_slept_outside_the_lock(self):
+        # A pump needing a moment to build pressure must not freeze the EE
+        # poller or cancel for that moment.
+        with _dispenser_on(), patch("robot_controller.DISPENSER_ON_DELAY_S", 0.3), \
+             _connected_robot() as (rc, rrc, abb, _):
+            t = threading.Thread(target=rc.set_dispenser, args=(True,))
+            t.start()
+            time.sleep(0.05)                       # now inside the prime delay
+            acquired = rc._lock.acquire(timeout=0.15)
+            if acquired:
+                rc._lock.release()
+            t.join(timeout=2.0)
+            assert acquired, "the prime delay must not hold the client lock"
+
+    def test_disconnect_closes_the_valve_before_dropping_the_link(self):
+        # Once the client is gone there is no way left to switch it off.
+        with _dispenser_on(), _connected_robot() as (rc, rrc, abb, ros):
+            rc.disconnect()
+            assert _sent_instructions(abb, "SetDigital")[-1]["args"] == ("doDispenser", 0)
+
+    def test_disconnect_sends_nothing_when_disabled(self):
+        with _connected_robot() as (rc, rrc, abb, ros):
+            rc.disconnect()
+            assert not _sent_instructions(abb, "SetDigital")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

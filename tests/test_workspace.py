@@ -44,3 +44,44 @@ class TestSceneMmPerPx:
         ws = WorkspaceConfig.simulation()
         surf = FakeSurface(1.875)
         assert scene_mm_per_px(ws, surf) == 1.875
+
+
+class TestCombinedCanvasSize:
+    """Every view is the COMBINED canvas of the whole camera rig, so the frame
+    the scale is measured over is no longer one camera's 640×480."""
+
+    def test_the_surface_is_fitted_to_the_canvas_not_to_one_camera(self):
+        surf = FakeSurface(1.0)
+        scene_mm_per_px(None, surf, frame_size=(1800, 620))
+        assert surf.calls == [(1800, 620)]
+
+    def test_a_wider_canvas_makes_each_pixel_smaller(self):
+        ws = WorkspaceConfig.simulation()
+        one = scene_mm_per_px(ws, None, frame_size=(DEPTH_WIDTH, DEPTH_HEIGHT))
+        wide = scene_mm_per_px(ws, None, frame_size=(2 * DEPTH_WIDTH, DEPTH_HEIGHT))
+        assert wide == one / 2
+
+    def test_a_missing_or_nonsense_size_falls_back_to_one_camera(self):
+        surf = FakeSurface(1.0)
+        scene_mm_per_px(None, surf, frame_size=None)
+        scene_mm_per_px(None, surf, frame_size=(0, 0))
+        assert surf.calls == [(DEPTH_WIDTH, DEPTH_HEIGHT)] * 2
+
+
+class TestSimulationAspect:
+    """Test Mode's synthetic plane follows the frame's shape, so a wide
+    multi-camera canvas is not squashed into a single camera's 4:3."""
+
+    def test_default_follows_one_camera(self):
+        ws = WorkspaceConfig.simulation()
+        assert ws.y_extent / ws.x_extent == DEPTH_HEIGHT / DEPTH_WIDTH
+
+    def test_a_wide_canvas_gives_a_wide_plane(self):
+        ws = WorkspaceConfig.simulation(frame_aspect=3.0)
+        assert ws.x_extent / ws.y_extent == 3.0
+
+    def test_the_plane_stays_isotropic(self):
+        """mm across == mm down: the whole point of deriving y from the aspect."""
+        aspect = 1800 / 620
+        ws = WorkspaceConfig.simulation(frame_aspect=aspect)
+        assert (ws.x_extent / 1800) == (ws.y_extent / 620)

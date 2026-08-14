@@ -14,7 +14,9 @@ class TestChain:
         assert chain("save") == "path_export.py"
 
     def test_multi_module_action_is_arrow_joined(self):
-        assert chain("capture") == "camera_thread.py → depth_extractor.py"
+        # Capture reads every camera and combines them before detection runs.
+        assert chain("capture") == ("camera_thread.py → realsense_source.py → "
+                                    "stitcher.py → depth_extractor.py")
 
     def test_unknown_action_is_empty_not_an_error(self):
         assert chain("no-such-action") == ""

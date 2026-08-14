@@ -32,15 +32,17 @@ depth image is the product, RGB is reference only).
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
 
 from config import (
-    DEPTH_WIDTH, DEPTH_HEIGHT,
+    DEPTH_WIDTH, DEPTH_HEIGHT, STITCH_CALIB_FILE,
     STITCH_MM_PER_PX, STITCH_MAX_GRID_W, STITCH_MAX_GRID_H,
     STITCH_NOMINAL_HFOV_DEG, STITCH_NOMINAL_VFOV_DEG,
 )
@@ -197,6 +199,44 @@ class StitchCalib:
         return StitchCalib(cams=cams, mm_per_px=self.mm_per_px)
 
 
+def load_calib(path: Path = STITCH_CALIB_FILE) -> StitchCalib:
+    """
+    Read a saved layout (stitch_calibration.json), or an empty rig if there is
+    none. The Multi-Cam Vision tool writes the file and the main app reads it,
+    so this is the ONE place the format is parsed — the two must never disagree
+    about what the operator saved.
+    """
+    try:
+        return StitchCalib.from_dict(json.loads(Path(path).read_text()))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return StitchCalib()
+
+
+@dataclass(frozen=True)
+class CanvasGrid:
+    """
+    A FROZEN canvas geometry: where pixel (0,0) sits in canvas mm, how big the
+    grid is, and its resolution.
+
+    ``stitch`` normally sizes the canvas to whatever cameras had data this
+    cycle, which is right for the placement tool — a camera being adjusted
+    should grow the picture. It is wrong for a running pipeline: the crop,
+    the reference frame and the captured still are all in canvas pixels, so a
+    canvas that resized when a camera dropped a frame would silently move every
+    one of them. Freeze the grid from the first good canvas and pass it back in.
+    """
+    origin_mm: tuple[float, float]
+    width: int
+    height: int
+    mm_per_px: float
+
+    @classmethod
+    def from_result(cls, result: "StitchResult") -> "CanvasGrid":
+        h, w = result.depth_m.shape[:2]
+        return cls(origin_mm=tuple(result.origin_mm), width=int(w), height=int(h),
+                   mm_per_px=float(result.mm_per_px))
+
+
 @dataclass
 class CameraFrame:
     """One camera's averaged capture: metric depth + valid mask (+ aligned RGB)."""
@@ -340,6 +380,27 @@ def default_row_mm(footprints, crops) -> list[tuple[tuple[float, float], ...]]:
         out.append(((x, 0.0), (x + w, 0.0), (x, h), (x + w, h)))
         x += w
     return out
+
+
+def with_default_row(calib: StitchCalib, footprints) -> StitchCalib:
+    """
+    Give every camera that has no quad yet its slot in the flush default row,
+    leaving placed cameras exactly where the operator put them.
+
+    The browser (and the main app's canvas grid) work RELATIVE to `quad_mm`, so
+    it must never be empty once a camera is known — a rig with no saved layout
+    still has to open as a readable row.
+    """
+    if not calib.cams:
+        return calib
+    row = default_row_mm([common_footprint_mm(footprints)] * len(calib.cams),
+                         [p.crop for p in calib.cams])
+    cams = []
+    for i, p in enumerate(calib.cams):
+        if not p.quad_mm and i < len(row):
+            p = p.merged({"quad_mm": [list(c) for c in row[i]]})
+        cams.append(p)
+    return StitchCalib(cams=cams, mm_per_px=calib.mm_per_px)
 
 
 def quad_centre_x(quad) -> float:
@@ -492,11 +553,17 @@ def _empty_result(n_cams: int, mm_per_px: float) -> StitchResult:
 
 
 def stitch(frames: list[CameraFrame], calib: StitchCalib,
-           mm_per_px: Optional[float] = None) -> StitchResult:
+           mm_per_px: Optional[float] = None,
+           grid: Optional[CanvasGrid] = None) -> StitchResult:
     """
     Lay every camera's frame onto the shared canvas through its corner-pin.
     `frames` are the raw per-device captures in enumeration order; the rotation,
     crop and placement in `calib` are applied here.
+
+    Pass ``grid`` to reuse a frozen canvas geometry instead of sizing one to
+    this cycle's cameras — see CanvasGrid. With a grid, a cycle where no camera
+    had data returns a correctly-sized EMPTY canvas rather than a stub, so the
+    pipeline downstream keeps its frame size.
     """
     if mm_per_px is None:
         mm_per_px = calib.mm_per_px
@@ -504,28 +571,32 @@ def stitch(frames: list[CameraFrame], calib: StitchCalib,
     prepared = [_prepare(f, calib.placement_for(f.serial, i), i)
                 for i, f in enumerate(frames)]
     live = [q for q in prepared if q is not None]
-    if not live:
+    if not live and grid is None:
         return _empty_result(len(frames), mm_per_px if mm_per_px > 0 else 2.0)
 
-    if mm_per_px <= 0:
-        mm_per_px = _auto_mm_per_px(live)
+    if grid is not None:
+        xmin, ymin = grid.origin_mm
+        gw, gh, mm_per_px = grid.width, grid.height, grid.mm_per_px
+    else:
+        if mm_per_px <= 0:
+            mm_per_px = _auto_mm_per_px(live)
 
-    corners = np.concatenate([q.quad for q in live])
-    xmin, ymin = float(corners[:, 0].min()), float(corners[:, 1].min())
-    xmax, ymax = float(corners[:, 0].max()), float(corners[:, 1].max())
-    # Quantize the origin so the canvas does not shuffle by a pixel every frame.
-    step = mm_per_px * 8
-    xmin = math.floor(xmin / step) * step
-    ymin = math.floor(ymin / step) * step
-    gw = int(math.ceil((xmax - xmin) / mm_per_px))
-    gh = int(math.ceil((ymax - ymin) / mm_per_px))
-    # Cap the grid by coarsening resolution, never by cropping coverage.
-    scale = max(gw / STITCH_MAX_GRID_W, gh / STITCH_MAX_GRID_H, 1.0)
-    if scale > 1.0:
-        mm_per_px *= scale
-        gw = max(1, int(math.ceil((xmax - xmin) / mm_per_px)))
-        gh = max(1, int(math.ceil((ymax - ymin) / mm_per_px)))
-    gw, gh = max(gw, 16), max(gh, 16)
+        corners = np.concatenate([q.quad for q in live])
+        xmin, ymin = float(corners[:, 0].min()), float(corners[:, 1].min())
+        xmax, ymax = float(corners[:, 0].max()), float(corners[:, 1].max())
+        # Quantize the origin so the canvas does not shuffle by a pixel every frame.
+        step = mm_per_px * 8
+        xmin = math.floor(xmin / step) * step
+        ymin = math.floor(ymin / step) * step
+        gw = int(math.ceil((xmax - xmin) / mm_per_px))
+        gh = int(math.ceil((ymax - ymin) / mm_per_px))
+        # Cap the grid by coarsening resolution, never by cropping coverage.
+        scale = max(gw / STITCH_MAX_GRID_W, gh / STITCH_MAX_GRID_H, 1.0)
+        if scale > 1.0:
+            mm_per_px *= scale
+            gw = max(1, int(math.ceil((xmax - xmin) / mm_per_px)))
+            gh = max(1, int(math.ceil((ymax - ymin) / mm_per_px)))
+        gw, gh = max(gw, 16), max(gh, 16)
 
     depth_sum = np.zeros((gh, gw), np.float32)
     coverage = np.zeros((gh, gw), np.uint8)

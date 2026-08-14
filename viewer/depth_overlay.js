@@ -29,6 +29,11 @@
   const canvas  = document.getElementById("overlay");
   const ctx     = canvas.getContext("2d");
   let labels = [];
+  // True when the numbers (and the trigger box) are HEIGHTS ABOVE THE SAND,
+  // which is what a reference frame buys: on a tilted camera the raw distance
+  // from the camera varies across the box by more than a hand's clearance, so
+  // no single absolute cutoff can separate the two. Set from the server.
+  let labelsRelative = false;
 
   /* ── Layout: keep a stage in the crop's aspect that fits the window ─────── */
   function layout() {
@@ -60,7 +65,11 @@
     ctx.strokeStyle = "rgba(0,0,0,0.85)";
     ctx.fillStyle = "#ffffff";
     for (const [u, v, mm] of labels) {
-      const t = String(Math.round(mm));
+      // Height above the sand is a SIGNED number and 0 is the surface itself,
+      // so the sign carries the meaning: +90 = a hand, -6 = a raked groove.
+      // An absolute distance from the camera is never signed, so no "+" there.
+      const n = Math.round(mm);
+      const t = labelsRelative && n > 0 ? "+" + n : String(n);
       const x = u * sx, y = v * sy;
       ctx.strokeText(t, x, y);   // dark outline keeps numbers readable on any colour
       ctx.fillText(t, x, y);
@@ -98,6 +107,26 @@
              params: { threshold_mm: Number.isFinite(v) && v > 0 ? v : null } });
     }, 400);
   });
+
+  /* The trigger box and the overlay numbers measure the same quantity, and
+     which quantity it is depends on whether a reference frame is set. Say so
+     in both places rather than leaving the operator to infer it from the
+     magnitudes — the two modes want values an order of magnitude apart. */
+  const trigLabelEl = document.querySelector('label[for="trigger"]');
+  const noteEl      = document.getElementById("note");
+  function setMeasurementMode(relative) {
+    if (relative === labelsRelative && trigLabelEl.dataset.set) return;
+    labelsRelative = !!relative;
+    trigLabelEl.dataset.set = "1";
+    trigLabelEl.textContent = labelsRelative ? "Trigger above sand" : "Trigger below";
+    trigLabelEl.title = labelsRelative
+      ? "Fires when something rises more than this many mm ABOVE the sand surface (the reference frame). Unaffected by camera tilt — the same number means the same thing everywhere in the box."
+      : "Fires when something comes closer to the camera than this many mm. No reference frame is set, so this is a raw distance: on a tilted camera the sand's own depth range may leave no value that works. Press Set Reference in Developer Mode to switch to height above the sand.";
+    noteEl.textContent = (labelsRelative
+      ? "numbers = mm above sand (0 = surface, − = groove)"
+      : "numbers = mm from camera") + " · Auto ON + trigger = automated runs";
+    draw();
+  }
 
   function syncTrigger(mm) {
     // Adopt the server's threshold (set here or in another window) — but never
@@ -197,6 +226,7 @@
       const data = JSON.parse(ev.data);
       if (data.type === "depth_labels") {
         labels = data.labels || [];
+        setMeasurementMode(data.relative);
         // The labels' (and the feed's) crop size — re-fit the stage when the
         // user adjusts the crop in Developer Mode.
         const s = data.size;
@@ -208,6 +238,11 @@
         }
       } else if (data.type === "state" || data.type === "init") {
         updateParticipant(data.participant);
+        // Arrives at 20 Hz and from the very first message, so the box is
+        // labelled correctly before any depth labels have been computed (they
+        // only run while this popup is connected, and only ~4 Hz).
+        if (typeof data.reference_set === "boolean")
+          setMeasurementMode(data.reference_set);
       }
     };
   }

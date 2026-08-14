@@ -14,12 +14,13 @@ from depth_extractor import (
     DepthGrooveParams,
     ProcessedDepth,
     colorize_depth,
-    depth_below_threshold,
     depth_region_labels,
     groove_mask,
     grooves_and_mask,
     grooves_from_depth,
+    presence_trigger,
     process_depth,
+    surface_height_mm,
 )
 
 
@@ -366,33 +367,198 @@ class TestDepthRegionLabels:
         assert len(labels) <= 20
 
 
-class TestDepthBelowThreshold:
-    """Participant-Mode trigger: enough valid pixels closer than the threshold."""
+def _tilted_sand(h=480, w=640, near_m=0.70, far_m=0.90):
+    """
+    A sandbox seen by a camera mounted at an angle: the surface itself ramps
+    from `near_m` at the left edge to `far_m` at the right. 200 mm of spread
+    across the box — more than a hand's clearance above it, which is exactly
+    what breaks an absolute trigger.
+    """
+    return np.tile(np.linspace(near_m, far_m, w, dtype=np.float32), (h, 1))
+
+
+class TestTiltedCameraTrigger:
+    """
+    The failure that motivated height-above-sand triggering, and its fix.
+
+    With a tilted camera the sand spans more depth than a hand does, so an
+    absolute cutoff either fires on the near end of the SAND or misses a hand
+    over the far end. Measuring against a reference frame removes the ramp,
+    because the reference contains it.
+    """
+
+    def test_absolute_trigger_fires_on_the_bare_tilted_sand(self):
+        sand = _tilted_sand()
+        ok = np.ones_like(sand, bool)
+        # High enough to see a hand at the far (900 mm) end…
+        assert presence_trigger(sand, ok, threshold_mm=850.0) is True  # …and the sand fires
+
+    def test_absolute_trigger_misses_a_hand_at_the_far_end(self):
+        sand = _tilted_sand()
+        frame = sand.copy()
+        frame[100:300, 500:600] -= 0.08          # a hand 80 mm above the far sand
+        ok = np.ones_like(frame, bool)
+        # Low enough not to fire on the bare sand (nearest sand is 700 mm)…
+        assert presence_trigger(sand, ok, threshold_mm=690.0) is False
+        # …but then the hand at the far end is invisible too. No value works.
+        assert presence_trigger(frame, ok, threshold_mm=690.0) is False
+
+    def test_reference_relative_trigger_sees_the_hand_and_ignores_the_sand(self):
+        sand = _tilted_sand()
+        ok = np.ones_like(sand, bool)
+        frame = sand.copy()
+        frame[100:300, 500:600] -= 0.08          # same hand, same far end
+        assert presence_trigger(sand, ok, threshold_mm=40.0, reference=sand) is False
+        assert presence_trigger(frame, ok, threshold_mm=40.0, reference=sand) is True
+
+    def test_the_same_threshold_works_at_both_ends_of_the_box(self):
+        """The whole point: one number, valid everywhere in the sandbox."""
+        sand = _tilted_sand()
+        ok = np.ones_like(sand, bool)
+        for col in (20, 120, 320, 500, 620):
+            frame = sand.copy()
+            lo, hi = max(0, col - 50), min(sand.shape[1], col + 50)
+            frame[100:300, lo:hi] -= 0.08
+            assert presence_trigger(frame, ok, threshold_mm=40.0,
+                                    reference=sand) is True, f"missed at x={col}"
+
+    def test_a_groove_never_triggers(self):
+        """Grooves are BELOW the surface — negative height, never a presence."""
+        sand = _tilted_sand()
+        frame = sand.copy()
+        frame[100:300, 200:400] += 0.01          # 10 mm deep rake
+        ok = np.ones_like(frame, bool)
+        assert presence_trigger(frame, ok, threshold_mm=40.0, reference=sand) is False
+
+    def test_a_mismatched_reference_falls_back_to_absolute(self):
+        """
+        A stale reference (wrong shape after a view rotation) must not disable
+        the trigger — it drops back to the absolute test it used before.
+        """
+        z = np.full((480, 640), 0.9, np.float32)
+        z[100:200, 100:200] = 0.5
+        ok = np.ones_like(z, bool)
+        stale = np.full((640, 480), 0.9, np.float32)
+        assert presence_trigger(z, ok, threshold_mm=700.0, reference=stale) is True
+        assert presence_trigger(z, ok, threshold_mm=400.0, reference=stale) is False
+
+
+class TestSurfaceHeight:
+
+    def test_height_is_positive_above_and_negative_below(self):
+        sand = np.full((10, 10), 0.90, np.float32)
+        frame = sand.copy()
+        frame[0, 0] = 0.80          # 100 mm nearer the camera = above the sand
+        frame[1, 1] = 0.91          # 10 mm farther = a groove
+        height, ok = surface_height_mm(frame, np.ones_like(frame, bool), sand)
+        assert ok.all()
+        assert height[0, 0] == pytest.approx(100.0, abs=1e-3)
+        assert height[1, 1] == pytest.approx(-10.0, abs=1e-3)
+        assert height[5, 5] == pytest.approx(0.0, abs=1e-3)
+
+    def test_the_tilt_cancels_exactly(self):
+        sand = _tilted_sand()
+        height, _ok = surface_height_mm(sand, np.ones_like(sand, bool), sand)
+        assert np.allclose(height, 0.0, atol=1e-3)
+
+    def test_no_usable_reference_returns_none(self):
+        z = np.full((10, 10), 0.9, np.float32)
+        ok = np.ones_like(z, bool)
+        assert surface_height_mm(z, ok, None) is None
+        assert surface_height_mm(z, ok, np.full((8, 8), 0.9, np.float32)) is None
+        assert surface_height_mm(z, ok, np.zeros((10, 10), np.float32)) is None
+
+
+class TestRelativeDepthLabels:
+
+    def test_labels_read_zero_on_untouched_tilted_sand(self):
+        """
+        Absolute labels would paint the camera's tilt across the picture; height
+        labels read ~0 everywhere, so a hand stands out as the only number.
+        """
+        sand = _tilted_sand()
+        ok = np.ones_like(sand, bool)
+        labels = depth_region_labels(sand, ok, interval_mm=10.0, reference=sand)
+        assert labels, "expected at least one region"
+        assert all(abs(mm) <= 5.0 for _u, _v, mm in labels)
+
+    def test_a_hand_reads_its_height_above_the_sand(self):
+        sand = _tilted_sand()
+        frame = sand.copy()
+        frame[100:380, 450:620] -= 0.09          # 90 mm above the far sand
+        ok = np.ones_like(frame, bool)
+        labels = depth_region_labels(frame, ok, interval_mm=10.0, reference=sand)
+        assert any(85.0 <= mm <= 95.0 for _u, _v, mm in labels)
+
+    def test_grooves_label_negative(self):
+        """Band 0 is a real band now, so negative bands must survive too."""
+        sand = np.full((480, 640), 0.90, np.float32)
+        frame = sand.copy()
+        frame[100:380, 100:400] += 0.02          # 20 mm below the surface
+        ok = np.ones_like(frame, bool)
+        labels = depth_region_labels(frame, ok, interval_mm=10.0, reference=sand)
+        assert any(mm == pytest.approx(-20.0) for _u, _v, mm in labels)
+        assert any(mm == pytest.approx(0.0) for _u, _v, mm in labels)
+
+    def test_without_a_reference_labels_stay_absolute(self):
+        z = np.full((480, 640), 1.0, np.float32)
+        ok = np.ones_like(z, bool)
+        labels = depth_region_labels(z, ok, interval_mm=10.0)
+        assert all(mm == pytest.approx(1000.0) for _u, _v, mm in labels)
+
+
+class TestIgnoreCloserRelative:
+
+    def test_absolute_cutoff_cannot_serve_a_tilted_box(self):
+        """
+        Any absolute cutoff splits the tilted SAND itself: below 700 mm it
+        rejects nothing (and so cannot catch a hand at the far end), above it
+        it starts throwing away the near end of the sandbox.
+        """
+        sand = _tilted_sand()
+        assert not (sand < 0.700).any()               # too low: never fires
+        cut = sand < 0.780                            # high enough for a far hand
+        assert cut.any() and not cut.all()            # …and it eats the near sand
+
+    def test_relative_cutoff_rejects_the_hand_not_the_sand(self):
+        sand = _tilted_sand()
+        frame = sand.copy()
+        # A groove near the left edge and a hand hovering over the right edge.
+        frame[240:244, 60:200] += 0.004                   # 4 mm deep rake
+        frame[100:300, 500:600] -= 0.08                   # hand, 80 mm up
+        ok = np.ones_like(frame, bool)
+
+        p = DepthGrooveParams(groove_depth_mm=1.0, min_blob_px=0,
+                              ignore_closer_mm=40.0)
+        mask, _skel = grooves_and_mask(frame, ok, p, reference=sand)
+        # The rake survives; nothing is detected under the hand.
+        assert mask[242, 60:200].any()
+        assert not mask[100:300, 500:600].any()
 
     def test_hand_in_frame_triggers(self):
         z = np.full((480, 640), 0.9, np.float32)           # sand at 900 mm
         z[100:200, 100:200] = 0.5                          # hand at 500 mm
         ok = np.ones_like(z, bool)
-        assert depth_below_threshold(z, ok, threshold_mm=700.0) is True
+        assert presence_trigger(z, ok, threshold_mm=700.0) is True
 
     def test_clear_frame_does_not_trigger(self):
         z = np.full((480, 640), 0.9, np.float32)
         ok = np.ones_like(z, bool)
-        assert depth_below_threshold(z, ok, threshold_mm=700.0) is False
+        assert presence_trigger(z, ok, threshold_mm=700.0) is False
 
     def test_speckle_below_min_area_ignored(self):
         z = np.full((480, 640), 0.9, np.float32)
         z[0:5, 0:5] = 0.3                                  # 25 px of near noise
         ok = np.ones_like(z, bool)
-        assert depth_below_threshold(z, ok, threshold_mm=700.0, min_px=150) is False
+        assert presence_trigger(z, ok, threshold_mm=700.0, min_px=150) is False
 
     def test_invalid_pixels_do_not_count(self):
         z = np.zeros((480, 640), np.float32)               # 0 m would read as "near"
         ok = np.zeros_like(z, bool)                        # …but nothing is valid
-        assert depth_below_threshold(z, ok, threshold_mm=700.0) is False
+        assert presence_trigger(z, ok, threshold_mm=700.0) is False
 
     def test_disabled_threshold(self):
         z = np.full((480, 640), 0.1, np.float32)
         ok = np.ones_like(z, bool)
-        assert depth_below_threshold(z, ok, threshold_mm=None) is False
-        assert depth_below_threshold(z, ok, threshold_mm=0.0) is False
+        assert presence_trigger(z, ok, threshold_mm=None) is False
+        assert presence_trigger(z, ok, threshold_mm=0.0) is False

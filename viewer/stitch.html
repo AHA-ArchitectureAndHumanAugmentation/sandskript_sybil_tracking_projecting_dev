@@ -107,6 +107,12 @@
   button:hover { background: #2c3038; }
   button:disabled { opacity: .4; cursor: default; }
   #btn-save { border-color: #2f6f4f; color: #8fe0b4; }
+  /* Unsaved work is worth shouting about here: the main app reads the FILE,
+     so anything not written is a layout only this window has. */
+  #btn-save.dirty { border-color: #e0a54f; color: #ffcf8a; background: #2e2418; }
+  #saved-state { font-size: 11px; line-height: 1.45; }
+  #saved-state.saved { color: #6d727c; }
+  #saved-state.dirty { color: #ffcf8a; }
   #camera-list { display: flex; flex-direction: column; gap: 4px; }
   .cam-row {
     display: flex; align-items: center; gap: 8px; padding: 6px 8px;
@@ -181,7 +187,12 @@
         <button id="btn-colour">Showing depth</button>
       </div>
       <div class="group">
+        <h2>Layout</h2>
         <button id="btn-save">Save layout</button>
+        <button id="btn-revert" disabled>Discard changes</button>
+        <!-- The main app builds its view from the SAVED file, so an unsaved
+             adjustment is a picture only this window can see. -->
+        <div id="saved-state" class="saved">Saved — this is what the app uses</div>
         <div id="msg"></div>
       </div>
       <p class="hint">Use <b>Turn</b> and <b>Move</b> until each camera sits

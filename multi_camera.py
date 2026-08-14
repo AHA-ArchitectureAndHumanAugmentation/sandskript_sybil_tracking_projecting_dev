@@ -12,9 +12,12 @@ placement workflow stays testable.
 This tool ONLY combines images. Groove detection and its parameters live in
 the main app; nothing here imports them.
 
-Deliberately separate from camera_thread.DepthCameraThread — this prototype
-must not touch the single-camera pipeline. One process per RealSense still
-applies: close the main app before running this tool.
+Deliberately separate from camera_thread.DepthCameraThread — that thread builds
+the same canvas for the pipeline (from the layout saved here), and the two must
+stay independent: this one is where a layout is SHAPED, with per-camera
+thumbnails, drag handles and no detection at all. They share only the pure
+placement math (stitcher.py) and the device layer (realsense_source.py). One
+process per RealSense still applies: close the main app before running this tool.
 """
 
 from __future__ import annotations
@@ -28,16 +31,16 @@ import cv2
 import numpy as np
 
 from config import (
-    DEPTH_WIDTH, DEPTH_HEIGHT, DEPTH_FPS,
     STITCH_AVERAGE_FRAMES, STITCH_EVERY_S, STITCH_HEIGHT_STEP_MM,
     STITCH_MAX_CAMERAS, STITCH_SYNTHETIC_CAMERAS,
 )
 from depth_extractor import colorize_depth, encode_jpeg
+import realsense_source
 from stitcher import (
-    CameraFrame, CameraPlacement, Intrinsics, StitchCalib,
+    CameraFrame, CameraPlacement, StitchCalib,
     bind_placements, common_footprint_mm, crop_mask, default_quad_mm,
-    default_row_mm, footprint_mm, quad_centre_x, requad_for_crop, rotate_frame,
-    rotate_quad, stitch, swap_quads_x, synthetic_scene,
+    default_row_mm, footprint_mm, load_calib, quad_centre_x, requad_for_crop,
+    rotate_frame, rotate_quad, stitch, swap_quads_x, synthetic_scene,
 )
 
 
@@ -53,6 +56,9 @@ class MultiCameraThread:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._calib = StitchCalib()
+        # The layout as last loaded from / written to disk. None until the
+        # cameras are bound, because that is when "what was loaded" is known.
+        self._saved: Optional[StitchCalib] = None
         self._serials: list[str] = []
         # Per-camera measurements refreshed every cycle, because the server
         # thread edits placements between cycles and needs them: the rotated
@@ -89,10 +95,40 @@ class MultiCameraThread:
     # ── setters (atomic swaps, same pattern as DepthCameraThread) ────────────
     def set_calib(self, calib: StitchCalib) -> None:
         self._calib = calib
+        self._saved = None          # re-snapshot once it is bound to the cameras
         self._publish_calib()
 
     def get_calib(self) -> StitchCalib:
         return self._calib
+
+    @property
+    def dirty(self) -> bool:
+        """
+        True when the layout on screen is no longer the one on disk.
+
+        This matters more than it looks: the MAIN APP builds its combined view
+        from the saved file, so an adjustment nobody saved is a picture only
+        this tool can see. Measured against the layout as it was LOADED (after
+        binding to the cameras present), so simply opening the tool is never
+        reported as a change.
+        """
+        if self._saved is None:
+            return False
+        return self._calib.to_dict() != self._saved.to_dict()
+
+    def mark_saved(self) -> None:
+        """The current layout is now what is on disk (call after writing it)."""
+        self._saved = self._calib
+
+    def revert_calib(self) -> None:
+        """
+        Throw away every unsaved adjustment and go back to the file — the same
+        layout a restart would load, and the one the main app will use.
+        """
+        self._calib = load_calib()
+        self._saved = None
+        self._serials = []          # forces a re-bind on the next canvas
+        self._publish_calib()
 
     def set_placement(self, index: int, changes: dict) -> None:
         """
@@ -191,105 +227,49 @@ class MultiCameraThread:
 
     # ── main loop ────────────────────────────────────────────────────────────
     def _run(self) -> None:
-        pipes = self._try_start_cameras()
-        if pipes is None:
+        cameras, note = realsense_source.open_cameras(STITCH_MAX_CAMERAS)
+        if not cameras:
+            self._set_note(f"{note} — SYNTHETIC scene")
             self._run_synthetic()
         else:
+            if note:
+                self._set_note(note)
+            print(f"[stitch] {len(cameras)} camera(s) live: "
+                  + ", ".join(c.serial for c in cameras))
             try:
-                self._run_real(pipes)
+                self._run_real(cameras)
             finally:
-                for pipe, _, _, _, _ in pipes:
-                    try:
-                        pipe.stop()
-                    except Exception:
-                        pass
+                realsense_source.close(cameras)
         with self._state_lock:
             self._state["stitch_canvas_jpg"] = None
             for i in range(STITCH_MAX_CAMERAS):
                 self._state[cam_key(i)] = None
         print("[stitch] stopped")
 
-    def _try_start_cameras(self):
-        """Start every RealSense pipeline; None → caller uses synthetic mode."""
-        try:
-            import pyrealsense2 as rs
-        except ImportError:
-            self._set_note("pyrealsense2 not installed — SYNTHETIC scene")
-            return None
-        try:
-            ctx = rs.context()
-            serials = sorted(d.get_info(rs.camera_info.serial_number)
-                             for d in ctx.query_devices())
-        except Exception as exc:
-            self._set_note(f"RealSense enumeration failed ({exc}) — SYNTHETIC scene")
-            return None
-        if not serials:
-            self._set_note("no cameras found (is the main app running?) "
-                           "— SYNTHETIC scene")
-            return None
-        if len(serials) > STITCH_MAX_CAMERAS:
-            self._set_note(f"{len(serials)} cameras found — using the first "
-                           f"{STITCH_MAX_CAMERAS}")
-            serials = serials[:STITCH_MAX_CAMERAS]
-
-        pipes = []
-        for serial in serials:
-            pipe = rs.pipeline()
-            cfg = rs.config()
-            cfg.enable_device(serial)
-            cfg.enable_stream(rs.stream.depth, DEPTH_WIDTH, DEPTH_HEIGHT,
-                              rs.format.z16, DEPTH_FPS)
-            cfg.enable_stream(rs.stream.color, DEPTH_WIDTH, DEPTH_HEIGHT,
-                              rs.format.bgr8, DEPTH_FPS)
-            try:
-                profile = pipe.start(cfg)
-            except Exception as exc:
-                for p, _, _, _, _ in pipes:
-                    p.stop()
-                self._set_note(f"cannot start camera {serial} ({exc}) — SYNTHETIC scene")
-                return None
-            scale = profile.get_device().first_depth_sensor().get_depth_scale()
-            ri = (profile.get_stream(rs.stream.depth)
-                  .as_video_stream_profile().get_intrinsics())
-            intr = Intrinsics(fx=ri.fx, fy=ri.fy, cx=ri.ppx, cy=ri.ppy,
-                              width=ri.width, height=ri.height)
-            align = rs.align(rs.stream.depth)
-            pipes.append((pipe, align, scale, intr, serial))
-            print(f"[stitch] camera {serial}: fx={ri.fx:.1f} fy={ri.fy:.1f}")
-        print(f"[stitch] {len(serials)} camera(s) live")
-        return pipes
-
-    def _run_real(self, pipes) -> None:
-        buffers = [deque(maxlen=STITCH_AVERAGE_FRAMES) for _ in pipes]
-        last_rgb: list[Optional[np.ndarray]] = [None] * len(pipes)
+    def _run_real(self, cameras) -> None:
+        buffers = [deque(maxlen=STITCH_AVERAGE_FRAMES) for _ in cameras]
+        last_rgb: list[Optional[np.ndarray]] = [None] * len(cameras)
         last_stitch = 0.0
         while not self._stop_event.is_set():
             got = False
-            for i, (pipe, align, scale, _intr, _serial) in enumerate(pipes):
-                try:
-                    frames = pipe.poll_for_frames()
-                except Exception:
+            for i, camera in enumerate(cameras):
+                frame = realsense_source.poll(camera)
+                if frame is None:
                     continue
-                if not frames:
-                    continue
-                frames = align.process(frames)
-                df = frames.get_depth_frame()
-                if not df:
-                    continue
-                z = np.asarray(df.get_data(), dtype=np.float32) * scale
-                buffers[i].append((z, z > 0))
-                cf = frames.get_color_frame()
-                if cf:
-                    last_rgb[i] = np.asarray(cf.get_data())
+                z, ok, rgb = frame
+                buffers[i].append((z, ok))
+                if rgb is not None:
+                    last_rgb[i] = rgb
                 got = True
 
             now = time.monotonic()
             if (now - last_stitch) >= STITCH_EVERY_S and all(buffers):
                 last_stitch = now
                 built = []
-                for i, (_p, _a, _s, intr, serial) in enumerate(pipes):
+                for i, camera in enumerate(cameras):
                     depth, valid = _average(buffers[i])
-                    built.append(CameraFrame(depth, valid, intr, last_rgb[i], serial))
+                    built.append(CameraFrame(depth, valid, camera.intr,
+                                             last_rgb[i], camera.serial))
                 self._process(built, synthetic=False)
             if not got:
                 time.sleep(0.005)
@@ -329,6 +309,10 @@ class MultiCameraThread:
                 p = p.merged({"quad_mm": [list(c) for c in row[i]]})
             cams.append(p)
         self._calib = StitchCalib(cams=cams, mm_per_px=bound.mm_per_px)
+        # The layout as LOADED is the baseline "unchanged" state: binding to the
+        # cameras present is not an operator edit, so it must not read as one.
+        if self._saved is None:
+            self._saved = self._calib
         self._publish_calib()
 
     def _default_row(self, cams: list[CameraPlacement]):

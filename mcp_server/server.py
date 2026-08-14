@@ -82,7 +82,7 @@ async def _ws_send(send: dict) -> dict:
 # ── tools ─────────────────────────────────────────────────────────────────────
 @mcp.tool()
 async def app_status() -> dict:
-    """App/pipeline status: phase, camera streaming, robot connected, stroke count, surface, projector clients."""
+    """App/pipeline status: phase, camera streaming, camera_count + frame_size of the combined multi-camera canvas (frame_size is after view_rotation, the quarter-turn set in Developer Mode), robot connected, stroke count, surface, projector clients. reference_set decides what trigger_mm and the ignore_closer_mm detection parameter measure: height above the sand when true, absolute distance from the camera when false."""
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(APP_URL + "/status",
@@ -175,7 +175,7 @@ async def set_surface_pose(tx: float = 0.4, ty: float = 0.0, tz: float = 0.0,
 async def save_toolpath(speed_pct: float = 5.0, offset_mm: float = 0.0,
                         safety_mm: float = 50.0, blend_mm: float = 0.5,
                         max_length_mm: float | None = None) -> dict:
-    """Save the generated toolpath (JSON with per-waypoint frames, plus mask.png/skeleton.png of the detection it came from) to a timestamped folder under paths/; returns the folder path. blend_mm = corner zone radius (0-5 mm, clamped per stroke). max_length_mm = Max Total Length ceiling on the DRAWN length (0 = off); omit it to use whatever the app currently has set. Saving is REFUSED when the path is longer — generate_path reports length_mm/over_length, so check there first."""
+    """Save the generated toolpath (path.json: a flat COMPAS 'frames' list in mm for compas_rrc plus the same waypoints grouped as 'strokes' in metres; plus mask.png/skeleton.png of the detection it came from) to a timestamped folder under paths/; returns the folder path. blend_mm = corner zone radius (0-50 mm, clamped per stroke). max_length_mm = Max Total Length ceiling on the DRAWN length (0 = off); omit it to use whatever the app currently has set. Saving is REFUSED when the path is longer — generate_path reports length_mm/over_length, so check there first."""
     params = {"speed_pct": speed_pct, "offset_mm": offset_mm,
               "safety_mm": safety_mm, "blend_mm": blend_mm}
     if max_length_mm is not None:

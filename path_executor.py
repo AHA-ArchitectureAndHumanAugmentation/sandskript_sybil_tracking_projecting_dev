@@ -86,6 +86,10 @@ class PathExecutor:
         self._cancel_event.set()
         if self._robot.connected:
             self._robot.stop_motion()
+            # The arm stops here, but the executor thread only unwinds to its
+            # finally a moment later — close the valve now rather than let it
+            # keep depositing onto a stationary point.
+            self._dispenser_off()
 
     def _run(self, strokes: list[list[list[float]]]) -> None:
         with self._state_lock:
@@ -153,6 +157,7 @@ class PathExecutor:
 
         except Exception as exc:
             print(f"[executor] error during path execution: {exc}")
+            self._dispenser_off()
             with self._state_lock:
                 self._state["executing"]  = False
                 self._state["phase"]      = "error"
@@ -181,12 +186,32 @@ class PathExecutor:
         # Land exactly on the stroke start before any blending begins.
         self._robot.move_to(waypoints[0], self._draw_speed, TRAVEL_ACCEL)
 
-        if len(waypoints) > 1:
-            self._robot.move_process_path(
-                waypoints[1:], self._draw_speed, DRAW_ACCEL,
-                stroke_blend(waypoints, self._blend_m),
-                self._cancel_event,
-            )
+        # Material flows only while the tool is genuinely drawing: the valve
+        # opens once the TCP is ON the first waypoint and closes before anything
+        # retracts, so nothing is deposited during a travel move. The finally is
+        # what guarantees the second half — a cancelled or failed stroke must
+        # not leave it running over the sand.
+        self._robot.set_dispenser(True)
+        try:
+            if len(waypoints) > 1:
+                self._robot.move_process_path(
+                    waypoints[1:], self._draw_speed, DRAW_ACCEL,
+                    stroke_blend(waypoints, self._blend_m),
+                    self._cancel_event,
+                )
+        finally:
+            self._dispenser_off()
+
+    def _dispenser_off(self) -> None:
+        """
+        Close the dispenser, swallowing failures. This runs on the cancel and
+        error paths, where raising would replace the real problem with a
+        follow-on one — and where the link may already be gone.
+        """
+        try:
+            self._robot.set_dispenser(False)
+        except Exception:
+            pass
 
     def _update_progress(self, done: int, total: int) -> None:
         if total <= 0:

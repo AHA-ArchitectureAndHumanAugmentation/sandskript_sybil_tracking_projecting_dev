@@ -223,6 +223,75 @@ class TestMoveSequence:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Material dispenser
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dispenser_log(robot):
+    """
+    Record the order of dispenser switches against the moves around them.
+    Returns a list like ["move", "on", "path", "off", "move"].
+    """
+    events = []
+    robot.move_to.side_effect = lambda *a, **k: events.append("move")
+    robot.move_process_path.side_effect = lambda *a, **k: events.append("path")
+    robot.set_dispenser.side_effect = (
+        lambda on: events.append("on" if on else "off"))
+    return events
+
+
+class TestDispenser:
+
+    def test_opens_only_after_landing_and_closes_before_the_retract(self, one_stroke):
+        # Material must never come out during a travel move: the valve opens
+        # after the third move_to (lift, travel, land) and closes before the
+        # final pen-up.
+        ex, robot, state, strokes = one_stroke
+        events = _dispenser_log(robot)
+        ex.start(strokes)
+        _wait_done(ex)
+        assert events == ["move", "move", "move", "on", "path", "off", "move"]
+
+    def test_one_open_close_pair_per_stroke(self, mock_robot, shared_state_and_lock):
+        state, lock = shared_state_and_lock
+        events = _dispenser_log(mock_robot)
+        ex = PathExecutor(mock_robot, state, lock)
+        ex.start([_make_stroke(2), _make_stroke(2, x_start=0.3)])
+        _wait_done(ex)
+        assert events.count("on") == 2
+        assert events.count("off") == 2
+
+    def test_a_failed_stroke_still_closes_the_valve(self, mock_robot, shared_state_and_lock):
+        state, lock = shared_state_and_lock
+        events = _dispenser_log(mock_robot)
+        mock_robot.move_process_path.side_effect = RuntimeError("bridge gone")
+        ex = PathExecutor(mock_robot, state, lock)
+        ex.start([_make_stroke(2)])
+        _wait_done(ex)
+        assert state["phase"] == "error"
+        assert events[-1] == "off"
+
+    def test_cancel_closes_the_valve(self, mock_robot, shared_state_and_lock):
+        state, lock = shared_state_and_lock
+        ex = PathExecutor(mock_robot, state, lock)
+        ex.start([_make_stroke(3)])
+        ex.cancel()
+        _wait_done(ex, timeout=2.0)
+        assert mock_robot.set_dispenser.call_args_list[-1][0][0] is False
+
+    def test_a_failing_close_does_not_mask_the_real_error(self, mock_robot,
+                                                          shared_state_and_lock):
+        # Closing runs on the error path, where the link may already be gone.
+        state, lock = shared_state_and_lock
+        mock_robot.set_dispenser.side_effect = (
+            lambda on: (_ for _ in ()).throw(RuntimeError("link gone"))
+            if not on else None)
+        ex = PathExecutor(mock_robot, state, lock)
+        ex.start([_make_stroke(2)])
+        _wait_done(ex)
+        assert state["phase"] == "done"      # the close failure is swallowed
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # State transitions
 # ─────────────────────────────────────────────────────────────────────────────
 

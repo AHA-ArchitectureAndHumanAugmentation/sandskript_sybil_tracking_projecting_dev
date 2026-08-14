@@ -126,7 +126,8 @@ main {
    depth-numbers reference window from the Depth viewport. */
 #btn-project,
 #btn-project-cal,
-#btn-depth-numbers {
+#btn-depth-numbers,
+#btn-rotate-view {
   position: absolute;
   top: 6px;
   z-index: 11;
@@ -142,8 +143,15 @@ main {
 #btn-project { right: 6px; }
 #btn-project-cal { right: 84px; }
 #btn-depth-numbers { right: 6px; }
-#btn-project:hover, #btn-project-cal:hover, #btn-depth-numbers:hover { background: #2a2a2a; color: #fff; }
-#btn-project.active, #btn-project-cal.active, #btn-depth-numbers.active { border-color: #00e5a0; color: #00e5a0; }
+/* Stacked UNDER the Participant Mode button rather than beside it: that button's
+   width is text, and a right-offset guessed from it would break the moment the
+   label changed. */
+#btn-rotate-view { right: 6px; top: 32px; }
+#btn-project:hover, #btn-project-cal:hover, #btn-depth-numbers:hover,
+#btn-rotate-view:hover { background: #2a2a2a; color: #fff; }
+#btn-project.active, #btn-project-cal.active, #btn-depth-numbers.active,
+#btn-rotate-view.active { border-color: #00e5a0; color: #00e5a0; }
+#btn-rotate-view:disabled { opacity: 0.45; cursor: default; }
 
 #panel-3d {
   grid-column: 3;
@@ -212,15 +220,32 @@ main {
 }
 #path-toggle.hidden { display: none; }
 
-/* Execution settings bar (always visible) + path-order legend above it. */
-#exec-bar,
-#path-legend {
+/* Execution settings bar (always visible) + path-order legend above it, as one
+   bottom-left stack. */
+#preview-controls {
   position: absolute;
-  left: 8px;
+  left: 8px; right: 8px; bottom: 38px;
   z-index: 10;
   display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+/* While the Detection Parameters overlay is open it covers the right 270px of
+   the preview at a higher z-index, so the stack pulls in to stay clear —
+   otherwise its lower half swallows the bar's right-hand controls. The rows
+   wrap instead of disappearing. #edit-panel precedes #panel-3d in <main>, and
+   a popped-out preview is in another document, where this cannot match — which
+   is exactly right, since the overlay stays behind in the main window. */
+#edit-panel:not(.hidden) ~ #panel-3d #preview-controls { right: 290px; }
+#exec-bar,
+#path-legend {
+  display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
+  row-gap: 5px;
+  max-width: 100%;
   padding: 4px 8px;
   background: #161616dd;
   border: 1px solid #2a2a2a;
@@ -228,11 +253,27 @@ main {
   font-size: 10px;
   color: #bbb;
 }
-#exec-bar    { bottom: 38px; }
-#path-legend { bottom: 68px; }
 #path-legend.hidden { display: none; }
 
-#exec-speed { width: 90px; }
+/* One control = label + input (+ unit), kept together when a row wraps. */
+.exec-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+#exec-bar { gap: 7px; padding: 4px 6px; }
+/* Forces the break between the two rows regardless of window width. */
+.exec-break { flex-basis: 100%; height: 0; margin: 0; }
+.exec-row-label {
+  color: #666;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  min-width: 26px;
+}
+
+#exec-spacing, #exec-blend { width: 72px; }
+#exec-speed { width: 72px; }
 #exec-speed-val { min-width: 30px; color: #ddd; }
 /* Drawn length readout beside the Max Total Length box. Turns red when the
    path is over the limit — the same answer Run and Save will give. */

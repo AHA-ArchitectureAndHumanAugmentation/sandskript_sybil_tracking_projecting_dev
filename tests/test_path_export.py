@@ -143,6 +143,60 @@ class TestJson:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# COMPAS frames — the form a compas_rrc script reads
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCompasFrames:
+
+    def test_frames_are_flat_and_typed(self):
+        j = build_json(STROKES, {})
+        assert len(j["frames"]) == 5           # 2 + 3 waypoints, one flat list
+        f = j["frames"][0]
+        assert f["dtype"] == "compas.geometry/Frame"
+        assert set(f["data"]) == {"point", "xaxis", "yaxis"}
+        assert isinstance(f["guid"], str) and len(f["guid"]) == 36
+
+    def test_frame_points_are_millimetres(self):
+        j = build_json(STROKES, {})
+        assert j["frames"][0]["data"]["point"] == [400.0, 0.0, 200.0]
+        # ...while strokes stay in metres, so both views describe one waypoint.
+        assert j["strokes"][0][0]["pose"][:3] == [0.4, 0.0, 0.2]
+
+    def test_frame_axes_match_the_live_run(self):
+        # Same construction as robot_controller.pose_to_frame: x/y from the
+        # rotation matrix, z left for compas to derive as x × y.
+        j = build_json(STROKES, {})
+        d = j["frames"][0]["data"]
+        x, y = np.array(d["xaxis"]), np.array(d["yaxis"])
+        assert abs(np.dot(x, y)) < 1e-6
+        assert np.allclose(np.cross(x, y), [0, 0, -1], atol=1e-6)   # tool-down
+
+    def test_stroke_starts_index_into_frames(self):
+        j = build_json(STROKES, {})
+        assert j["stroke_starts"] == [0, 2]
+        first_of_second = j["frames"][j["stroke_starts"][1]]["data"]["point"]
+        assert first_of_second == [400.0, 100.0, 200.0]
+
+    def test_work_object_is_the_identity_one(self):
+        j = build_json(STROKES, {})
+        assert j["wobj_origin"]["dtype"] == "compas.geometry/Point"
+        assert j["wobj_origin"]["data"] == [0.0, 0.0, 0.0]
+        assert j["wobj_xaxis"]["data"][1:] == [0.0, 0.0]   # along +X
+        assert j["wobj_yaxis"]["data"][0] == 0.0           # along +Y
+        assert j["wobj_yaxis"]["data"][1] > 0.0
+
+    def test_guids_are_unique(self):
+        j = build_json(STROKES, {})
+        guids = [f["guid"] for f in j["frames"]]
+        assert len(set(guids)) == len(guids)
+
+    def test_empty_path_still_has_the_keys(self):
+        j = build_json([], {})
+        assert j["frames"] == [] and j["stroke_starts"] == []
+        assert j["wobj_origin"]["data"] == [0.0, 0.0, 0.0]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Offset + bundle
 # ─────────────────────────────────────────────────────────────────────────────
 

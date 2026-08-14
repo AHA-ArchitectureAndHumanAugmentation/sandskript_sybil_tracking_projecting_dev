@@ -8,14 +8,17 @@ messages, params or reply fields break them; update tools + `mcp_server/README.m
 to match; (3) update README.md user docs. Do this in the same commit as the change.
 
 ## What this is
-depth-cam-to-robot: a browser-controlled pipeline that watches a sandbox with an
-Intel RealSense **D435i** depth camera, detects hand-raked grooves (mm-deep — raw
+depth-cam-to-robot: a browser-controlled pipeline that watches a sandbox with
+one or more Intel RealSense **D435i** depth cameras — combined into ONE canvas
+by the layout saved in Multi-Cam Vision, which is what every view in both modes
+shows — detects hand-raked grooves (mm-deep — raw
 metric depth, no RGB vision), converts them to strokes, projects them onto a
 Rhino-authored 3D target surface, and has an **ABB GoFa 10** (compas_rrc) retrace them with
 the TCP perpendicular to the surface. Artistic context: gestures in sand guide a
 robot depositing a living seeded substrate — the code's job ends at toolpath
 execution/export. Includes a projector subsystem that shines the detected mask
-back onto the sand, and a Save feature exporting JSON toolpaths.
+back onto the sand — and plays the participant sound cues through the
+projector's speaker — and a Save feature exporting JSON toolpaths.
 Two modes: **Developer Mode** (`/`, all manual controls) and **Participant
 Mode** (the ⧉ popup on the Depth viewport, `/depths`): an Auto toggle + depth
 trigger run the whole pipeline automatically and lock the manual buttons —
@@ -37,14 +40,22 @@ robot moves.
   Never bare `pip` (broken launcher risk — use `<ENVPY> -m pip`). The Intel
   RealSense USB driver is an OS-level install, outside the env. The old
   `.venv` is retired.
-- Unit tests: `<ENVPY> -m pytest -q -m "not integration"` (444, no
+- Unit tests: `<ENVPY> -m pytest -q -m "not integration"` (611, no
   hardware). Integration: `-m integration`, needs RealSense/robot + TEST_ROBOT_IP.
 - No CLI modes. Hardware vs no-robot is in the UI: "Test Mode (no robot)" button
   unlocks capture with a synthetic workspace; Run stays gated on a robot connection.
 - Robot bring-up: the GoFa link is NOT a direct socket. compas_rrc talks to a
   **ROS bridge** which talks to the **RRC RAPID task** on the controller, so
   three things must be up: (1) the RRC task loaded and running on the pendant,
-  controller in Auto; (2) the bridge — `docker compose up`, see README; (3) the
+  controller in Auto; (2) the bridge — `docker compose up` in **`docker/`**,
+  which is OUR committed `docker-compose.yml` (see README), not one cloned from
+  the compas_rrc repo: the driver image is pinned to `v1.1.2` so an upstream
+  release cannot change what the installation runs, and rosbridge is launched
+  with `unregister_timeout:=28800` (8 h) because the ~10 s default drops a quiet
+  connection — the normal state of an installation waiting between visitors.
+  `robot_ip` in that file is the ONE place the robot's own address is entered;
+  `namespace:=rob1` must match `RRC_NAMESPACE` (a test asserts both, plus the
+  port, against config.py); (3) the
   app, where the "IP" you enter is the machine running the BRIDGE (normally
   127.0.0.1), not the robot. Set TCP + payload on the pendant first.
   `RobotController.connect` sends a `Noop` as part of connecting: a live
@@ -52,20 +63,60 @@ robot moves.
   mid-stroke is worse.
 
 ## Pipeline (stage → owner → I/O)
-1. **Capture** `camera_thread.DepthCameraThread` — RealSense depth+RGB 640×480@30,
-   colour aligned to depth. Rolling buffer; `capture_frame()` → (depth_m float32
-   HxW, valid bool, rgb BGR|None), temporally averaged (~30 frames ≈1 s, noise ↓√N).
-   Live JPEGs into shared_state keys (`last_depth_color_jpg` etc.).
+1. **Capture** `camera_thread.DepthCameraThread` — **every** RealSense on the rig
+   (`realsense_source.open_cameras`, enumerated by serial), depth+RGB 640×480@30
+   each, colour aligned to depth, laid onto ONE **combined canvas** by
+   `stitcher.stitch` using the layout saved by Multi-Cam Vision
+   (`stitcher.load_calib` → stitch_calibration.json, bound by serial,
+   `with_default_row` for anything unplaced). That canvas — NOT one camera's
+   frame — is what the whole pipeline sees: crop, reference, still and trigger
+   are all in canvas pixels, and it is not 640×480.
+   On top of that canvas sits the **view rotation** (`view_rotation.py`,
+   Developer Mode's ⟳ button on the Depth viewport): a quarter turn of the
+   FINISHED canvas, applied at the single seam where it leaves the camera
+   thread (`_publish` + `capture_frame`), so every view, the projector mask,
+   the depth labels, the Participant popup, the captured still and therefore
+   the path all turn together and none of them knows about it. `np.rot90`, so
+   the picture is re-indexed and never resampled. It is NOT the per-camera
+   `rot_deg` in Multi-Cam Vision (that is a mounting angle baked in before
+   stitching); this turns the whole picture, live, without touching the layout
+   file. Persisted in settings.json (`view_rotation`) — it describes the rig.
+   Per-camera rolling buffers at the full frame rate; `capture_frame()` averages
+   EACH camera (~30 frames ≈1 s, noise ↓√N) and stitches the averages —
+   averaging before the warp, not after. Live JPEGs into shared_state keys
+   (`last_depth_color_jpg` etc.) rebuilt every STITCH_MAIN_EVERY_S (~5 Hz), not
+   per frame — warping several frames onto a big canvas 30×/s buys nothing on
+   static sand. The canvas geometry is FROZEN (`stitcher.CanvasGrid`) once every
+   camera has delivered its first frame and never changes again; `frame_size` /
+   `camera_count` are published to shared_state (and `/status`).
 2. **Groove detection** `depth_extractor` — `grooves_and_mask(depth, valid, params,
    reference, mm_per_px)`: gap-fill → denoise → detrend (subtract blurred surface)
    → threshold (valley/ridge/band, mm relief) → morph close/min-blob →
-   near-object rejection (`ignore_closer_mm` > 0: mask blobs touching anything
-   ABSOLUTELY closer to the camera than that — a hand/body over the sand —
-   dilated by GROOVE_NEAR_MARGIN_PX, are dropped; keeps the live projection off
-   objects; UI = the "Ignore closer than (mm)" number box overlaid on the Mask
-   viewport, always visible) → per-stroke filters
+   near-object rejection (`ignore_closer_mm` > 0: mask blobs touching a
+   hand/body over the sand, dilated by GROOVE_NEAR_MARGIN_PX, are dropped;
+   keeps the live projection off objects. WITH a reference the cutoff is a
+   HEIGHT ABOVE THE SAND (`surface_height_mm`), without one an absolute camera
+   distance — see stage 2b; UI = the number box overlaid on the Mask viewport,
+   always visible, relabelled "Ignore above sand" / "Ignore closer than" by
+   `showReferenceMode`) → per-stroke filters
    (reference subtraction, min mean depth, min/max width, min length) →
    (thick mask, 1-px skeleton). `process_depth` adds crop; coords stay full-frame.
+2b. **Height above the sand** `depth_extractor.surface_height_mm(depth, valid,
+   reference)` → `(height_mm, ok)` or None. `(reference − depth)·1000`: positive
+   = nearer the camera than the baseline (a hand), negative = a groove, ~0 =
+   untouched sand. This is the ONE place the camera's mounting angle is
+   cancelled, and three things read it — the Participant trigger
+   (`presence_trigger`), the popup's depth labels (`depth_region_labels`) and
+   near-object rejection. A TILTED camera makes distance-from-camera useless:
+   the sand alone spans more depth than a hand's clearance above it, so no
+   absolute cutoff separates them. The reference frame CONTAINS the tilt, so
+   subtracting it removes the gradient per pixel and one number means the same
+   thing everywhere in the box. It must be per-pixel: rescaling the depth axis
+   as a whole (however the range is compressed) scales the sand's spread and
+   the hand's clearance by the same factor, leaves their ratio alone, and
+   therefore changes no threshold test at all. None (no reference, or a shape
+   that no longer matches after a view rotation) = every caller falls back to
+   absolute — worse on a tilt, never broken.
 3. **Stroke extraction** `path_extractor.extract_from_edges` — 8-conn chain follow
    → Chaikin smooth → **endpoint join** (`join_strokes`, `join_mm` = exec-bar
    "Distance Threshold" box 0–200 mm, default JOIN_DISTANCE_MM=0 = off) →
@@ -110,10 +161,16 @@ robot moves.
    already implemented for a future multi-point UI; corners = mesh vertices
    nearest the bbox corners, shipped in `mesh_payload()["corners"]`, same
    indices browser + server). No camera↔robot calibration exists. Planar fallback:
-   `path_extractor.pixels_to_robot_coords` + `workspace.WorkspaceConfig` (Test Mode).
+   `path_extractor.pixels_to_robot_coords` + `workspace.WorkspaceConfig` (Test Mode;
+   `simulation(frame_aspect)` takes the canvas aspect so a wide rig is not squashed
+   into one camera's 4:3).
    The mm→px scale for all mm-based filters/spacings = `workspace.scene_mm_per_px`:
    surface first, workspace fallback — SAME precedence as stroke mapping, so a mm
    in the UI is a mm on whatever the strokes land on (Test Mode + surface included).
+   It takes `frame_size` — the COMBINED canvas, via `main._frame_size()` (captured
+   still first, else the live canvas) — because that is the frame stroke mapping
+   fits onto the target. Passing a single camera's 640×480 would misreport every
+   mm by the ratio of canvas width to 640.
 5. **Reach check** `reach.reach_flags` — envelope only (1.62 m sphere − 0.18 m axis
    cylinder). No IK/joint-limit/collision model. Red segments in preview.
 5b. **Length limit** `path_length.blended_length` — how far the tool travels
@@ -135,8 +192,10 @@ robot moves.
 6. **Execution** `path_executor.PathExecutor` — per stroke: retract along tool axis
    (Safety mm) → linear travel → land exactly on the first waypoint → one
    **zone-blended run** of linear moves through the rest (zone = exec-bar Radius
-   slider 0–5 mm, default BLEND_ZONE_M=0.5 mm, clamped per stroke by
-   `path_export.stroke_blend` to 45% of the shortest segment). The whole stroke
+   slider 0–BLEND_ZONE_MAX_MM = 50 mm, default BLEND_ZONE_M=0.5 mm, clamped per
+   stroke by `path_export.stroke_blend` to 45% of the shortest segment — so a
+   radius past what the Spacing allows is not an error, it just rounds as much
+   as the segment has room for). The whole stroke
    is queued at once and ONLY the last move asks for feedback — waiting per
    waypoint would stop the arm on each point and defeat the blending the zone
    data exists to produce; the wait happens outside the lock so cancel stays
@@ -144,14 +203,23 @@ robot moves.
    the GoFa 10's rated tool speed — note every Speed percentage is relative
    to it, so a pre-port bundle saved at "50%" now replays twice as fast);
    run-time normal offset baked into waypoints.
+   **Material dispenser**: `robot.set_dispenser(True/False)` wraps the blended
+   run in `_draw_stroke` — opened once the TCP is ON the first waypoint, closed
+   in a `finally` before anything retracts, so nothing is deposited during a
+   travel move and a cancel/error/disconnect closes it. Config-only
+   (`DISPENSER_ENABLED` False until the valve is wired + named in the
+   controller's I/O); disabled means not one instruction is sent. No UI, no MCP.
    `robot_controller` = thread-safe compas_rrc wrapper, and the ONE place the
    unit seam lives: everything above it is metres + axis-angle rotation vector,
-   RAPID wants mm + a frame (`pose_to_frame`/`frame_to_pose`).
+   RAPID wants mm + a frame (`pose_to_frame`/`frame_to_pose`). It is also where
+   **acceleration** is set (`rrc.SetAcceleration`, in `connect`): RAPID AccSet
+   is a controller-wide PERCENTAGE, not a per-move m/s², so `DRAW_ACCEL` /
+   `TRAVEL_ACCEL` never reach the arm and `RRC_ACCEL_PCT`/`RRC_ACCEL_RAMP_PCT`
+   (default 100 = the controller's own default) do.
 7. **Export** `path_export.save_bundle` → `paths/<YYYY-MM-DD_HH-MM-SS>/` with
    `path.script` (URScript movel/movep — a readable RECORD of the same
-   poses, NOT what the GoFa runs and never parsed back), `path.json` (poses
-   + per-waypoint plane:
-   origin + orthonormal x/y/z axes, z = approach), `preview.png`, plus the
+   poses, NOT what the GoFa runs and never parsed back), `path.json` (see
+   below), `preview.png`, plus the
    detection stage that produced the path: `mask.png` (thick region) and
    `skeleton.png` (1-px centrelines), both the CROPPED uint8 arrays stashed by
    `on_generate_path` as `last_mask`/`last_skeleton` — replaced in lockstep with
@@ -169,7 +237,25 @@ robot moves.
    (prefix + real base64 + PNG signature + PREVIEW_MAX_BYTES), since this is a
    client-supplied blob. No Developer window open → no preview.png, never a
    failed save.
-8. **Server/UI** `server.py` (aiohttp) + `viewer/` — MJPEG: /depth /rgb
+7b. **path.json** (`path_export.build_json`) carries the SAME waypoints twice,
+   because two different readers want them:
+   `frames` = a FLAT list of serialized COMPAS `Frame`s (`dtype`
+   `compas.geometry/Frame`, point in **mm**, xaxis+yaxis — compas derives
+   z = x×y = the approach) plus an identity work object as three
+   `compas.geometry/Point`s (`wobj_origin`/`wobj_xaxis`/`wobj_yaxis`, axis
+   points WOBJ_AXIS_MM out; identity because the poses are already base-frame,
+   the same `wobj0` a live run uses). That is exactly what `compas.json_load`
+   decodes and what a compas_rrc script consumes, so a saved bundle can be run
+   from a plain RRC script with no conversion. Frames are built the SAME way as
+   `robot_controller.pose_to_frame`, so the file and the live run agree.
+   `strokes` = the same waypoints GROUPED per stroke, poses in metres + the
+   per-waypoint plane (origin + orthonormal x/y/z) — this is what
+   `toolpath_loader` reads and the replay tool executes. `stroke_starts` indexes
+   `frames` at each stroke's first waypoint, since the flat list alone cannot
+   say where one gesture ends and the next begins. Plus `meta` (run params) and
+   `units`.
+8. **Server/UI** `server.py` (aiohttp) + `viewer/` — /sounds/*.wav (cue audio,
+   see stage 10c); MJPEG: /depth /rgb
    /depth/grooves /depth/mask /depth/mask/full /depth/cropped (colorized depth
    restricted to the Developer-Mode crop; composed only while a /depths popup
    is connected); WS /ws (JSON); POST /surface/upload (ADDS a part to the scene
@@ -177,11 +263,17 @@ robot moves.
    time, since each upload is a read-modify-write of the scene, serialized
    server-side by `main._surface_lock`);
    GET /status (compact state JSON for tools; `surface` = scene name,
-   `surface_count` = parts loaded); GET/POST /presets + GET
-   /presets/{name} (Detection-Parameter slider presets; saved as
-   `presets/<date_time>.json` but ANY .json in the folder loads — the GET
-   guard (`_safe_preset_path`) allows custom-renamed files, rejecting only
-   traversal via resolved-path containment; gitignored; browser-only, not
+   `surface_count` = parts loaded, `camera_count` + `frame_size` = the combined
+   canvas the crop is relative to, `view_rotation` = the quarter turn already
+   applied to it); GET/POST /presets + GET
+   /presets/{name} (Detection-Parameter presets — the sliders as flat keys
+   PLUS the whole Path Preview bar under an **`exec`** key
+   {spacing_mm,join_mm,blend_mm,speed_pct,offset_mm,safety_mm,max_length_mm},
+   so a preset restores what the settings DRAW and not just how they detect;
+   saved as `presets/<date_time>.json` but ANY .json in the folder loads — the
+   GET guard (`_safe_preset_path`) allows custom-renamed files, rejecting only
+   traversal via resolved-path containment; the server is schema-free here, it
+   persists what the browser posted verbatim; gitignored; browser-only, not
    exposed to MCP tools); /projection (+?cal);
    /depths (the Participant Mode popup: the CROPPED live depth view — the
    /depth/cropped stream, same region as the skeleton/mask views — with
@@ -193,14 +285,20 @@ robot moves.
    corner-pin homography; depth_view.html + depth_overlay.js = the popup.
 9. **Projector** — full-frame mask composed ONLY while a projection window is
    connected (`projection_clients`); corners persist in settings.json; Capture
-   auto-blanks projector and waits for buffer refill before averaging.
+   auto-blanks projector and waits for buffer refill before averaging. The
+   projection page is also the audio output — see stage 10c.
 10. **Participant Mode** `automation.ParticipantAutomation` (pure state machine)
     + `_participant_loop`/`_participant_pipeline` in main.py. Lives in the
     /depths popup: an **Auto toggle** (`set_automation{on}`) + a trigger
-    distance (mm, `set_trigger`); camera thread flags frames with
-    ≥TRIGGER_MIN_AREA_PX valid px closer than the trigger (`trigger_below`,
-    `depth_extractor.depth_below_threshold`) — evaluated on the CROPPED
-    region only, so motion outside the popup's visible area never triggers. Auto ON → **Auto On**; anything
+    threshold (mm, `set_trigger`, clamped TRIGGER_MIN_MM…TRIGGER_MAX_MM); camera
+    thread flags frames with ≥TRIGGER_MIN_AREA_PX valid px past the trigger
+    (`trigger_below`, `depth_extractor.presence_trigger`) — evaluated on the
+    CROPPED region only, so motion outside the popup's visible area never
+    triggers. The threshold is a HEIGHT ABOVE THE SAND when a reference is set
+    and an absolute camera distance when not (stage 2b); the popup relabels the
+    box and the overlay numbers from `state.reference_set` /
+    `depth_labels.relative`, because the two modes want values an order of
+    magnitude apart. Auto ON → **Auto On**; anything
     below trigger → **Alerted**; frame clear for PARTICIPANT_CLEAR_S →
     **Sensing** (waits buffer refill, then capture) → **Generating Paths**
     (current Dev-Mode crop/adjustments/spacing/join) → **profanity guard**
@@ -230,6 +328,25 @@ robot moves.
     PARTICIPANT_WARN_S seconds (`warn_s` travels with the state, so the CSS and
     the config can't drift apart). The browser never runs its own timer: one
     clock shows and judges.
+10c. **Sound cues** `sound_design` + `viewer/projection.html` — four synthesized
+    .wav cues marking the participant-facing moments, played through the
+    PROJECTOR's speaker. `sound_design.py` composes them from numpy (no
+    recordings, no audio dependency) and is run by hand to render
+    `sounds/*.wav`, which are COMMITTED — the app never imports the module.
+    Mapping = `config.SOUND_CUES` (status → file stem): Alerted→`engaged`
+    (rising A major triad = invitation), Sensing→`acknowledged` (the same notes
+    falling to the root, held + pulsed = received, still working),
+    Actuating→`anticipation` (accelerating pentatonic rise over a swell),
+    Invalid→`alarm` (tritone sawtooth klaxon, loudest by design). Generating
+    Paths is deliberately silent. Serving = `add_static(SOUNDS_URL_PATH)`, the
+    ONE static route that is not no-cache. The map is shipped in `init` as
+    `sounds{path,cues}` so the page holds no copy of it. Playback lives in
+    projection.html: Web Audio, all cues decoded at init, fired on status ENTRY
+    (`lastStatus` seeded from `init.participant` so opening the window mid-cycle
+    is silent), OUTPUT window only (`!IS_CAL`), `M` mutes, and a badge asks for
+    the one click browsers require before audio may start. No projection window
+    → no sound, by design. NOT wired into Developer Mode or the /depths popup,
+    and not exposed to MCP.
 11. **Profanity guard** `text_guard` — Participant Mode ONLY. Between Generating
     Paths and Actuating, OCRs the groove MASK (`shared_state["last_mask"]`,
     stashed by `on_generate_path`) and, on a wordlist hit, calls
@@ -252,20 +369,35 @@ robot moves.
     runs. Deliberately NOT wired into Developer Mode (the operator decides) and
     NOT exposed to MCP.
 
-## Contained prototype: Multi-Cam Vision (NOT part of the two modes)
+## Multi-Cam Vision: the placement tool (its own app; its OUTPUT feeds both modes)
 `run_stitch.bat` → `stitch_main.py` → http://localhost:5006. Lays HOWEVER MANY
 D435i depth feeds are plugged in (1 … STITCH_MAX_CAMERAS = 4, enumerated by
-serial) onto ONE top-down canvas covering a larger sand area. It ONLY combines
-images: no overlap search (the cameras are bolted down), no groove detection
-and no detection parameters (those live in the main app). ONE screen, always
+serial) onto ONE top-down canvas covering a larger sand area. The TOOL is
+standalone (separate process, separate port, no main-app import), but the
+LAYOUT it saves is now the main app's camera: `camera_thread` reads the same
+`stitch_calibration.json` and builds the same canvas for the pipeline. This is
+where the picture the robot draws from gets shaped.
+It ONLY combines images: no overlap search (the cameras are bolted down), no
+groove detection and no detection parameters (those live in the main app).
+ONE screen, always
 live, split by a drag bar into RESULT on top (the combined canvas, look-only,
 `pointer-events:none`; only the selected camera's footprint is outlined so you
 can tell the pictures apart) and WORKBENCH underneath (one panel per camera —
 every edit happens here). Splitter height persists in localStorage.
 Sidebar per camera: **Turn** (⟲ ⟳ quarter turns), **Move** (◀ ▶ = swap places
 with the neighbour to that side), Height (▼ ▲), Reset corners / Reset camera,
-depth-vs-colour, Save layout. Turn + Move are how the row is made to match the
-physical rig BEFORE any fine dragging.
+depth-vs-colour, Save layout / **Discard changes**. Turn + Move are how the row
+is made to match the physical rig BEFORE any fine dragging.
+**Saved vs adjusted** (`MultiCameraThread.dirty` / `mark_saved` / `revert_calib`,
+shipped as `dirty` in init+state): the main app builds its view from the FILE,
+so an unsaved adjustment is a picture only this window has — the Save button
+goes amber and the line under it reads "Adjusted — not saved. The app still
+uses the layout in stitch_calibration.json." Nothing but an explicit Save writes,
+so reopening always comes back to the last save; Discard changes (arms on the
+first click, fires on the second) reloads the file without a restart. The
+baseline for "dirty" is the layout AS LOADED — i.e. after `bind_placements`
+matched it to the cameras present — so merely opening the tool never reads as
+an edit, while a rig that no longer matches the file (a camera unplugged) does.
 Per panel: green numbered handles 1-4 on the corners shape where that camera
 lands, dragging inside the green outline moves it, blue EDGE bars trim the
 picture (edges not corners, so the two never fight for the same hit area).
@@ -315,14 +447,19 @@ overlap outlined, `/cam/{index}` = one workbench panel per camera carrying the
 crop rectangle; WS in: set_camera{index,…}, rotate_camera{index,steps},
 move_camera{index,steps} (±1 = one place left/right in the row),
 nudge_height{index,steps}, reset_camera{index,corners_only},
-set_grid{mm_per_px}, set_colour{on}, save_calib → `stitch_calibration.json`,
-gitignored; out: init/state carry `calib{cams[],mm_per_px}` and
+set_grid{mm_per_px}, set_colour{on}, save_calib → `stitch_calibration.json`
+(gitignored) + `mark_saved`, revert_calib (reload the file, drop unsaved edits);
+out: init/state carry `calib{cams[],mm_per_px}`, `dirty` (init also
+`calib_file`) and
 `info.cameras[].quad_px` = each placed quad in canvas pixels, which the browser
 uses ONLY to outline the selected camera in the result view — the workbench
 handles are driven by `calib.cams[].quad_mm`, not by `quad_px`).
-Deliberately NOT wired into Developer/Participant Mode or the MCP tools; no
-main-app API change. Cannot run while the main app runs (one process per
-RealSense). Never import `main` or `camera_thread` from these modules.
+The tool's UI is NOT wired into Developer/Participant Mode or the MCP tools —
+the coupling is one file, `stitch_calibration.json`, read at camera-thread
+start-up. Cannot run while the main app runs (one process per RealSense).
+Never import `main` or `camera_thread` from these modules; the shared code goes
+the other way (both import `stitcher` for the placement math and
+`realsense_source` for the devices).
 
 ## Contained tool: toolpath replay (NOT part of the two modes)
 `run_replay.bat` → `replay_main.py` → http://localhost:5007. Connect the robot,
@@ -381,8 +518,12 @@ in no `main`/`camera_thread`/`robot_controller`).
 ## Conventions
 - Pose = `[x, y, z, rx, ry, rz]`: metres + UR rotation vector (rad), robot base
   frame. Tool approach = tool-frame +Z; outward surface normal = −(R@[0,0,1]).
-- Pixels 640×480, v grows down (flipped to world/robot Y-up). Crops normalized
-  [0,1]; stroke coords always shifted back to full frame before mapping.
+- Pixels = the COMBINED canvas (640×480 only for a one-camera rig at 1:1 — never
+  assume it), v grows down (flipped to world/robot Y-up). Crops normalized [0,1],
+  so they survive any canvas size; stroke coords always shifted back to full
+  frame before mapping. Anything needing the real size takes it from
+  `shared_state["frame_size"]` / `still_dims` / `camera_thread.frame_size`, never
+  from DEPTH_WIDTH/DEPTH_HEIGHT — those two now describe ONE camera's stream.
 - Mesh files + UI depth params in mm; everything robot-side in m.
 - Console output goes through `module_trace.log(action, msg, extra=())`, which
   prints the task line then `  └ a.py → b.py` naming the modules that served it;
@@ -392,9 +533,14 @@ in no `main`/`camera_thread`/`robot_controller`).
   process-lifecycle lines stay bare `print()`. Flags: SHOW_MODULE_BANNER /
   SHOW_MODULE_TRACE.
 - `config.py` = every constant. `settings.json` = last robot IP + projector
-  corners. `environment.yml` = the committed conda-env recipe (env = `sandskript`;
+  corners + `view_rotation` (the canvas quarter turn; read once at start-up,
+  before the camera thread starts, so the first frame is already turned). `docker/docker-compose.yml` = the committed ROS bridge (pinned
+  driver image, 8 h rosbridge timeout, `robot_ip`).
+  `environment.yml` = the committed conda-env recipe (env = `sandskript`;
   pulls `tesseract` + `libcurl` from conda-forge for the profanity guard).
   `wordlists/*.txt` = profanity seed lists (committed, not gitignored).
+  `sounds/*.wav` = the rendered participant cues (committed too — a fresh
+  clone must make noise without anyone running the generator).
   Gitignored: `surfaces/`, `paths/`, `presets/`, `settings.json`, `.venv/`
   (retired but still ignored as a safety net).
 - Phases: idle → previewing → editing → captured → executing → done | error.
@@ -406,6 +552,9 @@ in no `main`/`camera_thread`/`robot_controller`).
   `run{params:{speed_pct,offset_mm,safety_mm,blend_mm}}`, `cancel`,
   `save_path{params:{speed_pct,offset_mm,safety_mm,blend_mm,image}}`,
   `set_groove_params{params}`, `set_reference`/`clear_reference`,
+  `rotate_view{params:{steps}}` (⟳ on the Depth viewport; steps = quarter turns
+  clockwise, default 1 — turns the whole canvas, re-bases the crop + reference,
+  drops the captured still, lock-gated like capture/generate/run),
   `set_surface_pose{params:{pose,offset_mm}}`, `clear_surface` (ALL parts),
   `remove_surface{params:{index}}` (one part; index = `info.parts[].index`,
   out-of-range/missing is a no-op; removing the last part clears the scene),
@@ -425,17 +574,27 @@ in no `main`/`camera_thread`/`robot_controller`).
   it is not a pipeline action),
   `set_exec_params{params:{speed_pct,offset_mm,safety_mm,blend_mm,spacing_mm,
   join_mm,max_length_mm}}` (live, debounced sync of the exec bar so Participant
-  Mode + reopened windows match; blend_mm = corner zone Radius slider, 0–5;
+  Mode + reopened windows match; blend_mm = corner zone Radius slider, 0–50;
   join_mm = Distance Threshold box, 0–200; max_length_mm = Max Total Length
   box, 0–100000, 0 = off). `run` and `save_path` also carry `max_length_mm`, so
   the click is judged against what that window currently shows.
-- out: `state` (20 Hz, incl. `path_length_mm` + `max_length_mm` — the drawn
+- out: `view_rotation{deg,crop}` (broadcast on the button press only — `crop` is
+  the server's crop turned onto the new canvas; it travels WITH the angle
+  because a client that took one without the other would frame the wrong sand.
+  Deliberately not folded into `state`: the crop is dragged by hand and
+  republishing it 20×/s would fight the mouse. `deg` alone IS in `state` and
+  `init`, so a window that missed the broadcast self-heals),
+  `state` (20 Hz, incl. `view_rotation`, `reference_set` — which tells both UIs
+  whether the trigger and the near-object cutoff are heights above the sand or
+  absolute camera distances — and `path_length_mm` + `max_length_mm` — the drawn
   length of the current path and its ceiling — and
   `participant{auto,status,message,trigger_mm,below,max_draw_min,remaining_s,
   warn_s}`;
   `init` carries the same block plus `detect{crop,adjustments,spacing_mm,join_mm}`
-  + `exec{speed_pct,offset_mm,safety_mm,blend_mm}` — the browser restores its
-  controls from these on (re)open), `capture_result{stroke_count,point_count,strokes,
+  + `exec{speed_pct,offset_mm,safety_mm,blend_mm}` + `view_rotation`
+  + `reference_set` — the browser restores its controls from these on (re)open — and `sounds{path,cues}` = where the cue
+  .wav files are served and which participant status plays which, straight from
+  `config.SOUND_CUES`), `capture_result{stroke_count,point_count,strokes,
   reach_flags,reach_out,skeleton,path_serial,length_mm,max_length_mm,
   exec_viz:{blend_m,reach_m,min_reach_m,spacing_mm,join_mm}}`, `still`, `preview`,
   `surface_status{loaded,info,pose,offset_mm,mesh,message}` (`info.count` +
@@ -443,9 +602,11 @@ in no `main`/`camera_thread`/`robot_controller`).
   COMBINED geometry + union corners), `save_result`,
   `reference_status`, `execution_update`, `connection_result`,
   `register_result{success,message,pose,error}`,
-  `depth_labels{labels:[[u,v,mm],...],size:[w,h]}` (only to /depths popups,
-  ~4 Hz; coords + size are relative to the Developer-Mode crop, matching the
-  /depth/cropped stream — the popup re-fits its stage from `size`).
+  `depth_labels{labels:[[u,v,mm],...],size:[w,h],relative}` (only to /depths
+  popups, ~4 Hz; coords + size are relative to the Developer-Mode crop, matching
+  the /depth/cropped stream — the popup re-fits its stage from `size`.
+  `relative` = those mm are height above the sand, not distance from the
+  camera — see stage 2b).
   (`skeleton` = dense on-surface [x,y,z] polylines for the white preview line;
   `exec_viz` lets the browser rebuild the toolpath viz client-side on
   Offset/Safety edits.)
@@ -454,13 +615,98 @@ in no `main`/`camera_thread`/`robot_controller`).
 - **Never `import main` from tools/scripts** — import starts the camera thread and
   pollers (hardware side effects). Import the stage modules instead.
 - One process per RealSense; one RRC client per controller task. The running app owns
-  both — external tools must go through HTTP/WS, not open hardware directly.
-- Safety constants (`MAX_TCP_SPEED`, `GOFA_REACH_M`, speeds/accels, `DRAW_Z`) only
-  change on explicit user request.
+  both — external tools must go through HTTP/WS, not open hardware directly. The
+  main app now owns EVERY camera, so Multi-Cam Vision and the app are strictly
+  either/or (it always was, but with one camera you could get away with it).
+- Only an explicit Save writes `stitch_calibration.json` — never a drag, a
+  rotate, a reset or a shutdown. That is what makes the combined view
+  reproducible: reopening the tool, and the main app reading the same file,
+  both rebuild the last SAVED layout exactly (same quads → same canvas origin,
+  size and mm/px; `_auto_mm_per_px` derives from saved quads, so it is
+  deterministic too). Don't add an autosave — an adjustment the operator was
+  still trying out would silently become what the robot draws from.
+- The canvas geometry is frozen ONCE, at camera-thread start-up, and the layout
+  file is read there and nowhere else. Editing the layout therefore needs an app
+  restart — which is not a limitation to "fix", since the placement tool cannot
+  run while the app holds the cameras anyway. Never re-bind or re-freeze mid
+  session: the crop, the reference frame and the captured still are all in
+  canvas pixels, so a canvas that resized would silently move all three.
+- `stitch(..., grid=...)` is what enforces that. Without a grid the canvas is
+  sized to whichever cameras had data THIS cycle — right for the placement tool
+  (a camera being dragged should grow the picture), wrong for a running
+  pipeline, where one dropped frame would resize the world.
+- A camera that stops delivering leaves its part of the canvas blank; it does
+  NOT shrink the canvas and does not stop the app. Deliberate — a half-blank
+  view is diagnosable, a silently re-scaled drawing is not.
+- Changing the layout moves the projector's picture too: the full-frame mask is
+  the whole canvas, so the projection corner-pin (`/projection?cal`) must be
+  re-done after a layout change. The two calibrations use the same TL,TR,BL,BR
+  convention on purpose. **A view rotation does the same thing** — the mask is
+  the whole (turned) canvas, so re-do the corner-pin after pressing ⟳.
+- The view rotation is the ONE thing about the canvas that may change mid
+  session, and it is safe precisely because it does NOT re-freeze anything: the
+  grid, the layout file and the stitch are untouched, the finished picture is
+  only re-indexed. What it does change is width vs height, which `mm_per_px`
+  divides by — so `set_view_rotation` republishes `frame_size`, and
+  `on_rotate_view` re-bases everything shaped by the old orientation: the crop
+  (`rotate_crop`), the reference frame (`rotate_image` — a full-canvas array),
+  and the flat workspace's `y_extent` (`WorkspaceConfig.with_frame_aspect`,
+  which only exists for this). The captured still and its strokes are DROPPED,
+  exactly like Retake, because strokes are already projected into robot space
+  and cannot be turned back. Don't try to "keep the capture" through a rotation.
+- The crop is turned SERVER-side, not in the browser, and shipped back in
+  `view_rotation{crop}`. It is the server's copy that Participant Mode and a
+  reopened window read, so a browser-side turn would leave those pointing at
+  the old sand — and two Developer windows would disagree. The browser's job is
+  to render what comes back.
+- The crop box is drawn in pixels over the depth `<img>`, and after a turn the
+  new frame only arrives with the next MJPEG frame (~200 ms). A `ResizeObserver`
+  on the depth images redraws it then; don't replace that with a one-shot
+  `renderCrop()` at click time, which measures the OLD aspect.
+- `rotate_view` is lock-gated (`_manual_locked`) like capture/generate/run:
+  re-aiming the camera halfway through a participant's drawing would change what
+  that drawing means. It is also deliberately NOT an MCP tool — dropping the
+  capture is an at-the-rig decision.
+- Safety constants (`MAX_TCP_SPEED`, `GOFA_REACH_M`, speeds/accels incl.
+  `RRC_ACCEL_PCT`, `DRAW_Z`) only change on explicit user request.
+- `RRC_ACCEL_PCT` is a percentage of the arm's rated acceleration, NOT m/s².
+  Passing `DRAW_ACCEL` (0.3) through would read as 0.3% and the arm would crawl.
+  It is one global setting shared by drawing and travel, so lowering it to
+  smooth corners also slows the hops between strokes — and it PERSISTS on the
+  controller, which is why `connect` sends it every time even at 100.
+- The dispenser must fail CLOSED, not open. `set_dispenser(True)` raises (no
+  material = a failed drawing, and it belongs in the error phase), but every
+  close path swallows — `_draw_stroke`'s `finally`, `PathExecutor._dispenser_off`,
+  `cancel`, and `_disconnect_unlocked`, which switches the output off BEFORE
+  dropping the client because afterwards there is no way left to switch it.
+  Don't move the open before the landing move_to: material would come out
+  during the travel.
 - Projection windows intentionally open on `127.0.0.1` (not localhost): Chrome
   caps 6 HTTP/1.1 connections per host and MJPEG streams hold theirs forever.
 - `/`, `/projection`, `/depths`, `/static/*` are served no-cache — but Python
   changes still need an app restart.
+- The rig's camera is MOUNTED AT AN ANGLE (the installation needs it), so the
+  sand's own depth spans more than a hand's clearance above it. That is why the
+  trigger and `ignore_closer_mm` go through `surface_height_mm` (stage 2b) and
+  not raw depth. Don't "simplify" either back to an absolute compare — it
+  works on a bench with a level camera and fails on the actual rig.
+- Do NOT try to fix the tilt by remapping the depth NUMBERS (normalize the
+  frame's min…max into a smaller range, auto-scale the colormap, etc.). Every
+  such remap is monotonic in depth, so `hit = depth < threshold` selects exactly
+  the same pixels with a relabelled threshold; the sand's spread and the hand's
+  clearance are scaled by the same factor and their ratio — the thing that
+  decides whether any cutoff can separate them — is unchanged. Tilt is a
+  SPATIAL gradient; only a per-pixel baseline removes it. A per-frame min/max
+  would also move every time a hand entered, which is precisely when it matters.
+- Setting or clearing a reference silently changes what the trigger and the
+  near-object box MEAN (height above sand ↔ camera distance), and the two want
+  values an order of magnitude apart. Hence `state.reference_set`, the relabelled
+  boxes, and `on_set_reference`'s warning when the existing trigger is still a
+  camera-distance-looking number (`_ABSOLUTE_LOOKING_MM`). Keep all three: a
+  trigger that quietly stops firing is the worst outcome here.
+- `depth_region_labels` bands SIGNED values now, so band 0 is the sand itself.
+  Invalid pixels use an int32-min sentinel, not 0 — the old `+1` offset would
+  merge every invalid pixel into the sand's own band.
 - Participant Sensing waits DEPTH_AVERAGE_FRAMES/DEPTH_FPS before capturing:
   the averaged still uses the PAST second, which would contain the hand
   otherwise. Keep that wait ≥ the buffer length.
@@ -496,6 +742,40 @@ in no `main`/`camera_thread`/`robot_controller`).
   reach the server (`set_exec_params`) to be re-judged on Run/Save. Don't wire
   Distance Threshold into the client-side path — the browser has no copy of the
   pre-join chains.
+- A **preset carries the exec bar too**, under a NESTED `exec` key beside the
+  flat slider keys. Nested on purpose: the flat keys keep their old meaning, so
+  presets written before this still load and their absent `exec` simply leaves
+  the bar alone (`applyExecSettings` applies only fields that parse as numbers —
+  never reset what a file does not mention). `readExecSettings`/
+  `applyExecSettings` are the ONE reader/writer pair for that bar; the reconnect
+  restore (`restoreSessionSettings`) goes through the same writer, feeding it
+  `init.exec` merged with `detect.spacing_mm`/`join_mm` — two blocks on the
+  wire, one bar on screen. Loading a preset then does what a manual edit does:
+  `syncExecParams()` so the server's session copy (and therefore Participant
+  Mode) matches, and — only if a path is already on screen — one
+  `generate_path` for the new Spacing/Distance Threshold plus a
+  `rebuildToolpathViz` for Offset/Safety/Radius. No clamping is added in the
+  browser: the range inputs bound what can be typed and `main._num` clamps every
+  value again server-side, so a hand-edited preset cannot push the arm past a
+  limit.
+- The exec bar is TWO rows (`#preview-controls` stack: `#path-legend` above
+  `#exec-bar`): PATH = Spacing / Distance Threshold / Radius, RUN = Speed /
+  Offset / Safety / Max Total Length / Save. `.exec-break` forces that split;
+  each control is wrapped in `.exec-group` so a label never wraps away from its
+  input. The stack pulls its right edge in to 290px while the Detection
+  Parameters overlay is open (`#edit-panel:not(.hidden) ~ #panel-3d
+  #preview-controls`) — that overlay is 270px wide at z-index 60 and used to
+  swallow the bar's right-hand controls. Keep the rule keyed on the overlay's
+  own `hidden` class: a popped-out preview lives in another document where the
+  selector cannot match, which is right, because the overlay stays behind in the
+  main window.
+- path.json holds the SAME waypoints in two shapes — `frames` (COMPAS, mm, flat,
+  for compas_rrc) and `strokes` (grouped, metres, what `toolpath_loader` and the
+  replay tool read). Neither is redundant: drop `frames` and an RRC script has
+  to convert; drop `strokes` and replay loses both the stroke boundaries (the
+  tool would drag between gestures instead of retracting) and `meta`. Anything
+  added to one must be derived from the same poses as the other — they are
+  written from one list in `build_json`, keep it that way.
 - The drawn-length readout is the SERVER's number, pushed in `state` and
   `capture_result`, never recomputed in the browser. One implementation means
   what the box shows is exactly what Run/Save judge; a JS copy would drift the
@@ -528,6 +808,29 @@ in no `main`/`camera_thread`/`robot_controller`).
   unavailable" and every drawing passes.
 - Never OCR the skeleton or the projected 3D strokes — 1-px hairlines read
   terribly. The guard is on the thick mask for a reason.
+- Sound plays in the projection OUTPUT window only, never `?cal`. Both pages
+  are the same file, so lifting the `!IS_CAL` gate makes the laptop and the
+  projector play the same buffer a few ms apart — which sounds like a fault,
+  not like stereo. Same split as `projection_blank`.
+- Audio must never be able to break the experience: a blocked AudioContext, a
+  404 on a .wav, a browser with no Web Audio, or nobody clicking to unlock all
+  mean SILENCE and nothing else. Keep every fetch/decode `.catch()`ed and keep
+  `playCue` a no-op when the context is not running — same fail-open rule as
+  the profanity guard.
+- Cues fire on status ENTRY, and `lastStatus` is seeded from `init.participant`
+  on purpose: without that, opening the projection window mid-drawing blurts
+  the cue for a stage nobody just reached. Don't drive sound off a timer or off
+  `below` — the state machine's statuses are the only trigger.
+- The status→cue map lives in `config.SOUND_CUES` and travels in `init`. Don't
+  hardcode a second copy in projection.html; a rename would then half-apply.
+- Edit `sound_design.py` → RE-RENDER (`<ENVPY> sound_design.py`) and commit the
+  .wav files. The code is not what plays; the rendered files are. A test asserts
+  every configured cue exists under `sounds/`.
+- `sounds/` is the one static route deliberately served WITH caching. Re-fetching
+  a ~200 KB wav mid-experience is an audible stutter, and unlike viewer.js the
+  files don't change between restarts.
+- The alarm's grit uses a SEEDED rng — `render_all` must be deterministic or
+  every regeneration shows up as a binary diff.
 - Multi-Cam Vision has no auto-alignment and no detection ON PURPOSE. The
   cameras are bolted down, so an overlap search only ever failed on flat sand;
   and the tool exists to combine images — groove parameters belong in the main
@@ -581,6 +884,11 @@ in no `main`/`camera_thread`/`robot_controller`).
 - `scheduler.py` must not grow its own "is this a bundle?" rule. It calls
   `toolpath_loader.list_toolpaths` precisely so the Scheduler and the replay
   tool always list the same folders.
-- Test count reference: 444 unit (+6 hardware-gated). The `text_guard` OCR
+- `realsense_source` is the ONE place a RealSense is opened, and it returns
+  either every camera or none — a partial start would place the cameras that
+  did come up against a layout that assumed the missing one. Keep the colour
+  frame `.copy()`ed there: `np.asarray(frame.get_data())` is a view of SDK
+  memory and callers hold the latest colour for seconds.
+- Test count reference: 611 unit (+6 hardware-gated). The `text_guard` OCR
   tests skip themselves when Tesseract is absent; the text-matching ones always
   run. Keep green.

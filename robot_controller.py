@@ -21,8 +21,10 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from config import (
-    RRC_CONNECT_TIMEOUT_S, RRC_NAMESPACE, RRC_ROS_PORT, RRC_TOOL,
-    RRC_WORK_OBJECT, START_JOINT_ANGLES, START_SPEED,
+    DISPENSER_ENABLED, DISPENSER_OFF_DELAY_S, DISPENSER_ON_DELAY_S,
+    DISPENSER_SIGNAL, RRC_ACCEL_PCT, RRC_ACCEL_RAMP_PCT, RRC_CONNECT_TIMEOUT_S,
+    RRC_NAMESPACE, RRC_ROS_PORT, RRC_TOOL, RRC_WORK_OBJECT, START_JOINT_ANGLES,
+    START_SPEED,
 )
 
 # RAPID zone data is a rounding radius in mm; -1 means "stop exactly here".
@@ -114,6 +116,13 @@ class RobotController:
         abb.send(rrc.SetTool(RRC_TOOL))
         abb.send(rrc.SetWorkObject(RRC_WORK_OBJECT))
 
+        # Acceleration is a controller-wide setting (RAPID AccSet), not a
+        # per-move argument — this is the only place it can be set, and it
+        # applies to travel and drawing alike. Sent on every connect even at
+        # 100%, because it persists on the controller: without this, a session
+        # that turned it down would quietly govern the next one.
+        abb.send(rrc.SetAcceleration(RRC_ACCEL_PCT, RRC_ACCEL_RAMP_PCT))
+
         with self._lock:
             if self._abb is not None:
                 self._disconnect_unlocked()
@@ -129,6 +138,11 @@ class RobotController:
         if self._abb is not None:
             try:
                 import compas_rrc as rrc
+                # Close the valve before dropping the link, not after: once the
+                # client is gone there is no way left to switch it off, and an
+                # open dispenser over the sand outlasts the session.
+                if DISPENSER_ENABLED and DISPENSER_SIGNAL:
+                    self._abb.send(rrc.SetDigital(DISPENSER_SIGNAL, 0))
                 self._abb.send(rrc.Stop())
             except Exception:
                 pass
@@ -224,6 +238,33 @@ class RobotController:
                 self._abb.send(rrc.Stop())
             except Exception:
                 pass
+
+    # ── Material dispenser ───────────────────────────────────────────────────
+    def set_dispenser(self, on: bool) -> None:
+        """
+        Open or close the substrate dispenser's digital output.
+
+        A no-op unless a signal is configured, so a rig without the valve wired
+        sends nothing at all — which is the state the code ships in. Errors are
+        NOT swallowed here: material failing to flow is a real failure of the
+        drawing and belongs in the error phase. The executor is what makes
+        closing safe, by doing it in a ``finally``.
+
+        The optional delay is the time a pump needs to build (or drop) pressure
+        before the arm moves; it is slept OUTSIDE the lock so the EE poller and
+        cancel keep working through it.
+        """
+        if not DISPENSER_ENABLED or not DISPENSER_SIGNAL:
+            return
+        with self._lock:
+            if self._abb is None:
+                return
+            import compas_rrc as rrc
+            self._abb.send_and_wait(
+                rrc.SetDigital(DISPENSER_SIGNAL, 1 if on else 0))
+        delay = DISPENSER_ON_DELAY_S if on else DISPENSER_OFF_DELAY_S
+        if delay > 0:
+            time.sleep(delay)
 
     def get_ee_position(self) -> list[float]:
         with self._lock:

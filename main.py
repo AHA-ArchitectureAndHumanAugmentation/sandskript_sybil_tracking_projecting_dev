@@ -17,13 +17,13 @@ for _stream in (sys.stdout, sys.stderr):
 from config import (
     HTTP_HOST, HTTP_PORT, CONTOUR_MIN_PIXELS,
     DEPTH_LABELS_INTERVAL_MM,
-    DEPTH_WIDTH, DEPTH_HEIGHT, DEPTH_FPS, DEPTH_AVERAGE_FRAMES, SURFACE_DIR,
+    DEPTH_FPS, DEPTH_AVERAGE_FRAMES, SURFACE_DIR,
     DRAW_Z, DRAW_SPEED, TRAVEL_Z, MAX_TCP_SPEED,
     RESAMPLE_SPACING_MM, RESAMPLE_SPACING_MIN_MM, RESAMPLE_SPACING_MAX_MM,
     JOIN_DISTANCE_MM, JOIN_DISTANCE_MIN_MM, JOIN_DISTANCE_MAX_MM,
     MAX_PATH_LENGTH_MM, MAX_PATH_LENGTH_MIN_MM, MAX_PATH_LENGTH_MAX_MM,
-    GOFA_REACH_M, GOFA_MIN_REACH_M, BLEND_ZONE_M,
-    PARTICIPANT_TICK_S, PARTICIPANT_CLEAR_S,
+    GOFA_REACH_M, GOFA_MIN_REACH_M, BLEND_ZONE_M, BLEND_ZONE_MAX_MM,
+    PARTICIPANT_TICK_S, PARTICIPANT_CLEAR_S, TRIGGER_MIN_MM, TRIGGER_MAX_MM,
     PARTICIPANT_MAX_DRAW_MIN, PARTICIPANT_MAX_DRAW_MIN_MIN,
     PARTICIPANT_MAX_DRAW_MAX_MIN,
     PROFANITY_CHECK_ENABLED,
@@ -45,6 +45,7 @@ from robot_controller import RobotController
 from server import Server
 from settings import load_settings, save_settings
 from surface import SurfaceModel, SurfacePose, SurfaceScene
+from view_rotation import norm_deg, rotate_crop, rotate_image
 from workspace import WorkspaceConfig, scene_mm_per_px
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -59,7 +60,20 @@ shared_state: dict = {
     "depth_overlay_clients": 0,      # connected /depths popups (gates the labels)
     "depth_labels":        None,     # [[u, v, mm], ...] for the depth-number overlay
     "depth_labels_size":   None,     # [w, h] px of the crop the labels cover
+    # True when those mm are HEIGHT ABOVE THE SAND (a reference is set) rather
+    # than distance from the camera. Same switch the trigger uses, so the popup
+    # can name the units the operator is typing into the trigger box.
+    "depth_labels_relative": False,
     "last_depth_crop_jpg": None,     # cropped colorized depth for the popup
+    # Size of the COMBINED camera canvas (every view is the stitched rig) and
+    # how many cameras feed it. Published by the camera thread once the canvas
+    # geometry is frozen; None until then.
+    "frame_size":          None,     # [width, height] px of the combined canvas
+    "camera_count":        0,        # cameras combined into it
+    # Quarter-turn rotation of that canvas (Developer Mode's ⟳ button). Applied
+    # in the camera thread, so every view and the captured still inherit it.
+    # Persisted in settings.json — it describes how the rig is mounted.
+    "view_rotation":       0,        # 0/90/180/270, clockwise
     "workspace":           None,     # WorkspaceConfig | None — confirmed workspace
     "pending_workspace":   None,     # WorkspaceConfig | None — loaded from disk
     "ws_points":           {"p0": None, "px": None, "py": None},
@@ -191,7 +205,11 @@ async def on_simulate_workspace() -> None:
     tested without a robot. Does not connect or move the robot; Run remains
     gated on a real connection.
     """
-    ws_cfg = WorkspaceConfig.simulation()
+    # The synthetic plane takes the COMBINED canvas's aspect, so a Test-Mode
+    # preview of a wide multi-camera view stays isotropic instead of being
+    # squashed into one camera's 4:3.
+    size = _frame_size()
+    ws_cfg = WorkspaceConfig.simulation(size[0] / size[1] if size else None)
     with state_lock:
         shared_state["workspace"]         = ws_cfg
         shared_state["pending_workspace"] = None
@@ -207,10 +225,30 @@ async def on_simulate_workspace() -> None:
     )
 
 
+# A trigger above this many mm was almost certainly typed as a distance from the
+# camera: no hand hovers half a metre over the sand. Used only to warn when a
+# reference is captured and the number's meaning changes under it.
+_ABSOLUTE_LOOKING_MM = 300.0
+
+
 # ── Capture image / Edit / Generate path callbacks ───────────────────────────
-def _mm_per_px(workspace, surface_model=None) -> float | None:
+def _frame_size() -> tuple[int, int] | None:
+    """
+    Size of the frame the pipeline is working from — the COMBINED camera canvas.
+
+    The captured still wins when there is one, so a crop/generate keeps using
+    the frame it was taken on; otherwise the camera thread's live canvas. Both
+    are needed because the mm scale and the surface fit depend on it, and it is
+    no longer the fixed 640×480 of a single camera.
+    """
+    with state_lock:
+        dims = shared_state.get("still_dims")
+    return tuple(dims) if dims else camera_thread.frame_size
+
+
+def _mm_per_px(workspace, surface_model=None, frame_size=None) -> float | None:
     """Scene scale for the mm-based filters/spacings — see workspace.scene_mm_per_px."""
-    return scene_mm_per_px(workspace, surface_model)
+    return scene_mm_per_px(workspace, surface_model, frame_size or _frame_size())
 
 
 async def on_set_groove_params(params: dict) -> None:
@@ -240,7 +278,17 @@ async def on_depth_overlay_params(params: dict) -> None:
 
 
 async def on_set_reference(ws) -> None:
-    """Capture the current (undrawn) sand as a baseline for background subtraction."""
+    """
+    Capture the current (undrawn) sand as a baseline.
+
+    The reference does two jobs. It cancels pre-existing natural grooves for
+    detection (`ref_strength`), and — because a picture of the empty sand
+    CONTAINS the camera's tilt — it turns "distance from the camera" into
+    "height above the sand" for the Participant trigger and the near-object
+    cutoff. That second job is what makes a tilted rig workable at all, so
+    setting one silently changes what those two numbers mean; say so, and warn
+    when the existing trigger value was plainly tuned as a camera distance.
+    """
     captured = camera_thread.capture_frame()
     if captured is None:
         await server.send_reference_status(ws, False, "No depth frame to set as reference.")
@@ -248,16 +296,29 @@ async def on_set_reference(ws) -> None:
     depth_m, _valid, _rgb = captured
     with state_lock:
         shared_state["reference_depth"] = depth_m
+        trigger_mm = shared_state.get("trigger_mm")
     camera_thread.set_reference(depth_m)
-    await server.send_reference_status(ws, True, "Reference captured — natural grooves can be subtracted.")
-    module_trace.log("reference", "Reference depth captured for background subtraction.")
+    msg = ("Reference captured — natural grooves can be subtracted, and the "
+           "Participant trigger + near-object cutoff now measure HEIGHT ABOVE "
+           "THE SAND (tilt-proof) instead of distance from the camera.")
+    if trigger_mm is not None and trigger_mm > _ABSOLUTE_LOOKING_MM:
+        msg += (f" Your trigger is still {trigger_mm:.0f} mm — that reads as a "
+                "camera distance; as a height above the sand try something "
+                "like 60–120 mm.")
+    await server.send_reference_status(ws, True, msg)
+    module_trace.log("reference",
+                     "Reference depth captured — background subtraction on, "
+                     "trigger + near-object cutoff now relative to the sand.")
 
 
 async def on_clear_reference(ws) -> None:
     with state_lock:
         shared_state["reference_depth"] = None
     camera_thread.set_reference(None)
-    await server.send_reference_status(ws, False, "Reference cleared.")
+    await server.send_reference_status(
+        ws, False,
+        "Reference cleared — the trigger and near-object cutoff are absolute "
+        "distances from the camera again.")
     module_trace.log("reference", "Reference depth cleared.")
 
 
@@ -576,7 +637,7 @@ async def on_generate_path(ws, params: dict) -> None:
     width, height  = dims
     crop = Crop.from_dict(params.get("crop"))
     gp   = DepthGrooveParams.from_dict(params.get("adjustments"))
-    mmpp = _mm_per_px(workspace, surface_model)
+    mmpp = _mm_per_px(workspace, surface_model, (width, height))
 
     # Waypoint spacing in mm (Path Preview slider), clamped to the allowed range.
     try:
@@ -723,6 +784,86 @@ async def on_retake(ws) -> None:
     module_trace.log("capture", "Retake — back to live preview")
 
 
+async def on_rotate_view(ws, params: dict | None = None) -> None:
+    """
+    Turn the whole combined canvas a quarter turn (Developer Mode's ⟳ button).
+
+    The camera thread turns the canvas itself, so every view follows for free.
+    What has to be re-based here is the state that was recorded in the OLD
+    orientation and would otherwise silently point at the wrong sand:
+
+      * the crop — turned with the picture, so it keeps framing the same region
+        (it is the server's copy that Participant Mode and a reopened window
+        read, so turning it here is what keeps every client agreeing);
+      * the reference frame — a full-canvas array, turned by the same amount so
+        background subtraction still lines up pixel for pixel;
+      * the workspace — a quarter turn swaps the canvas's width and height, and
+        Test Mode's plane takes its shape from that aspect;
+      * the captured still and its path — these CANNOT be re-based (the strokes
+        are already projected into robot space), so they are dropped, exactly
+        like Retake. Rotation is a framing adjustment: turn first, then capture.
+
+    Refused while Participant Auto is ON — re-aiming the camera mid-session
+    would change what a participant's drawing means halfway through it.
+    """
+    if _manual_locked(ws):
+        await server.send_capture_result(ws, False, error=_AUTO_LOCK_MSG)
+        return
+    try:
+        steps = int((params or {}).get("steps", 1))
+    except (TypeError, ValueError):
+        steps = 1
+
+    with state_lock:
+        old = shared_state.get("view_rotation", 0)
+        reference = shared_state.get("reference_depth")
+        gen_params = shared_state.get("participant_gen_params") or {}
+        crop_dict = gen_params.get("crop")
+        workspace = shared_state.get("workspace")
+    new = norm_deg(old + 90 * steps)
+    delta = norm_deg(new - old)
+
+    reference = rotate_image(reference, delta)
+    crop_dict = rotate_crop(crop_dict, delta)
+
+    with state_lock:
+        shared_state["view_rotation"] = new
+        shared_state["reference_depth"] = reference
+        shared_state["participant_gen_params"]["crop"] = crop_dict
+        # Same reset as Retake, plus the detection images the path was made of.
+        shared_state["captured_still"] = None
+        shared_state["still_dims"]     = None
+        shared_state["strokes"]        = []
+        shared_state["last_mask"]      = None
+        shared_state["last_skeleton"]  = None
+        shared_state["path_length_mm"] = 0.0
+        if shared_state["phase"] in ("editing", "captured", "done"):
+            shared_state["phase"] = "previewing"
+
+    camera_thread.set_view_rotation(new)
+    camera_thread.set_reference(reference)
+    camera_thread.set_live_crop(Crop.from_dict(crop_dict))
+
+    # frame_size is now the turned one, so re-derive anything shaped by it.
+    size = _frame_size()
+    if workspace is not None and size:
+        workspace = workspace.with_frame_aspect(size[0] / size[1])
+        with state_lock:
+            shared_state["workspace"] = workspace
+    with state_lock:
+        surface_model = shared_state.get("surface_model")
+    camera_thread.set_scale(_mm_per_px(workspace, surface_model, size))
+
+    save_settings({"view_rotation": new})
+    await server.broadcast_view_rotation(new, crop_dict)
+    where = f" — canvas now {size[0]}×{size[1]} px" if size else ""
+    module_trace.log(
+        "rotate",
+        f"View rotated to {new}°{where}; crop and reference turned with it, "
+        "captured still dropped — capture again",
+    )
+
+
 def _length_check(strokes, blend_mm: float, params: dict) -> tuple[bool, str]:
     """
     Enforce the Max Total Length box. Returns ``(ok, message)``.
@@ -783,7 +924,7 @@ async def on_run(ws, params: dict | None = None) -> None:
     speed_pct = _num("speed_pct", (DRAW_SPEED / MAX_TCP_SPEED) * 100.0, 1.0, 100.0)
     offset_mm = _num("offset_mm", 0.0, -20.0, 200.0)
     safety_mm = _num("safety_mm", TRAVEL_Z * 1000.0, 5.0, 300.0)
-    blend_mm  = _num("blend_mm", BLEND_ZONE_M * 1000.0, 0.0, 5.0)
+    blend_mm  = _num("blend_mm", BLEND_ZONE_M * 1000.0, 0.0, BLEND_ZONE_MAX_MM)
     draw_speed = (speed_pct / 100.0) * MAX_TCP_SPEED
 
     ok, why = _length_check(strokes, blend_mm, params)
@@ -879,7 +1020,7 @@ async def on_save_path(ws, params: dict) -> None:
     speed_pct = _num("speed_pct", (DRAW_SPEED / MAX_TCP_SPEED) * 100.0, 1.0, 100.0)
     offset_mm = _num("offset_mm", 0.0, -20.0, 200.0)
     safety_mm = _num("safety_mm", TRAVEL_Z * 1000.0, 5.0, 300.0)
-    blend_mm  = _num("blend_mm", BLEND_ZONE_M * 1000.0, 0.0, 5.0)
+    blend_mm  = _num("blend_mm", BLEND_ZONE_M * 1000.0, 0.0, BLEND_ZONE_MAX_MM)
     speed = (speed_pct / 100.0) * MAX_TCP_SPEED
 
     ok, why = _length_check(strokes, blend_mm, params)
@@ -1005,7 +1146,7 @@ async def on_set_exec_params(params: dict) -> None:
     speed_pct = _num("speed_pct", (DRAW_SPEED / MAX_TCP_SPEED) * 100.0, 1.0, 100.0)
     offset_mm = _num("offset_mm", 0.0, -20.0, 200.0)
     safety_mm = _num("safety_mm", TRAVEL_Z * 1000.0, 5.0, 300.0)
-    blend_mm  = _num("blend_mm", BLEND_ZONE_M * 1000.0, 0.0, 5.0)
+    blend_mm  = _num("blend_mm", BLEND_ZONE_M * 1000.0, 0.0, BLEND_ZONE_MAX_MM)
     spacing_mm = _num("spacing_mm", RESAMPLE_SPACING_MM,
                       RESAMPLE_SPACING_MIN_MM, RESAMPLE_SPACING_MAX_MM)
     join_mm    = _num("join_mm", JOIN_DISTANCE_MM,
@@ -1031,12 +1172,19 @@ async def on_set_exec_params(params: dict) -> None:
 
 
 async def on_set_trigger(params: dict) -> None:
-    """Set (or clear with null/empty) the Participant-Mode trigger distance."""
+    """
+    Set (or clear with null/empty) the Participant-Mode trigger threshold.
+
+    The number is a height ABOVE THE SAND when a reference frame is set, and a
+    raw distance from the camera when there is none — the camera thread picks
+    the mode per frame, so nothing here has to know which is in force. One
+    range spans both, hence the low floor.
+    """
     raw = (params or {}).get("threshold_mm")
     mm = None
     try:
         if raw is not None and str(raw).strip() != "":
-            mm = min(max(float(raw), 50.0), 5000.0)
+            mm = min(max(float(raw), TRIGGER_MIN_MM), TRIGGER_MAX_MM)
     except (TypeError, ValueError):
         mm = None
     camera_thread.set_trigger_threshold(mm)
@@ -1236,7 +1384,17 @@ server = Server(
     on_set_automation=on_set_automation,
     on_set_exec_params=on_set_exec_params,
     on_preview_image=on_preview_image,
+    on_rotate_view=on_rotate_view,
 )
+
+# The view rotation describes how the rig is mounted, so it outlives a restart.
+# Set BEFORE the thread starts: the canvas is published turned from the first
+# frame, and frame_size is right the first time anything reads it.
+_saved_rotation = norm_deg(load_settings().get("view_rotation", 0))
+if _saved_rotation:
+    shared_state["view_rotation"] = _saved_rotation
+    camera_thread.set_view_rotation(_saved_rotation)
+    print(f"[depth] view rotation {_saved_rotation}° restored from settings.json")
 
 # Camera starts immediately so both MJPEG feeds are live from the moment you open the browser
 camera_thread.start()

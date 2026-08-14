@@ -2,8 +2,12 @@
 path_export.py — save a generated toolpath to disk in an open, robot-neutral form.
 
 Each save produces a timestamped subfolder under ``paths/`` containing:
-  - path.json    the strokes as 6-DOF poses PLUS a full plane/frame per
-                 waypoint (origin + x/y/z axes), for frame-guided workflows.
+  - path.json    the waypoints in COMPAS's own JSON form — a flat ``frames``
+                 list of ``compas.geometry/Frame`` objects in millimetres plus
+                 an identity work object (``wobj_origin/xaxis/yaxis``), which is
+                 what a compas_rrc script reads with ``compas.json_load``. The
+                 same file also keeps ``strokes`` (poses + planes, in metres),
+                 which is what the replay tool executes.
                  This is the EXECUTABLE file: the replay tool reads it back and
                  the ABB frames the robot moves through come straight from it.
   - path.script  URScript (movel travels + movep drawing) of the same strokes.
@@ -31,6 +35,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -40,6 +45,7 @@ from scipy.spatial.transform import Rotation
 
 from config import (
     BLEND_ZONE_M, DRAW_ACCEL, PATHS_DIR, PREVIEW_MAX_BYTES, TRAVEL_ACCEL,
+    WOBJ_AXIS_MM,
 )
 
 Pose = list           # [x, y, z, rx, ry, rz]
@@ -131,13 +137,70 @@ def _plane(pose: Pose) -> dict:
     }
 
 
+def _compas_frame(pose: Pose) -> dict:
+    """
+    One waypoint as COMPAS's serialized ``Frame``: point in MILLIMETRES plus the
+    x and y axes (compas derives z = x × y, which is the tool approach).
+
+    Same construction as ``robot_controller.pose_to_frame``, which is what the
+    live run sends — so a compas_rrc script reading this file moves the arm
+    through exactly the frames this app would have commanded.
+    """
+    R = Rotation.from_rotvec(np.asarray(pose[3:6])).as_matrix()
+    return {
+        "dtype": "compas.geometry/Frame",
+        "data": {
+            "point": [round(float(pose[i]) * 1000.0, 4) for i in range(3)],
+            "xaxis": [round(float(v), 6) for v in R[:, 0]],
+            "yaxis": [round(float(v), 6) for v in R[:, 1]],
+        },
+        "guid": str(uuid.uuid4()),
+    }
+
+
+def _compas_point(xyz) -> dict:
+    return {"dtype": "compas.geometry/Point",
+            "data": [float(v) for v in xyz],
+            "guid": str(uuid.uuid4())}
+
+
 def build_json(strokes: Strokes, meta: dict) -> dict:
+    """
+    The saved path in two views of the same waypoints.
+
+    ``frames`` + ``wobj_*`` are COMPAS objects in millimetres, the form
+    ``compas.json_load`` decodes and a compas_rrc script consumes directly. The
+    work object is the identity one (origin at 0, axes along X and Y) because
+    the poses are already in the robot's base frame — the same ``wobj0`` the
+    live run uses.
+
+    That list is FLAT: one gesture follows the next with nothing between them,
+    which is all the format carries. ``stroke_starts`` gives the index in
+    ``frames`` where each stroke begins, so a consumer can still lift the tool
+    between strokes instead of dragging it across the surface — and ``strokes``
+    below keeps the same waypoints grouped, in metres, which is what the replay
+    tool executes.
+    """
     strokes_out = [
         [{"pose": [round(float(v), 5) for v in p], "plane": _plane(p)} for p in s]
         for s in strokes
     ]
-    return {"meta": meta, "units": "metres, radians (UR pose = rotation vector)",
-            "strokes": strokes_out}
+    frames, starts, n = [], [], 0
+    for s in strokes:
+        starts.append(n)
+        frames.extend(_compas_frame(p) for p in s)
+        n += len(s)
+    return {
+        "frames": frames,
+        "wobj_origin": _compas_point([0.0, 0.0, 0.0]),
+        "wobj_xaxis": _compas_point([WOBJ_AXIS_MM, 0.0, 0.0]),
+        "wobj_yaxis": _compas_point([0.0, WOBJ_AXIS_MM, 0.0]),
+        "stroke_starts": starts,
+        "meta": meta,
+        "units": "frames + work object in millimetres; strokes in metres, "
+                 "radians (pose = rotation vector)",
+        "strokes": strokes_out,
+    }
 
 
 # ── bundle ────────────────────────────────────────────────────────────────────

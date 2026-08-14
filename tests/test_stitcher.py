@@ -1,5 +1,6 @@
 """Unit tests for the multi-camera stitching math (stitcher.py). No hardware."""
 
+import json
 import threading
 
 import cv2
@@ -11,7 +12,7 @@ from multi_camera import MultiCameraThread
 from stitcher import (
     CameraFrame, CameraPlacement, Intrinsics, StitchCalib,
     bind_placements, common_footprint_mm, crop_corners_px, crop_mask,
-    default_quad_mm, default_row_mm, fill_small_holes, footprint_mm,
+    default_quad_mm, default_row_mm, fill_small_holes, footprint_mm, load_calib,
     quad_area_mm2, quad_centre_x, requad_for_crop, rotate_frame, rotate_quad,
     stitch, swap_quads_x, synthetic_scene,
 )
@@ -436,6 +437,82 @@ class TestBindPlacements:
         other = calib.with_camera(0, calib.cams[0].merged({"height_mm": 4.0}))
         assert calib.cams[0].height_mm == 0.0 and other.cams[0].height_mm == 4.0
         assert calib.with_camera(9, CameraPlacement()) is calib
+
+
+class TestSavedVsAdjusted:
+    """
+    The main app builds its combined view from the SAVED file, so the tool has
+    to be honest about the difference: adjustments the operator did not save
+    are a picture only this window has, and reopening must come back to the
+    file exactly.
+    """
+
+    @staticmethod
+    def _rig(tmp_path, n=2):
+        row = default_row_mm([(800.0, 600.0)] * n, [(0, 0, 1, 1)] * n)
+        saved = StitchCalib(cams=[CameraPlacement(serial=f"S{i}", quad_mm=row[i])
+                                  for i in range(n)])
+        path = tmp_path / "stitch_calibration.json"
+        path.write_text(json.dumps(saved.to_dict()))
+        cam = MultiCameraThread({}, threading.Lock())
+        cam.set_calib(saved)
+        # Binding to the cameras present is what start-up does; it is the
+        # baseline, not an edit.
+        cam._sync_placements([_flat_frame(serial=f"S{i}") for i in range(n)])
+        return cam, path, saved
+
+    def test_a_freshly_loaded_layout_is_not_dirty(self, tmp_path):
+        cam, _path, _saved = self._rig(tmp_path)
+        assert cam.dirty is False
+
+    def test_binding_more_cameras_than_the_file_has_is_not_hidden(self, tmp_path):
+        """A rig that no longer matches the file genuinely differs from it."""
+        cam, _path, _saved = self._rig(tmp_path, n=2)
+        cam._sync_placements([_flat_frame(serial=s) for s in ("S0", "S1", "S2")])
+        assert cam.dirty is True
+
+    def test_any_adjustment_marks_it_unsaved(self, tmp_path):
+        cam, _path, _saved = self._rig(tmp_path)
+        cam.nudge_height(0, 1)
+        assert cam.dirty is True
+
+    def test_saving_makes_the_screen_and_the_file_agree_again(self, tmp_path):
+        cam, _path, _saved = self._rig(tmp_path)
+        cam.rotate_camera(0, 1)
+        assert cam.dirty is True
+        cam.mark_saved()
+        assert cam.dirty is False
+
+    def test_discarding_restores_the_saved_layout(self, tmp_path, monkeypatch):
+        cam, path, saved = self._rig(tmp_path)
+        monkeypatch.setattr("multi_camera.load_calib", lambda: load_calib(path))
+        before = cam.get_calib().to_dict()
+        cam.set_placement(0, {"quad_mm": [[9.0, 9.0]] * 4})
+        cam.nudge_height(1, 3)
+        assert cam.dirty is True
+
+        cam.revert_calib()
+        cam._sync_placements([_flat_frame(serial=f"S{i}") for i in range(2)])
+        assert cam.get_calib().to_dict() == before
+        assert cam.dirty is False
+
+    def test_an_unsaved_adjustment_never_reaches_the_file(self, tmp_path):
+        cam, path, saved = self._rig(tmp_path)
+        cam.nudge_height(0, 5)
+        # Nothing but an explicit save writes; reopening reads the file.
+        assert load_calib(path).to_dict() == saved.to_dict()
+
+    def test_the_same_file_always_builds_the_same_canvas(self, tmp_path):
+        """Reopening the tool — and the main app reading the same file — must
+        land on identical canvas geometry, or the two would draw differently."""
+        _cam, path, _saved = self._rig(tmp_path)
+        calib = load_calib(path)
+        frames = [_flat_frame(serial="S0"), _flat_frame(serial="S1")]
+        a = stitch(frames, calib)
+        b = stitch([_flat_frame(serial="S0"), _flat_frame(serial="S1")], load_calib(path))
+        assert a.depth_m.shape == b.depth_m.shape
+        assert a.origin_mm == pytest.approx(b.origin_mm)
+        assert a.mm_per_px == pytest.approx(b.mm_per_px)
 
 
 class TestMoveCamera:
