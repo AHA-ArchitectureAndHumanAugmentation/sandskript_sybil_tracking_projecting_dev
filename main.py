@@ -99,7 +99,7 @@ shared_state: dict = {
 }
 state_lock = threading.Lock()
 
-EMULATE_CAPTURE = True  # True = no camera -- auto-generate + save + send after every tile switch. Set False once the camera's reconnected.
+EMULATE_CAPTURE = False  # True = no camera -- auto-generate + save + send after every tile switch. Set False once the camera's reconnected.
 STARTUP_TILE_ID = 1  # tile used immediately on startup, before any message arrives. None = wait for a real message like before.
 SHOW_PROJECTION_VIEWER = True  # True = open a compas_viewer window (tile + projected path) before every send. False = run unattended.
 
