@@ -17,17 +17,9 @@ from config import (
 from settings import load_settings, save_settings
 
 _VIEWER_DIR = Path(__file__).parent / "viewer"
-# Cue .wav files live beside the code, not beside the working directory.
 _SOUNDS_DIR = Path(__file__).parent / SOUNDS_DIR
 
 def _safe_preset_path(name: str) -> Path | None:
-    """
-    Resolve a preset filename to a path inside PRESETS_DIR, or None if it is
-    unsafe. Presets may be renamed to ANY filename (spaces, dots, unicode…),
-    so instead of whitelisting characters we require a .json file and confirm
-    the resolved path stays within PRESETS_DIR — which also blocks traversal
-    ('..', absolute paths, embedded separators).
-    """
     if not name or not name.lower().endswith(".json"):
         return None
     if "/" in name or "\\" in name or "\x00" in name:
@@ -40,14 +32,6 @@ def _safe_preset_path(name: str) -> Path | None:
 
 
 class _BroadcastWS:
-    """
-    Duck-typed stand-in for a single client WebSocket whose ``send_str`` fans
-    out to every connected BROWSER client (tool sockets excluded). Lets the
-    Participant-Mode automation reuse the per-ws pipeline handlers
-    (capture/generate/save/run) unchanged — any open Developer-Mode window
-    sees the automated run's stills/previews/results live.
-    """
-
     def __init__(self, server: "Server"):
         self._server = server
 
@@ -62,9 +46,6 @@ class _BroadcastWS:
 
 @web.middleware
 async def _no_cache_static(request: web.Request, handler):
-    """Serve the page and viewer assets with no-cache so code edits show up on a
-    plain refresh. Covers both /static/* and the index page at '/' — otherwise a
-    stale cached index.html can reference a fresh viewer.js and break the UI."""
     resp = await handler(request)
     if (request.path in ("/", "/projection", "/depths")
             or request.path.startswith(STATIC_PATH)) and not resp.prepared:
@@ -77,9 +58,9 @@ class Server:
         self,
         shared_state: dict,
         state_lock: threading.Lock,
-        robot,
-        on_connect: Callable,
-        on_disconnect: Callable,
+        robot=None,
+        on_connect: Optional[Callable] = None,
+        on_disconnect: Optional[Callable] = None,
         on_last_disconnect: Optional[Callable] = None,
         on_simulate_workspace: Optional[Callable] = None,
         on_capture_image: Optional[Callable] = None,
@@ -140,8 +121,8 @@ class Server:
         self._ws_clients: set[web.WebSocketResponse] = set()
         self._projection_clients: set[web.WebSocketResponse] = set()
         self._tool_clients: set[web.WebSocketResponse] = set()
-        self._overlay_clients: set[web.WebSocketResponse] = set()  # /depths popups
-        self._last_labels: Optional[list] = None   # last depth_labels object sent
+        self._overlay_clients: set[web.WebSocketResponse] = set()
+        self._last_labels: Optional[list] = None
         self._app = self._build_app()
 
     def _build_app(self) -> web.Application:
@@ -164,10 +145,7 @@ class Server:
         app.router.add_post("/projection/corners", self._handle_corners_post)
         app.router.add_get(WS_PATH, self._handle_ws)
         app.router.add_static(STATIC_PATH, _VIEWER_DIR, show_index=False)
-        # Participant-Mode cue audio for the projection window. Unlike the
-        # viewer assets these are NOT no-cache: they never change between
-        # restarts, and re-fetching a .wav mid-experience is a stutter.
-        _SOUNDS_DIR.mkdir(parents=True, exist_ok=True)   # add_static needs it
+        _SOUNDS_DIR.mkdir(parents=True, exist_ok=True)
         app.router.add_static(SOUNDS_URL_PATH, _SOUNDS_DIR, show_index=False)
         return app
 
@@ -219,25 +197,16 @@ class Server:
         return await self._mjpeg_stream(request, "last_mask_full_jpg")
 
     async def _handle_depth_cropped(self, request: web.Request) -> web.StreamResponse:
-        """Colorized depth restricted to the Developer-Mode crop — the
-        Participant popup's view (composed only while a popup is connected)."""
         return await self._mjpeg_stream(request, "last_depth_crop_jpg")
 
     async def _handle_status(self, request: web.Request) -> web.Response:
-        """Compact app state for external tools (MCP): one JSON object."""
         with self._lock:
             s = self._state
             out = {
                 "phase": s.get("phase", "idle"),
                 "robot_connected": s.get("robot_connected", False),
                 "camera_streaming": s.get("last_depth_color_jpg") is not None,
-                # Every view is the COMBINED canvas of the whole camera rig, so
-                # its size is not 640×480 and its aspect follows the saved
-                # Multi-Cam layout — tools that reason about crops need both.
                 "camera_count": s.get("camera_count", 0),
-                # frame_size is AFTER the view rotation, so a tool reading it
-                # gets the frame crops are actually relative to; the angle is
-                # reported beside it so the turn is not invisible.
                 "frame_size": s.get("frame_size"),
                 "view_rotation": s.get("view_rotation", 0),
                 "executing": s.get("executing", False),
@@ -262,7 +231,6 @@ class Server:
         return web.FileResponse(_VIEWER_DIR / "depth_view.html")
 
     def broadcast_ws(self) -> "_BroadcastWS":
-        """A ws-like object that broadcasts — for the automation pipeline."""
         return self._broadcast_ws
 
     async def _handle_corners_get(self, request: web.Request) -> web.Response:
@@ -287,27 +255,22 @@ class Server:
             self._state["projection_clients"] = len(self._projection_clients)
 
     def _participant_snapshot(self) -> dict:
-        """Participant-Mode block for state/init messages. Caller holds the lock."""
         return {
             "auto": bool(self._state.get("auto_on", False)),
             "status": self._state.get("participant_status", "Auto Off"),
             "message": self._state.get("participant_msg", ""),
             "trigger_mm": self._state.get("trigger_mm"),
             "below": self._state.get("trigger_below"),
-            # Max Drawing Time: the limit (minutes, None = off) and the seconds
-            # left on it — the popup's countdown is this number, never its own.
             "max_draw_min": self._state.get("max_draw_min"),
             "remaining_s": self._state.get("participant_remaining_s"),
-            "warn_s": PARTICIPANT_WARN_S,   # when the countdown goes red
+            "warn_s": PARTICIPANT_WARN_S,
         }
 
     def _set_overlay_count(self) -> None:
-        # The camera thread computes depth-number labels only while > 0.
         with self._lock:
             self._state["depth_overlay_clients"] = len(self._overlay_clients)
 
     async def broadcast_projection_blank(self, on: bool) -> None:
-        """Blank/unblank connected projection windows (used during Capture)."""
         msg = json.dumps({"type": "projection_blank", "on": on})
         for client in list(self._projection_clients):
             try:
@@ -317,7 +280,6 @@ class Server:
         self._set_projection_count()
 
     async def _handle_surface_upload(self, request: web.Request) -> web.Response:
-        """Receive an STL/OBJ mesh (multipart form field 'file') and load it."""
         if not self._on_surface_upload:
             return web.json_response({"ok": False, "error": "not supported"}, status=501)
         try:
@@ -330,13 +292,6 @@ class Server:
         except Exception as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
 
-    # ── Detection-parameter presets ──────────────────────────────────────────
-    # Save/list/load the Detection Parameters sliders — plus the Path Preview
-    # bar under an `exec` key — as small JSON files under PRESETS_DIR. The
-    # values live in the browser, so Save just persists the posted params object
-    # verbatim; Load hands one back for the browser to apply. Deliberately
-    # schema-free at this end: what a preset contains is the UI's business, and
-    # a file written by an older build must still load.
     async def _handle_presets_list(self, request: web.Request) -> web.Response:
         PRESETS_DIR.mkdir(parents=True, exist_ok=True)
         items = [
@@ -358,7 +313,7 @@ class Server:
         PRESETS_DIR.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         name, path, n = f"{ts}.json", PRESETS_DIR / f"{ts}.json", 2
-        while path.exists():          # guard two saves within the same second
+        while path.exists():
             name = f"{ts}_{n}.json"
             path = PRESETS_DIR / name
             n += 1
@@ -400,8 +355,6 @@ class Server:
             self._set_projection_count()
             self._overlay_clients.discard(ws)
             self._set_overlay_count()
-            # Shutdown-on-last-disconnect tracks BROWSER clients only: an MCP
-            # tool connecting and disconnecting must not kill the app.
             if (not was_tool
                     and not (self._ws_clients - self._tool_clients)
                     and self._on_last_disconnect):
@@ -418,8 +371,6 @@ class Server:
             participant = self._participant_snapshot()
             detect = self._state.get("participant_gen_params") or {}
             exec_p = dict(self._state.get("participant_exec_params") or {})
-            # The Max Total Length box lives beside the exec bar's other values
-            # so a reopened window restores it with them.
             exec_p["max_length_mm"] = self._state.get("max_length_mm", 0.0)
             rotation = self._state.get("view_rotation", 0)
             ref_set = self._state.get("reference_depth") is not None
@@ -427,22 +378,10 @@ class Server:
             await ws.send_str(json.dumps({
                 "type": "init",
                 "participant": participant,
-                # Where the projection window fetches its cue audio, and which
-                # participant status plays which cue. Shipped rather than
-                # hardcoded in the page so config.SOUND_CUES stays the one
-                # place the mapping is written down.
                 "sounds": {"path": SOUNDS_URL_PATH, "cues": SOUND_CUES},
-                # Current session settings (crop/adjustments/spacing + exec-bar
-                # values) so a reopened Developer window restores its controls
-                # instead of showing — and later re-sending — the defaults.
                 "detect": detect,
                 "exec": exec_p,
-                # Quarter-turn rotation of the combined canvas, so the ⟳ button
-                # opens showing the angle the pipeline is actually using (it is
-                # restored from settings.json, not reset per window).
                 "view_rotation": rotation,
-                # Whether the trigger / ignore-closer cutoffs are heights above
-                # the sand (reference set) or absolute camera distances.
                 "reference_set": ref_set,
                 "last_ip": last_ip,
                 "workspace": ws_cfg.to_browser_dict() if ws_cfg is not None else None,
@@ -460,7 +399,6 @@ class Server:
     async def broadcast_surface_status(self, loaded: bool, info=None, pose=None,
                                        offset_mm: float = 0.0, mesh=None,
                                        message: str = "") -> None:
-        """Tell every client the surface changed (mesh sent only when included)."""
         msg = json.dumps({
             "type": "surface_status",
             "loaded": loaded,
@@ -488,11 +426,12 @@ class Server:
 
         if msg_type == "connect":
             ip = data.get("ip", "").strip()
-            if ip:
+            if ip and self._on_connect:
                 await self._on_connect(ip, ws)
 
         elif msg_type == "disconnect":
-            await self._on_disconnect(ws)
+            if self._on_disconnect:
+                await self._on_disconnect(ws)
 
         elif msg_type == "simulate_workspace":
             if self._on_simulate_workspace:
@@ -515,8 +454,6 @@ class Server:
                 asyncio.create_task(self._on_retake(ws))
 
         elif msg_type == "rotate_view":
-            # ⟳ on the Depth viewport: turn the whole combined canvas a quarter
-            # turn. Every other view is derived from that canvas, so they follow.
             if self._on_rotate_view:
                 asyncio.create_task(self._on_rotate_view(ws, data.get("params", {})))
 
@@ -557,7 +494,6 @@ class Server:
                 asyncio.create_task(self._on_remove_surface(data.get("params", {})))
 
         elif msg_type == "tool_hello":
-            # External tool (MCP) socket: exempt from shutdown-on-last-disconnect.
             self._tool_clients.add(ws)
 
         elif msg_type == "register_freedrive":
@@ -569,36 +505,26 @@ class Server:
                 asyncio.create_task(self._on_register_corner(ws, data.get("params", {})))
 
         elif msg_type == "depth_overlay_hello":
-            # This socket is a /depths popup: the camera thread computes the
-            # depth-number labels only while at least one is connected.
             self._overlay_clients.add(ws)
             self._set_overlay_count()
 
         elif msg_type == "preview_image":
-            # A Developer window volunteering a screenshot of its 3D preview, so
-            # an automated run can still write preview.png with nobody at the
-            # Save button. Not a manual pipeline action — never lock-gated.
             if self._on_preview_image:
                 asyncio.create_task(self._on_preview_image(data.get("params", {})))
 
         elif msg_type == "set_exec_params":
-            # Live sync of the exec-bar values (speed/offset/safety/spacing) so
-            # Participant Mode always matches what Developer Mode shows.
             if self._on_set_exec_params:
                 asyncio.create_task(self._on_set_exec_params(data.get("params", {})))
 
         elif msg_type == "set_trigger":
-            # Participant-Mode trigger distance (mm); null/empty clears it.
             if self._on_set_trigger:
                 asyncio.create_task(self._on_set_trigger(data.get("params", {})))
 
         elif msg_type == "set_max_draw_time":
-            # Participant-Mode Max Drawing Time (minutes); null/empty clears it.
             if self._on_set_max_draw_time:
                 asyncio.create_task(self._on_set_max_draw_time(data.get("params", {})))
 
         elif msg_type == "set_automation":
-            # Participant popup Auto toggle; ON locks the manual pipeline buttons.
             if self._on_set_automation:
                 asyncio.create_task(self._on_set_automation(data.get("params", {})))
 
@@ -607,15 +533,10 @@ class Server:
                 asyncio.create_task(self._on_depth_overlay_params(data.get("params", {})))
 
         elif msg_type == "projection_hello":
-            # This socket is a projection window: full-frame mask composition
-            # in the camera thread switches on while any are connected.
             self._projection_clients.add(ws)
             self._set_projection_count()
 
         elif msg_type == "projection_corners":
-            # Corner-pin update from the calibration window: persist it and
-            # mirror it to the other projection windows (e.g. the projector
-            # output) so they warp live while the user drags on the laptop.
             corners = data.get("corners")
             if (isinstance(corners, list) and len(corners) == 4
                     and all(isinstance(c, list) and len(c) == 2 for c in corners)):
@@ -623,7 +544,7 @@ class Server:
                 msg = json.dumps({"type": "projection_corners", "corners": corners})
                 for client in list(self._projection_clients):
                     if client is ws:
-                        continue          # don't echo back to the sender
+                        continue
                     try:
                         await client.send_str(msg)
                     except Exception:
@@ -636,9 +557,6 @@ class Server:
             if not self._ws_clients:
                 continue
 
-            # Depth-number labels → only to /depths popups, only when the
-            # camera thread produced a fresh list (identity check: it swaps
-            # the whole object, ~4 Hz, so most 20 Hz ticks send nothing).
             if self._overlay_clients:
                 with self._lock:
                     labels = self._state.get("depth_labels")
@@ -646,10 +564,6 @@ class Server:
                     rel = self._state.get("depth_labels_relative", False)
                 if labels is not None and labels is not self._last_labels:
                     self._last_labels = labels
-                    # ``size`` = [w, h] px of the cropped region the labels
-                    # (and the /depth/cropped stream) cover. ``relative`` says
-                    # what the numbers ARE: height above the sand when a
-                    # reference is set, else distance from the camera.
                     lmsg = json.dumps({"type": "depth_labels", "labels": labels,
                                        "size": size, "relative": rel})
                     for client in list(self._overlay_clients):
@@ -672,9 +586,6 @@ class Server:
                 length_mm  = self._state.get("path_length_mm", 0.0)
                 max_len_mm = self._state.get("max_length_mm", 0.0)
                 rotation   = self._state.get("view_rotation", 0)
-                # A reference switches the trigger and the "Ignore closer than"
-                # cutoff from distance-from-camera to height-above-sand, so both
-                # UIs have to relabel their boxes when it appears or is cleared.
                 ref_set    = self._state.get("reference_depth") is not None
                 participant = self._participant_snapshot()
 
@@ -693,9 +604,6 @@ class Server:
                 },
                 "workspace": ws_cfg.to_browser_dict() if ws_cfg is not None else None,
                 "exec_error": exec_error,
-                # Drawn length of the current path and the Max Total Length
-                # ceiling (0 = off). Server-computed so what the box shows is
-                # exactly what Run/Save judge.
                 "path_length_mm": round(length_mm, 1),
                 "max_length_mm": round(max_len_mm, 1),
                 "view_rotation": rotation,
@@ -729,7 +637,6 @@ class Server:
 
     async def send_still(self, ws, depth_jpg: Optional[bytes], rgb_jpg: Optional[bytes],
                          width: int, height: int) -> None:
-        """Send the frozen still (colorized depth + aligned RGB) plus its dimensions."""
         try:
             await ws.send_str(json.dumps({
                 "type": "still",
@@ -745,7 +652,6 @@ class Server:
                            grooves_jpg: Optional[bytes],
                            mask_jpg: Optional[bytes],
                            rgb_jpg: Optional[bytes] = None) -> None:
-        """Send the edit preview: full colorized depth + cropped RGB/skeleton/mask."""
         try:
             await ws.send_str(json.dumps({
                 "type": "preview",
@@ -772,7 +678,6 @@ class Server:
     async def send_register_result(self, ws, success: bool, message: str = "",
                                    pose: Optional[dict] = None,
                                    error: Optional[str] = None) -> None:
-        """Outcome of a corner→TCP registration step (freedrive or confirm)."""
         try:
             await ws.send_str(json.dumps({
                 "type": "register_result",
@@ -785,12 +690,6 @@ class Server:
             pass
 
     async def broadcast_view_rotation(self, deg: int, crop: dict | None) -> None:
-        """
-        Tell every client the canvas was turned, and hand back the crop turned
-        with it. Sent on the button press rather than folded into the 20 Hz
-        `state`: the crop is something the operator drags, and republishing it
-        continuously would fight their mouse.
-        """
         msg = json.dumps({"type": "view_rotation", "deg": deg, "crop": crop})
         dead = set()
         for client in list(self._ws_clients):
@@ -834,21 +733,12 @@ class Server:
                 "point_count": point_count,
                 "strokes": strokes_data or [],
                 "error": error,
-                # Which Generate Path these strokes came from. The browser echoes
-                # it back with a pushed preview image so a slow screenshot from
-                # an earlier generate can never be saved beside this path.
                 "path_serial": path_serial,
-                # Drawn length of this path (mm, corner zone applied) and the
-                # ceiling it is judged against — see path_length.py.
                 "length_mm": round(length_mm, 1),
                 "max_length_mm": round(max_length_mm, 1),
                 "reach_flags": reach_flags or [],
                 "reach_out": reach_out,
-                # Dense on-surface skeleton polylines ([x,y,z] only) — the white
-                # preview line. Separate from the executed waypoint strokes above.
                 "skeleton": skeleton_data or [],
-                # blend_m / reach_m / min_reach_m / spacing_mm for the browser's
-                # client-side toolpath rebuild (exec-bar Offset/Safety changes).
                 "exec_viz": exec_viz or {},
             }))
         except Exception:

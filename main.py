@@ -24,7 +24,7 @@ from config import (
     RESAMPLE_SPACING_MM, RESAMPLE_SPACING_MIN_MM, RESAMPLE_SPACING_MAX_MM,
     JOIN_DISTANCE_MM, JOIN_DISTANCE_MIN_MM, JOIN_DISTANCE_MAX_MM,
     MAX_PATH_LENGTH_MM, MAX_PATH_LENGTH_MIN_MM, MAX_PATH_LENGTH_MAX_MM,
-    GOFA_REACH_M, GOFA_MIN_REACH_M, BLEND_ZONE_M, BLEND_ZONE_MAX_MM,
+    BLEND_ZONE_M, BLEND_ZONE_MAX_MM,
     PARTICIPANT_TICK_S, PARTICIPANT_CLEAR_S, TRIGGER_MIN_MM, TRIGGER_MAX_MM,
     PARTICIPANT_MAX_DRAW_MIN, PARTICIPANT_MAX_DRAW_MIN_MIN,
     PARTICIPANT_MAX_DRAW_MAX_MIN,
@@ -33,17 +33,13 @@ from config import (
 import text_guard
 import module_trace
 from automation import ParticipantAutomation
-from reach import reach_flags as _compute_reach_flags
-from registration import register_pose
 from camera_thread import DepthCameraThread
 from depth_extractor import (
     Crop, DepthGrooveParams, colorize_depth, encode_jpeg, process_depth,
 )
 from path_extractor import extract_from_edges, pixels_to_robot_coords
-from path_executor import PathExecutor
 from path_export import is_png_data_url, save_bundle
 from path_length import exceeds_limit, total_length_mm
-from robot_controller import RobotController
 from server import Server
 from settings import load_settings, save_settings
 from surface import SurfaceModel, SurfacePose, SurfaceScene
@@ -51,7 +47,7 @@ from view_rotation import norm_deg, rotate_crop, rotate_image
 from workspace import WorkspaceConfig, scene_mm_per_px
 from zmq_bridge import send_path_to_charlotte, TileReceiver
 
-# ── Shared state ──────────────────────────────────────────────────────────────
+# ── Shared state ────────────────────────────────────────────────────────────
 shared_state: dict = {
     "robot_connected":     False,
     "last_depth_color_jpg": None,    # colorized depth (live view)
@@ -126,78 +122,16 @@ state_lock = threading.Lock()
 
 EMULATE_CAPTURE = True  # True = no camera -- auto-generate + save + send after every tile switch. Set False once the camera's reconnected.
 
-# ── Singletons ────────────────────────────────────────────────────────────────
-robot         = RobotController()
+# ── Singletons ──────────────────────────────────────────────────────────────
 camera_thread = DepthCameraThread(shared_state, state_lock)
-path_executor = PathExecutor(robot, shared_state, state_lock)
 automation    = ParticipantAutomation(
     clear_ticks=round(PARTICIPANT_CLEAR_S / PARTICIPANT_TICK_S),
     max_draw_s=(PARTICIPANT_MAX_DRAW_MIN or 0.0) * 60.0)
 
 
-# ── Robot connection callbacks ────────────────────────────────────────────────
-async def on_robot_connect(ip: str, ws) -> None:
-    loop = asyncio.get_running_loop()
-    try:
-        await asyncio.wait_for(
-            loop.run_in_executor(None, robot.connect, ip),
-            timeout=10.0,
-        )
-        with state_lock:
-            shared_state["robot_connected"] = True
-
-        save_settings({"last_ip": ip})
-
-        await server.send_connection_result(
-            ws, True, f"Connected to {ip} — load a 3D surface to start."
-        )
-        module_trace.log("connect", f"Robot connected: {ip}")
-
-    except asyncio.TimeoutError:
-        with state_lock:
-            shared_state["robot_connected"] = False
-        msg = (
-            f"Timeout: no answer from the ROS bridge at {ip} after 10 s. "
-            "Is `docker compose up` running, and the RRC task started on the "
-            "pendant?"
-        )
-        await server.send_connection_result(ws, False, msg)
-        module_trace.log("connect", msg)
-    except Exception as exc:
-        with state_lock:
-            shared_state["robot_connected"] = False
-        await server.send_connection_result(ws, False, str(exc))
-        module_trace.log("connect", f"Robot connection failed: {exc}")
-
-
-async def on_robot_disconnect(ws) -> None:
-    loop = asyncio.get_running_loop()
-    path_executor.cancel()
-    if robot.connected:
-        await loop.run_in_executor(None, robot.end_freedrive)
-    await loop.run_in_executor(None, robot.disconnect)
-    with state_lock:
-        shared_state["robot_connected"] = False
-        shared_state["freedrive"]       = False
-        shared_state["pending_workspace"] = None
-        shared_state["executing"]       = False
-        shared_state["phase"]           = "idle"
-    if ws is not None:
-        await server.send_connection_result(ws, False, "Disconnected")
-    module_trace.log("disconnect", "Robot disconnected")
-
-
 async def on_last_client_disconnect() -> None:
-    print("Last client disconnected — stopping camera and robot.")
-    loop = asyncio.get_running_loop()
+    print("Last client disconnected — stopping camera.")
     camera_thread.stop()
-    path_executor.cancel()
-    if robot.connected:
-        await loop.run_in_executor(None, robot.end_freedrive)
-        await loop.run_in_executor(None, robot.disconnect)
-        with state_lock:
-            shared_state["robot_connected"] = False
-            shared_state["freedrive"]       = False
     os.kill(os.getpid(), signal.SIGINT)
 
 
@@ -237,7 +171,7 @@ async def on_simulate_workspace() -> None:
 _ABSOLUTE_LOOKING_MM = 300.0
 
 
-# ── Capture image / Edit / Generate path callbacks ───────────────────────────
+# ── Capture image / Edit / Generate path callbacks ──────────────────────────────
 def _frame_size() -> tuple[int, int] | None:
     """
     Size of the frame the pipeline is working from — the COMBINED camera canvas.
@@ -328,7 +262,7 @@ async def on_clear_reference(ws) -> None:
     module_trace.log("reference", "Reference depth cleared.")
 
 
-# ── Target surface (3D projection) callbacks ─────────────────────────────────
+# ── Target surface (3D projection) callbacks ─────────────────────────────────────
 # Loading and removing are read-modify-write on the scene (read the current
 # parts, rebuild, store) with awaits in between, so they are serialized: two
 # clients uploading at once must not drop a part.
@@ -533,99 +467,6 @@ async def on_clear_surface() -> None:
     module_trace.log("surface", "[surface] cleared — paths map to the flat workspace again", extra=("workspace",))
 
 
-# ── Corner→TCP surface registration ──────────────────────────────────────────
-# Optional touch-off placement: pick a mesh corner in the Path Preview, guide
-# the tool tip onto the physical corner, confirm. 1-point for now (translation
-# only — rotation stays on the sliders); registration.py already solves
-# ≥3 points (full pose) for the future multi-point flow.
-#
-# Hand-guiding is NOT software-controlled on the GoFa: RRC has no freedrive
-# instruction, and lead-through is armed with the button on the arm itself.
-# The toggle therefore only arms the touch-off in the UI and tells the operator
-# what to do with their hands — the position is still read back with GetFrame,
-# so registration works exactly as before.
-async def on_register_freedrive(ws, params: dict) -> None:
-    """Arm/disarm the touch-off (registration popup button)."""
-    on = bool((params or {}).get("on"))
-    with state_lock:
-        connected = shared_state.get("robot_connected", False)
-        executing = shared_state.get("executing", False)
-    if not connected:
-        await server.send_register_result(ws, False, error="Robot not connected.")
-        return
-    if executing:
-        await server.send_register_result(
-            ws, False, error="Cannot hand-guide while executing.")
-        return
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
-        None, robot.start_freedrive if on else robot.end_freedrive)
-    with state_lock:
-        shared_state["freedrive"] = on
-    if on and not getattr(robot, "FREEDRIVE_IS_SOFTWARE_CONTROLLED", True):
-        await server.send_register_result(
-            ws, True,
-            message="Hold the lead-through button on the arm and guide the tool "
-                    "tip onto the corner, then confirm.")
-    module_trace.log(
-        "register",
-        f"[register] touch-off {'armed — guide the tool tip to the corner' if on else 'disarmed'}")
-
-
-async def on_register_corner(ws, params: dict) -> None:
-    """Confirm the touch-off: current TCP = the selected mesh corner."""
-    try:
-        idx = int((params or {}).get("corner_index", -1))
-    except (TypeError, ValueError):
-        idx = -1
-    with state_lock:
-        model = shared_state.get("surface_model")
-        pose_d = shared_state.get("surface_pose")
-        offset = shared_state.get("surface_offset_mm", 0.0)
-        info = shared_state.get("surface_info")
-        connected = shared_state.get("robot_connected", False)
-    if model is None:
-        await server.send_register_result(ws, False, error="No surface loaded.")
-        return
-    if not connected:
-        await server.send_register_result(ws, False, error="Robot not connected.")
-        return
-    corners = model.corner_points()
-    if not 0 <= idx < len(corners):
-        await server.send_register_result(ws, False, error="No corner selected.")
-        return
-
-    loop = asyncio.get_running_loop()
-    tcp = await loop.run_in_executor(None, robot.get_ee_position)
-    try:
-        new_pose = register_pose([corners[idx]], [tcp[:3]],
-                                 SurfacePose.from_dict(pose_d))
-    except ValueError as exc:
-        await server.send_register_result(ws, False, error=str(exc))
-        return
-
-    # Touch-off done — leave freedrive so the robot holds position again.
-    await loop.run_in_executor(None, robot.end_freedrive)
-    with state_lock:
-        shared_state["surface_pose"] = new_pose.to_dict()
-        shared_state["freedrive"] = False
-
-    # Corners belong to the COMBINED scene bbox, so the solved pose moves every
-    # loaded surface as one rigid assembly — their authored relative positions
-    # are preserved by construction.
-    n_parts = len(getattr(model, "parts", [])) or 1
-    whole = f" (all {n_parts} surfaces moved together)" if n_parts > 1 else ""
-    msg = (f"Corner {idx + 1} registered at TCP "
-           f"[{tcp[0]:.3f}, {tcp[1]:.3f}, {tcp[2]:.3f}] m{whole} — re-run Generate Path.")
-    await server.send_register_result(ws, True, message=msg, pose=new_pose.to_dict())
-    # Sliders + preview update everywhere via the normal surface_status path.
-    await server.broadcast_surface_status(
-        loaded=True, info=info, pose=new_pose.to_dict(), offset_mm=offset,
-        mesh=None, message=msg,
-    )
-    module_trace.log("register", f"[register] {msg}")
-
-
 async def on_capture_image(ws) -> None:
     """Freeze a temporally averaged depth (+ colour) frame and enter editing."""
     if _manual_locked(ws):
@@ -807,8 +648,6 @@ async def on_generate_path(ws, params: dict) -> None:
         for stroke in skeleton_strokes
     ]
 
-    reach_flags, reach_out, reach_total = _compute_reach_flags(robot_strokes)
-
     with state_lock:
         shared_state["strokes"] = robot_strokes
         shared_state["strokes_surface"] = surface_mode
@@ -841,15 +680,11 @@ async def on_generate_path(ws, params: dict) -> None:
         stroke_count=extracted.total_strokes,
         point_count=extracted.total_points,
         strokes_data=strokes_data,
-        reach_flags=reach_flags,
-        reach_out=reach_out,
         skeleton_data=skeleton_data,
         # Everything the browser needs to rebuild the toolpath preview
         # client-side when the exec-bar Offset/Safety inputs change.
         exec_viz={
             "blend_m": session_blend_mm / 1000.0,
-            "reach_m": GOFA_REACH_M,
-            "min_reach_m": GOFA_MIN_REACH_M,
             "spacing_mm": spacing_mm,
             "join_mm": join_mm,
         },
@@ -861,10 +696,8 @@ async def on_generate_path(ws, params: dict) -> None:
     # falls back to workspace.py — show whichever actually ran.
     module_trace.log(
         "generate",
-        f"Generated path: {extracted.total_strokes} strokes, {extracted.total_points} points"
-        + (f" — WARNING: {reach_out}/{reach_total} waypoints outside estimated reach"
-           if reach_out else ""),
-        extra=("surface" if surface_mode else "workspace", "reach"),
+        f"Generated path: {extracted.total_strokes} strokes, {extracted.total_points} points",
+        extra=("surface" if surface_mode else "workspace",),
     )
 
 
@@ -988,74 +821,6 @@ def _length_check(strokes, blend_mm: float, params: dict) -> tuple[bool, str]:
     return False, (f"Path too long: {actual:.0f} mm of drawing exceeds the "
                    f"{limit:.0f} mm Max Total Length. Rake a smaller drawing, "
                    f"or raise the limit.")
-
-
-async def on_run(ws, params: dict | None = None) -> None:
-    if _manual_locked(ws):
-        await server.send_capture_result(ws, False, error=_AUTO_LOCK_MSG)
-        return
-    with state_lock:
-        strokes      = shared_state.get("strokes", [])
-        connected    = shared_state.get("robot_connected", False)
-        surface_mode = shared_state.get("strokes_surface", False)
-
-    if not strokes:
-        return
-    if not connected:
-        await server.send_capture_result(ws, False, error="Robot not connected.")
-        return
-    if path_executor.running:
-        return
-
-    # Execution settings from the preview bar: speed as % of the robot's max
-    # TCP speed, plus run-time offset / safety retract distances in mm.
-    params = params or {}
-
-    def _num(key, default, lo, hi):
-        try:
-            return min(max(float(params.get(key, default)), lo), hi)
-        except (TypeError, ValueError):
-            return default
-
-    speed_pct = _num("speed_pct", (DRAW_SPEED / MAX_TCP_SPEED) * 100.0, 1.0, 100.0)
-    offset_mm = _num("offset_mm", 0.0, -20.0, 200.0)
-    safety_mm = _num("safety_mm", TRAVEL_Z * 1000.0, 5.0, 300.0)
-    blend_mm  = _num("blend_mm", BLEND_ZONE_M * 1000.0, 0.0, BLEND_ZONE_MAX_MM)
-    draw_speed = (speed_pct / 100.0) * MAX_TCP_SPEED
-
-    ok, why = _length_check(strokes, blend_mm, params)
-    if not ok:
-        await server.send_capture_result(ws, False, error=why)
-        module_trace.log("run", f"[executor] refused — {why}")
-        return
-
-    with state_lock:
-        shared_state["participant_exec_params"] = {
-            "speed_pct": speed_pct, "offset_mm": offset_mm,
-            "safety_mm": safety_mm, "blend_mm": blend_mm}
-
-    # Surface strokes already carry contact depth along the surface normal, so
-    # the executor must not add the planar DRAW_Z on top.
-    path_executor.start(
-        strokes,
-        draw_z=0.0 if surface_mode else DRAW_Z,
-        draw_speed=draw_speed,
-        normal_offset=offset_mm / 1000.0,
-        travel_dist=safety_mm / 1000.0,
-        blend_m=blend_mm / 1000.0,
-    )
-    module_trace.log(
-        "run",
-        f"[executor] starting path: {len(strokes)} strokes, "
-        f"{speed_pct:.0f}% speed ({draw_speed:.3f} m/s), "
-        f"offset {offset_mm:.1f} mm, safety {safety_mm:.0f} mm, "
-        f"blend {blend_mm:.1f} mm"
-        + (" (surface mode)" if surface_mode else ""))
-
-
-async def on_cancel(ws) -> None:
-    path_executor.cancel()
-    module_trace.log("cancel", "[executor] cancel requested")
 
 
 async def on_preview_image(params: dict) -> None:
@@ -1362,7 +1127,6 @@ async def _participant_pipeline() -> None:
         await on_generate_path(bws, gen_params)
         with state_lock:
             strokes = shared_state.get("strokes", [])
-            connected = shared_state.get("robot_connected", False)
             mask = shared_state.get("last_mask")
             exec_blend_mm = (shared_state.get("participant_exec_params") or {}).get(
                 "blend_mm", BLEND_ZONE_M * 1000.0)
@@ -1408,23 +1172,15 @@ async def _participant_pipeline() -> None:
                 module_trace.log("guard",
                                  f"[participant] profanity guard skipped: {verdict.reason}")
 
-        # ── Actuating: save the bundle first (always), then run on the robot.
+        # ── Actuating: save the bundle — the robot-execution repo (rrc-dev)
+        # picks it up from here via the tile hand-off / ZeroMQ bridge.
         automation.stage("Actuating")
         module_trace.log("run", "[participant] stage: Actuating", extra=("automation",))
         _sync_participant_state()
         with state_lock:
             exec_params = dict(shared_state.get("participant_exec_params") or {})
         await on_save_path(bws, exec_params)
-        if not connected:
-            automation.finish("Path saved — robot not connected, run skipped.")
-            return
-        await on_run(bws, exec_params)
-        await asyncio.sleep(0.5)                # let the executor thread spin up
-        while path_executor.running:
-            await asyncio.sleep(0.2)
-        with state_lock:
-            err = shared_state.get("exec_error")
-        automation.finish(f"Run failed: {err}" if err else "Done — path drawn and saved.")
+        automation.finish("Done — path drawn and saved.")
     except Exception as exc:
         automation.finish(f"Automation error: {exc}")
         module_trace.log("participant", f"[participant] pipeline error: {exc}")
@@ -1456,21 +1212,16 @@ async def _participant_loop() -> None:
             _sync_participant_state()
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────────────────
 server = Server(
     shared_state,
     state_lock,
-    robot,
-    on_connect=on_robot_connect,
-    on_disconnect=on_robot_disconnect,
     on_last_disconnect=on_last_client_disconnect,
     on_simulate_workspace=on_simulate_workspace,
     on_capture_image=on_capture_image,
     on_preview_adjust=on_preview_adjust,
     on_generate_path=on_generate_path,
     on_retake=on_retake,
-    on_run=on_run,
-    on_cancel=on_cancel,
     on_save_path=on_save_path,
     on_set_groove_params=on_set_groove_params,
     on_set_reference=on_set_reference,
@@ -1480,8 +1231,6 @@ server = Server(
     on_clear_surface=on_clear_surface,
     on_remove_surface=on_remove_surface,
     on_depth_overlay_params=on_depth_overlay_params,
-    on_register_freedrive=on_register_freedrive,
-    on_register_corner=on_register_corner,
     on_set_trigger=on_set_trigger,
     on_set_max_draw_time=on_set_max_draw_time,
     on_set_automation=on_set_automation,
@@ -1502,26 +1251,6 @@ if _saved_rotation:
 # Camera starts immediately so both MJPEG feeds are live from the moment you open the browser
 camera_thread.start()
 
-
-# ── Live TCP poller ───────────────────────────────────────────────────────────
-# Nothing else writes shared_state["ee"], so without this the preview's TCP dot
-# would sit at the origin forever. Poll the robot's TCP frame at 10 Hz while
-# connected; the broadcast loop relays it to the browser.
-def _ee_poller() -> None:
-    import time
-    while True:
-        time.sleep(0.1)
-        if not robot.connected:
-            continue
-        try:
-            pose = robot.get_ee_position()
-            with state_lock:
-                shared_state["ee"] = list(pose)
-        except Exception:
-            pass
-
-
-threading.Thread(target=_ee_poller, daemon=True, name="ee_poller").start()
 tile_receiver = TileReceiver(shared_state, state_lock)
 tile_receiver.start()
 
@@ -1546,6 +1275,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nShutting down.")
         camera_thread.stop()
-        path_executor.cancel()
-        robot.end_freedrive()
-        robot.disconnect()
