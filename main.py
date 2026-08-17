@@ -7,11 +7,6 @@ import signal
 import sys
 import threading
 import webbrowser
-import json
-import subprocess
-import tempfile
-import cv2
-import numpy as np
 
 # Force UTF-8 console output so Unicode in log messages (→, ×, …) never crashes
 # the program on Windows consoles that default to a legacy code page (cp1252).
@@ -24,13 +19,8 @@ for _stream in (sys.stdout, sys.stderr):
 from config import (
     HTTP_HOST, HTTP_PORT, CONTOUR_MIN_PIXELS,
     DEPTH_LABELS_INTERVAL_MM,
-<<<<<<< HEAD
-    DEPTH_WIDTH, DEPTH_HEIGHT, DEPTH_FPS, DEPTH_AVERAGE_FRAMES, SURFACE_DIR,
-    DRAW_SPEED, TRAVEL_Z, MAX_TCP_SPEED,
-=======
     DEPTH_FPS, DEPTH_AVERAGE_FRAMES, SURFACE_DIR,
     DRAW_Z, DRAW_SPEED, TRAVEL_Z, MAX_TCP_SPEED,
->>>>>>> origin/test
     RESAMPLE_SPACING_MM, RESAMPLE_SPACING_MIN_MM, RESAMPLE_SPACING_MAX_MM,
     JOIN_DISTANCE_MM, JOIN_DISTANCE_MIN_MM, JOIN_DISTANCE_MAX_MM,
     MAX_PATH_LENGTH_MM, MAX_PATH_LENGTH_MIN_MM, MAX_PATH_LENGTH_MAX_MM,
@@ -43,24 +33,25 @@ from config import (
 import text_guard
 import module_trace
 from automation import ParticipantAutomation
+from reach import reach_flags as _compute_reach_flags
+from registration import register_pose
 from camera_thread import DepthCameraThread
 from depth_extractor import (
     Crop, DepthGrooveParams, colorize_depth, encode_jpeg, process_depth,
 )
 from path_extractor import extract_from_edges, pixels_to_robot_coords
+from path_executor import PathExecutor
 from path_export import is_png_data_url, save_bundle
+from path_length import exceeds_limit, total_length_mm
+from robot_controller import RobotController
 from server import Server
 from settings import load_settings, save_settings
 from surface import SurfaceModel, SurfacePose, SurfaceScene
+from view_rotation import norm_deg, rotate_crop, rotate_image
 from workspace import WorkspaceConfig, scene_mm_per_px
 from zmq_bridge import send_path_to_charlotte, TileReceiver
-from tile_viewer import show_flat_stroke_preview, show_projection_preview
 
 # ── Shared state ──────────────────────────────────────────────────────────────
-# NOTE: robot_connected / freedrive / ee / executing / progress are kept in
-# this dict (always at their default, never set True) purely so server.py's
-# existing UI payload shape doesn't break on a missing key. No robot logic
-# writes to any of them anymore.
 shared_state: dict = {
     "robot_connected":     False,
     "last_depth_color_jpg": None,    # colorized depth (live view)
@@ -72,13 +63,26 @@ shared_state: dict = {
     "depth_overlay_clients": 0,      # connected /depths popups (gates the labels)
     "depth_labels":        None,     # [[u, v, mm], ...] for the depth-number overlay
     "depth_labels_size":   None,     # [w, h] px of the crop the labels cover
+    # True when those mm are HEIGHT ABOVE THE SAND (a reference is set) rather
+    # than distance from the camera. Same switch the trigger uses, so the popup
+    # can name the units the operator is typing into the trigger box.
+    "depth_labels_relative": False,
     "last_depth_crop_jpg": None,     # cropped colorized depth for the popup
+    # Size of the COMBINED camera canvas (every view is the stitched rig) and
+    # how many cameras feed it. Published by the camera thread once the canvas
+    # geometry is frozen; None until then.
+    "frame_size":          None,     # [width, height] px of the combined canvas
+    "camera_count":        0,        # cameras combined into it
+    # Quarter-turn rotation of that canvas (Developer Mode's ⟳ button). Applied
+    # in the camera thread, so every view and the captured still inherit it.
+    # Persisted in settings.json — it describes how the rig is mounted.
+    "view_rotation":       0,        # 0/90/180/270, clockwise
     "workspace":           None,     # WorkspaceConfig | None — confirmed workspace
     "pending_workspace":   None,     # WorkspaceConfig | None — loaded from disk
     "ws_points":           {"p0": None, "px": None, "py": None},
     "freedrive":           False,
     "ee":                  [0.0] * 6,
-    "phase":               "idle",     # idle|previewing|editing|captured|error
+    "phase":               "idle",     # idle|previewing|editing|captured|executing|done|error
     "captured_still":      None,       # (depth_m, valid, rgb) — frozen averaged depth + colour
     "reference_depth":     None,       # baseline depth frame for background subtraction
     "surface_model":       None,       # SurfaceModel | None — target mesh for 3D projection
@@ -88,58 +92,130 @@ shared_state: dict = {
     "surface_mesh_payload": None,      # local-frame vertices/faces for the 3D preview
     "strokes_surface":     False,      # True when current strokes were surface-projected
     "still_dims":          None,       # (width, height) of the captured still
-    "strokes":             [],         # projected strokes after Generate Path
+    "strokes":             [],         # robot-space strokes after Generate Path
+    # Detection images from the last Generate Path, saved into the bundle and
+    # (mask only) OCR'd by the Participant-Mode profanity guard.
     "last_mask":           None,       # thick detected-region mask, cropped
     "last_skeleton":       None,       # 1-px groove centrelines, cropped
+    # 3D-preview screenshot pushed up by a Developer window (Participant Mode
+    # has nobody to click Save). Paired with the generate that produced it.
     "last_preview_png":    None,       # PNG data URL | None
     "path_serial":         0,          # bumped by every Generate Path
+    # Drawn length of the current path (mm, corner zone applied) and the ceiling
+    # the Max Total Length box sets. Over it, Run/Save refuse and Participant
+    # Mode calls the drawing Invalid. 0 = no limit.
+    "path_length_mm":      0.0,
+    "max_length_mm":       MAX_PATH_LENGTH_MM,
     "executing":           False,
     "progress":            0.0,
     # ── Participant Mode (automated pipeline) ──
-    "auto_on":             False,
-    "trigger_mm":          None,
-    "trigger_below":       None,
-    "participant_status":  "Auto Off",
-    "participant_msg":     "",
-    "participant_gen_params":  {},
-    "participant_exec_params": {},
+    "auto_on":             False,      # Participant popup Auto toggle
+    "trigger_mm":          None,       # trigger distance (mm from camera); None = off
+    "trigger_below":       None,       # camera thread: something closer than trigger_mm?
+    # Max Drawing Time: minutes one participant may occupy the sand (hand in →
+    # hand out). None = off. remaining_s is what the popup counts down.
+    "max_draw_min":        PARTICIPANT_MAX_DRAW_MIN or None,
+    "participant_remaining_s": None,
+    "participant_status":  "Auto Off", # Auto Off|Auto On|Alerted|Sensing|Generating Paths|Actuating|Invalid
+    "participant_msg":     "",         # last automation outcome/message
+    "participant_gen_params":  {},     # last crop/adjustments/spacing from Developer Mode
+    "participant_exec_params": {},     # last speed_pct/offset_mm/safety_mm from Developer Mode
     "next_tile_id": None,   # set by zmq_bridge.TileReceiver; the tile Charlotte wants next
 }
 state_lock = threading.Lock()
 
-EMULATE_CAPTURE = False  # True = no camera -- auto-generate + save + send after every tile switch. Set False once the camera's reconnected.
-STARTUP_TILE_ID = 1  # tile used immediately on startup, before any message arrives. None = wait for a real message like before.
-SHOW_PROJECTION_VIEWER = True  # True = open a compas_viewer window (tile + projected path) before every send. False = run unattended.
+EMULATE_CAPTURE = True  # True = no camera -- auto-generate + save + send after every tile switch. Set False once the camera's reconnected.
 
 # ── Singletons ────────────────────────────────────────────────────────────────
+robot         = RobotController()
 camera_thread = DepthCameraThread(shared_state, state_lock)
+path_executor = PathExecutor(robot, shared_state, state_lock)
 automation    = ParticipantAutomation(
-    clear_ticks=round(PARTICIPANT_CLEAR_S / PARTICIPANT_TICK_S))
+    clear_ticks=round(PARTICIPANT_CLEAR_S / PARTICIPANT_TICK_S),
+    max_draw_s=(PARTICIPANT_MAX_DRAW_MIN or 0.0) * 60.0)
 
 
-# ── Robot connection -- STUBS ONLY ────────────────────────────────────────────
-# No RobotController, no RTDE, nothing physical. These exist only so
-# server.py's callback slots have something to call.
+# ── Robot connection callbacks ────────────────────────────────────────────────
 async def on_robot_connect(ip: str, ws) -> None:
-    await server.send_connection_result(ws, False, "Robot connection is not available in this repo -- see Charlotte's pipeline.")
+    loop = asyncio.get_running_loop()
+    try:
+        await asyncio.wait_for(
+            loop.run_in_executor(None, robot.connect, ip),
+            timeout=10.0,
+        )
+        with state_lock:
+            shared_state["robot_connected"] = True
+
+        save_settings({"last_ip": ip})
+
+        await server.send_connection_result(
+            ws, True, f"Connected to {ip} — load a 3D surface to start."
+        )
+        module_trace.log("connect", f"Robot connected: {ip}")
+
+    except asyncio.TimeoutError:
+        with state_lock:
+            shared_state["robot_connected"] = False
+        msg = (
+            f"Timeout: no answer from the ROS bridge at {ip} after 10 s. "
+            "Is `docker compose up` running, and the RRC task started on the "
+            "pendant?"
+        )
+        await server.send_connection_result(ws, False, msg)
+        module_trace.log("connect", msg)
+    except Exception as exc:
+        with state_lock:
+            shared_state["robot_connected"] = False
+        await server.send_connection_result(ws, False, str(exc))
+        module_trace.log("connect", f"Robot connection failed: {exc}")
 
 
 async def on_robot_disconnect(ws) -> None:
+    loop = asyncio.get_running_loop()
+    path_executor.cancel()
+    if robot.connected:
+        await loop.run_in_executor(None, robot.end_freedrive)
+    await loop.run_in_executor(None, robot.disconnect)
+    with state_lock:
+        shared_state["robot_connected"] = False
+        shared_state["freedrive"]       = False
+        shared_state["pending_workspace"] = None
+        shared_state["executing"]       = False
+        shared_state["phase"]           = "idle"
     if ws is not None:
         await server.send_connection_result(ws, False, "Disconnected")
+    module_trace.log("disconnect", "Robot disconnected")
 
 
 async def on_last_client_disconnect() -> None:
-    print("Last client disconnected — stopping camera.")
+    print("Last client disconnected — stopping camera and robot.")
+    loop = asyncio.get_running_loop()
     camera_thread.stop()
+    path_executor.cancel()
+    if robot.connected:
+        await loop.run_in_executor(None, robot.end_freedrive)
+        await loop.run_in_executor(None, robot.disconnect)
+        with state_lock:
+            shared_state["robot_connected"] = False
+            shared_state["freedrive"]       = False
     os.kill(os.getpid(), signal.SIGINT)
 
 
 # ── Workspace setup callbacks ─────────────────────────────────────────────────
+# The interactive 3-point (P0/Px/Py) freedrive calibration was removed: the
+# drawing target is now always a surface mesh loaded from file (or the Test
+# Mode synthetic workspace). WorkspaceConfig remains for the planar fallback.
 async def on_simulate_workspace() -> None:
-    """Set a synthetic workspace so the depth→groove→Path-Preview pipeline
-    can be tested without a surface loaded."""
-    ws_cfg = WorkspaceConfig.simulation()
+    """
+    Set a synthetic workspace so the depth→groove→Path-Preview pipeline can be
+    tested without a robot. Does not connect or move the robot; Run remains
+    gated on a real connection.
+    """
+    # The synthetic plane takes the COMBINED canvas's aspect, so a Test-Mode
+    # preview of a wide multi-camera view stays isotropic instead of being
+    # squashed into one camera's 4:3.
+    size = _frame_size()
+    ws_cfg = WorkspaceConfig.simulation(size[0] / size[1] if size else None)
     with state_lock:
         shared_state["workspace"]         = ws_cfg
         shared_state["pending_workspace"] = None
@@ -149,23 +225,48 @@ async def on_simulate_workspace() -> None:
         camera_thread.start()
     module_trace.log(
         "generate",
-        f"Simulation workspace active: "
+        f"Simulation workspace active (no robot): "
         f"{ws_cfg.x_extent:.3f} m × {ws_cfg.y_extent:.3f} m — Capture enabled.",
         extra=("workspace",),
     )
 
 
+# A trigger above this many mm was almost certainly typed as a distance from the
+# camera: no hand hovers half a metre over the sand. Used only to warn when a
+# reference is captured and the number's meaning changes under it.
+_ABSOLUTE_LOOKING_MM = 300.0
+
+
 # ── Capture image / Edit / Generate path callbacks ───────────────────────────
-def _mm_per_px(workspace, surface_model=None) -> float | None:
-    return scene_mm_per_px(workspace, surface_model)
+def _frame_size() -> tuple[int, int] | None:
+    """
+    Size of the frame the pipeline is working from — the COMBINED camera canvas.
+
+    The captured still wins when there is one, so a crop/generate keeps using
+    the frame it was taken on; otherwise the camera thread's live canvas. Both
+    are needed because the mm scale and the surface fit depend on it, and it is
+    no longer the fixed 640×480 of a single camera.
+    """
+    with state_lock:
+        dims = shared_state.get("still_dims")
+    return tuple(dims) if dims else camera_thread.frame_size
+
+
+def _mm_per_px(workspace, surface_model=None, frame_size=None) -> float | None:
+    """Scene scale for the mm-based filters/spacings — see workspace.scene_mm_per_px."""
+    return scene_mm_per_px(workspace, surface_model, frame_size or _frame_size())
 
 
 async def on_set_groove_params(params: dict) -> None:
+    """Push the latest Detect-Grooves params + crop to the camera thread so the
+    LIVE depth/groove feeds update in real time (used before an image is captured).
+    The crop restricts the live groove/mask preview to the selected region."""
     gp = DepthGrooveParams.from_dict(params.get("adjustments"))
     crop = Crop.from_dict(params.get("crop"))
     with state_lock:
         workspace = shared_state.get("workspace")
         surface_model = shared_state.get("surface_model")
+        # Participant Mode reuses the latest Developer-Mode detection settings.
         shared_state["participant_gen_params"].update(
             {"crop": params.get("crop"), "adjustments": params.get("adjustments")})
     camera_thread.set_live_params(gp)
@@ -174,6 +275,7 @@ async def on_set_groove_params(params: dict) -> None:
 
 
 async def on_depth_overlay_params(params: dict) -> None:
+    """Region band width (mm) for the /depths depth-number overlay popup."""
     try:
         interval = float(params.get("interval_mm", DEPTH_LABELS_INTERVAL_MM))
     except (TypeError, ValueError):
@@ -182,6 +284,17 @@ async def on_depth_overlay_params(params: dict) -> None:
 
 
 async def on_set_reference(ws) -> None:
+    """
+    Capture the current (undrawn) sand as a baseline.
+
+    The reference does two jobs. It cancels pre-existing natural grooves for
+    detection (`ref_strength`), and — because a picture of the empty sand
+    CONTAINS the camera's tilt — it turns "distance from the camera" into
+    "height above the sand" for the Participant trigger and the near-object
+    cutoff. That second job is what makes a tilted rig workable at all, so
+    setting one silently changes what those two numbers mean; say so, and warn
+    when the existing trigger value was plainly tuned as a camera distance.
+    """
     captured = camera_thread.capture_frame()
     if captured is None:
         await server.send_reference_status(ws, False, "No depth frame to set as reference.")
@@ -189,24 +302,46 @@ async def on_set_reference(ws) -> None:
     depth_m, _valid, _rgb = captured
     with state_lock:
         shared_state["reference_depth"] = depth_m
+        trigger_mm = shared_state.get("trigger_mm")
     camera_thread.set_reference(depth_m)
-    await server.send_reference_status(ws, True, "Reference captured — natural grooves can be subtracted.")
-    module_trace.log("reference", "Reference depth captured for background subtraction.")
+    msg = ("Reference captured — natural grooves can be subtracted, and the "
+           "Participant trigger + near-object cutoff now measure HEIGHT ABOVE "
+           "THE SAND (tilt-proof) instead of distance from the camera.")
+    if trigger_mm is not None and trigger_mm > _ABSOLUTE_LOOKING_MM:
+        msg += (f" Your trigger is still {trigger_mm:.0f} mm — that reads as a "
+                "camera distance; as a height above the sand try something "
+                "like 60–120 mm.")
+    await server.send_reference_status(ws, True, msg)
+    module_trace.log("reference",
+                     "Reference depth captured — background subtraction on, "
+                     "trigger + near-object cutoff now relative to the sand.")
 
 
 async def on_clear_reference(ws) -> None:
     with state_lock:
         shared_state["reference_depth"] = None
     camera_thread.set_reference(None)
-    await server.send_reference_status(ws, False, "Reference cleared.")
+    await server.send_reference_status(
+        ws, False,
+        "Reference cleared — the trigger and near-object cutoff are absolute "
+        "distances from the camera again.")
     module_trace.log("reference", "Reference depth cleared.")
 
 
 # ── Target surface (3D projection) callbacks ─────────────────────────────────
+# Loading and removing are read-modify-write on the scene (read the current
+# parts, rebuild, store) with awaits in between, so they are serialized: two
+# clients uploading at once must not drop a part.
 _surface_lock = asyncio.Lock()
 
 
 async def on_surface_upload(filename: str, blob: bytes) -> dict:
+    """
+    Save an uploaded STL/OBJ, ADD it to the surface scene, and broadcast the
+    combined mesh + status. Loading is cumulative: each file keeps the position
+    authored in it, so surfaces exported from one Rhino document assemble
+    themselves. Re-loading the same file name replaces that part in place.
+    """
     SURFACE_DIR.mkdir(exist_ok=True)
     safe_name = os.path.basename(filename)
     path = SURFACE_DIR / safe_name
@@ -227,6 +362,8 @@ async def on_surface_upload(filename: str, blob: bytes) -> dict:
             shared_state["surface_mesh_payload"] = mesh_payload
             pose = shared_state["surface_pose"]
             offset = shared_state["surface_offset_mm"]
+            # A surface replaces the flat workspace for mapping, so it also
+            # unlocks the capture flow — no P0/Px/Py calibration in surface mode.
             if shared_state["phase"] == "idle":
                 shared_state["phase"] = "previewing"
 
@@ -274,9 +411,7 @@ async def switch_to_tile(tile_id: int) -> None:
 
 def _emulate_pixel_stroke(width: int, height: int) -> list:
     """Synthetic 2D drawing -- a sine wave, randomized a bit each call so
-    successive emulated captures aren't identical. Stands in ONLY for
-    camera capture + groove detection -- projection (project_strokes)
-    is the same real raycasting code a live capture uses."""
+    successive emulated captures aren't identical."""
     margin = 0.15
     amplitude = height * 0.3
     frequency = random.uniform(2.0, 4.0)
@@ -315,33 +450,6 @@ async def _emulate_capture_and_save(tile_id: int) -> None:
         module_trace.log("surface", f"[emulate] projection failed: {exc}")
         return
 
-    if SHOW_PROJECTION_VIEWER:
-        mm_per_px = surface_model.drawing_mm_per_px(DEPTH_WIDTH, DEPTH_HEIGHT)
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump({
-                "pixel_strokes": fake_strokes,
-                "frame_width": DEPTH_WIDTH,
-                "frame_height": DEPTH_HEIGHT,
-                "mm_per_px": mm_per_px,
-            }, f)
-            flat_data_path = f.name
-
-        module_trace.log("surface", f"[emulate] tile {tile_id}: opening RAW stroke viewer -- close it to continue")
-        await loop.run_in_executor(None, subprocess.run, ["python", "tile_viewer.py", "flat", flat_data_path])
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump({
-                "mesh_vertices": surface_model.mesh.vertices.tolist(),
-                "mesh_faces": surface_model.mesh.faces.tolist(),
-                "robot_strokes": robot_strokes,
-                "tile_id": tile_id,
-            }, f)
-            projected_data_path = f.name
-
-        module_trace.log("surface", f"[emulate] tile {tile_id}: opening PROJECTED viewer -- close it to continue")
-        await loop.run_in_executor(None, subprocess.run, ["python", "tile_viewer.py", "projected", projected_data_path])
-
     with state_lock:
         shared_state["strokes"] = robot_strokes
         shared_state["strokes_surface"] = True
@@ -351,18 +459,8 @@ async def _emulate_capture_and_save(tile_id: int) -> None:
     await on_save_path(server.broadcast_ws(), {})
 
 
-
 async def _tile_switch_watcher() -> None:
     last_seq = None
-
-    if STARTUP_TILE_ID is not None:
-        module_trace.log("surface", f"[startup] using tile {STARTUP_TILE_ID} immediately")
-        with state_lock:
-            shared_state["next_tile_id"] = STARTUP_TILE_ID
-        await switch_to_tile(STARTUP_TILE_ID)
-        if EMULATE_CAPTURE:
-            await _emulate_capture_and_save(STARTUP_TILE_ID)
-
     while True:
         await asyncio.sleep(1.0)
         with state_lock:
@@ -374,8 +472,8 @@ async def _tile_switch_watcher() -> None:
             if EMULATE_CAPTURE:
                 await _emulate_capture_and_save(tile_id)
 
-
 async def on_remove_surface(params: dict) -> None:
+    """Drop ONE loaded surface from the scene (the ✕ next to it in the list)."""
     try:
         idx = int((params or {}).get("index", -1))
     except (TypeError, ValueError):
@@ -383,11 +481,13 @@ async def on_remove_surface(params: dict) -> None:
     async with _surface_lock:
         with state_lock:
             scene = shared_state.get("surface_model")
+        # Explicit bounds check: a missing/garbled index must be a no-op, and
+        # Python would happily read parts[-1] as "the last one".
         if not isinstance(scene, SurfaceScene) or not 0 <= idx < len(scene.parts):
             return
         removed = scene.parts[idx].name
         new_scene = scene.without_part(idx)
-        if new_scene is None:
+        if new_scene is None:                   # last one gone → back to flat
             await on_clear_surface()
             return
 
@@ -410,6 +510,7 @@ async def on_remove_surface(params: dict) -> None:
 
 
 async def on_set_surface_pose(params: dict) -> None:
+    """Update the surface placement (base frame) and TCP normal-offset."""
     pose = SurfacePose.from_dict(params.get("pose"))
     try:
         offset = float(params.get("offset_mm", 0.0))
@@ -422,6 +523,7 @@ async def on_set_surface_pose(params: dict) -> None:
 
 
 async def on_clear_surface() -> None:
+    """Remove every loaded surface (the whole scene)."""
     with state_lock:
         shared_state["surface_model"] = None
         shared_state["surface_info"] = None
@@ -431,13 +533,97 @@ async def on_clear_surface() -> None:
     module_trace.log("surface", "[surface] cleared — paths map to the flat workspace again", extra=("workspace",))
 
 
-# ── Corner registration -- STUBS ONLY (needed the robot's live TCP position) ──
+# ── Corner→TCP surface registration ──────────────────────────────────────────
+# Optional touch-off placement: pick a mesh corner in the Path Preview, guide
+# the tool tip onto the physical corner, confirm. 1-point for now (translation
+# only — rotation stays on the sliders); registration.py already solves
+# ≥3 points (full pose) for the future multi-point flow.
+#
+# Hand-guiding is NOT software-controlled on the GoFa: RRC has no freedrive
+# instruction, and lead-through is armed with the button on the arm itself.
+# The toggle therefore only arms the touch-off in the UI and tells the operator
+# what to do with their hands — the position is still read back with GetFrame,
+# so registration works exactly as before.
 async def on_register_freedrive(ws, params: dict) -> None:
-    await server.send_register_result(ws, False, error="Robot registration is not available in this repo.")
+    """Arm/disarm the touch-off (registration popup button)."""
+    on = bool((params or {}).get("on"))
+    with state_lock:
+        connected = shared_state.get("robot_connected", False)
+        executing = shared_state.get("executing", False)
+    if not connected:
+        await server.send_register_result(ws, False, error="Robot not connected.")
+        return
+    if executing:
+        await server.send_register_result(
+            ws, False, error="Cannot hand-guide while executing.")
+        return
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None, robot.start_freedrive if on else robot.end_freedrive)
+    with state_lock:
+        shared_state["freedrive"] = on
+    if on and not getattr(robot, "FREEDRIVE_IS_SOFTWARE_CONTROLLED", True):
+        await server.send_register_result(
+            ws, True,
+            message="Hold the lead-through button on the arm and guide the tool "
+                    "tip onto the corner, then confirm.")
+    module_trace.log(
+        "register",
+        f"[register] touch-off {'armed — guide the tool tip to the corner' if on else 'disarmed'}")
 
 
 async def on_register_corner(ws, params: dict) -> None:
-    await server.send_register_result(ws, False, error="Robot registration is not available in this repo.")
+    """Confirm the touch-off: current TCP = the selected mesh corner."""
+    try:
+        idx = int((params or {}).get("corner_index", -1))
+    except (TypeError, ValueError):
+        idx = -1
+    with state_lock:
+        model = shared_state.get("surface_model")
+        pose_d = shared_state.get("surface_pose")
+        offset = shared_state.get("surface_offset_mm", 0.0)
+        info = shared_state.get("surface_info")
+        connected = shared_state.get("robot_connected", False)
+    if model is None:
+        await server.send_register_result(ws, False, error="No surface loaded.")
+        return
+    if not connected:
+        await server.send_register_result(ws, False, error="Robot not connected.")
+        return
+    corners = model.corner_points()
+    if not 0 <= idx < len(corners):
+        await server.send_register_result(ws, False, error="No corner selected.")
+        return
+
+    loop = asyncio.get_running_loop()
+    tcp = await loop.run_in_executor(None, robot.get_ee_position)
+    try:
+        new_pose = register_pose([corners[idx]], [tcp[:3]],
+                                 SurfacePose.from_dict(pose_d))
+    except ValueError as exc:
+        await server.send_register_result(ws, False, error=str(exc))
+        return
+
+    # Touch-off done — leave freedrive so the robot holds position again.
+    await loop.run_in_executor(None, robot.end_freedrive)
+    with state_lock:
+        shared_state["surface_pose"] = new_pose.to_dict()
+        shared_state["freedrive"] = False
+
+    # Corners belong to the COMBINED scene bbox, so the solved pose moves every
+    # loaded surface as one rigid assembly — their authored relative positions
+    # are preserved by construction.
+    n_parts = len(getattr(model, "parts", [])) or 1
+    whole = f" (all {n_parts} surfaces moved together)" if n_parts > 1 else ""
+    msg = (f"Corner {idx + 1} registered at TCP "
+           f"[{tcp[0]:.3f}, {tcp[1]:.3f}, {tcp[2]:.3f}] m{whole} — re-run Generate Path.")
+    await server.send_register_result(ws, True, message=msg, pose=new_pose.to_dict())
+    # Sliders + preview update everywhere via the normal surface_status path.
+    await server.broadcast_surface_status(
+        loaded=True, info=info, pose=new_pose.to_dict(), offset_mm=offset,
+        mesh=None, message=msg,
+    )
+    module_trace.log("register", f"[register] {msg}")
 
 
 async def on_capture_image(ws) -> None:
@@ -445,6 +631,9 @@ async def on_capture_image(ws) -> None:
     if _manual_locked(ws):
         await server.send_capture_result(ws, False, error=_AUTO_LOCK_MSG)
         return
+    # If a projector is running, blank it and wait for the rolling depth buffer
+    # to refill with projector-free frames — the average uses the PAST second,
+    # so blanking without the wait would not help.
     with state_lock:
         proj = shared_state.get("projection_clients", 0) > 0
     if proj:
@@ -477,6 +666,7 @@ async def on_capture_image(ws) -> None:
 
 
 async def on_preview_adjust(ws, params: dict) -> None:
+    """Reprocess the captured depth with the latest crop/groove params → preview."""
     with state_lock:
         still = shared_state.get("captured_still")
     if still is None:
@@ -505,6 +695,7 @@ async def on_preview_adjust(ws, params: dict) -> None:
     grooves_jpg = await loop.run_in_executor(None, encode_jpeg, processed.grooves)
     mask_jpg    = await loop.run_in_executor(None, encode_jpeg, processed.mask)
 
+    # Crop the captured RGB to the same region so the RGB view shows only the crop.
     rgb_jpg = None
     if _rgb is not None:
         x0, y0 = processed.origin
@@ -542,14 +733,17 @@ async def on_generate_path(ws, params: dict) -> None:
     width, height  = dims
     crop = Crop.from_dict(params.get("crop"))
     gp   = DepthGrooveParams.from_dict(params.get("adjustments"))
-    mmpp = _mm_per_px(workspace, surface_model)
+    mmpp = _mm_per_px(workspace, surface_model, (width, height))
 
+    # Waypoint spacing in mm (Path Preview slider), clamped to the allowed range.
     try:
         spacing_mm = float(params.get("spacing_mm", RESAMPLE_SPACING_MM))
     except (TypeError, ValueError):
         spacing_mm = RESAMPLE_SPACING_MM
     spacing_mm = min(max(spacing_mm, RESAMPLE_SPACING_MIN_MM), RESAMPLE_SPACING_MAX_MM)
 
+    # Endpoint-join distance in mm (Path Preview "Distance Threshold" box);
+    # 0 = off. Strokes whose ends fall within it merge into one toolpath.
     try:
         join_mm = float(params.get("join_mm", JOIN_DISTANCE_MM))
     except (TypeError, ValueError):
@@ -576,6 +770,10 @@ async def on_generate_path(ws, params: dict) -> None:
 
     dense = extracted.strokes_dense or []
     if surface_model is not None:
+        # Project the 2D drawing onto the 3D surface: waypoints lie on the mesh,
+        # TCP perpendicular to it, offset applied along the surface normal.
+        # The dense skeleton is projected at ZERO offset so the white preview
+        # line lies exactly on the surface regardless of TCP offset.
         try:
             robot_strokes = await loop.run_in_executor(
                 None, surface_model.project_strokes,
@@ -598,30 +796,44 @@ async def on_generate_path(ws, params: dict) -> None:
         )
         surface_mode = False
 
+    # Convert to serialisable list-of-lists for the browser's 3D preview
     strokes_data = [
         [[round(v, 5) for v in pose] for pose in stroke]
         for stroke in robot_strokes
     ]
+    # Skeleton needs positions only (white line) — drop orientations, round 4dp.
     skeleton_data = [
         [[round(pose[0], 4), round(pose[1], 4), round(pose[2], 4)] for pose in stroke]
         for stroke in skeleton_strokes
     ]
 
-    # Reach checking removed (reach.py was UR-specific). Kept the same
-    # payload shape so the browser doesn't choke on a missing key.
-    reach_flags, reach_out, reach_total = [], 0, len(robot_strokes)
+    reach_flags, reach_out, reach_total = _compute_reach_flags(robot_strokes)
 
     with state_lock:
         shared_state["strokes"] = robot_strokes
         shared_state["strokes_surface"] = surface_mode
+        # Both go into the saved bundle; the mask is additionally what the
+        # Participant-Mode profanity guard OCRs (never the skeleton — 1-px
+        # hairlines read terribly). Replaced in lockstep with `strokes`, so a
+        # save can never pick up images from a different generate.
         shared_state["last_mask"] = processed.mask
         shared_state["last_skeleton"] = processed.grooves
+        # The 3D preview belongs to the OLD path until a browser sends a new
+        # shot; drop it now so a stale picture can never reach the bundle.
         shared_state["last_preview_png"] = None
         path_serial = shared_state["path_serial"] + 1
         shared_state["path_serial"] = path_serial
         shared_state["phase"]   = "captured" if robot_strokes else "editing"
         session_blend_mm = (shared_state.get("participant_exec_params") or {}).get(
-            "blend_mm", MOVEP_BLEND_M * 1000.0)
+            "blend_mm", BLEND_ZONE_M * 1000.0)
+        max_length_mm = shared_state.get("max_length_mm", MAX_PATH_LENGTH_MM)
+
+    # How far the tool will travel while drawing. Measured on the projected
+    # robot-space strokes, so spacing, joining and the surface's real scale are
+    # already in the number; the corner zone is applied on top.
+    length_mm = total_length_mm(robot_strokes, session_blend_mm)
+    with state_lock:
+        shared_state["path_length_mm"] = length_mm
 
     await server.send_capture_result(
         ws,
@@ -632,23 +844,32 @@ async def on_generate_path(ws, params: dict) -> None:
         reach_flags=reach_flags,
         reach_out=reach_out,
         skeleton_data=skeleton_data,
+        # Everything the browser needs to rebuild the toolpath preview
+        # client-side when the exec-bar Offset/Safety inputs change.
         exec_viz={
             "blend_m": session_blend_mm / 1000.0,
-            "reach_m": UR_REACH_M,
-            "min_reach_m": UR_MIN_REACH_M,
+            "reach_m": GOFA_REACH_M,
+            "min_reach_m": GOFA_MIN_REACH_M,
             "spacing_mm": spacing_mm,
             "join_mm": join_mm,
         },
         path_serial=path_serial,
+        length_mm=length_mm,
+        max_length_mm=max_length_mm,
     )
+    # Mapping owner depends on the run: a loaded mesh uses surface.py, Test Mode
+    # falls back to workspace.py — show whichever actually ran.
     module_trace.log(
         "generate",
-        f"Generated path: {extracted.total_strokes} strokes, {extracted.total_points} points",
-        extra=("surface" if surface_mode else "workspace",),
+        f"Generated path: {extracted.total_strokes} strokes, {extracted.total_points} points"
+        + (f" — WARNING: {reach_out}/{reach_total} waypoints outside estimated reach"
+           if reach_out else ""),
+        extra=("surface" if surface_mode else "workspace", "reach"),
     )
 
 
 async def on_retake(ws) -> None:
+    """Discard the captured still and return to the live preview phase."""
     with state_lock:
         shared_state["captured_still"] = None
         shared_state["still_dims"]     = None
@@ -659,16 +880,197 @@ async def on_retake(ws) -> None:
     module_trace.log("capture", "Retake — back to live preview")
 
 
-# ── Robot execution -- STUBS ONLY (no PathExecutor, no robot to run on) ──────
+async def on_rotate_view(ws, params: dict | None = None) -> None:
+    """
+    Turn the whole combined canvas a quarter turn (Developer Mode's ⟳ button).
+
+    The camera thread turns the canvas itself, so every view follows for free.
+    What has to be re-based here is the state that was recorded in the OLD
+    orientation and would otherwise silently point at the wrong sand:
+
+      * the crop — turned with the picture, so it keeps framing the same region
+        (it is the server's copy that Participant Mode and a reopened window
+        read, so turning it here is what keeps every client agreeing);
+      * the reference frame — a full-canvas array, turned by the same amount so
+        background subtraction still lines up pixel for pixel;
+      * the workspace — a quarter turn swaps the canvas's width and height, and
+        Test Mode's plane takes its shape from that aspect;
+      * the captured still and its path — these CANNOT be re-based (the strokes
+        are already projected into robot space), so they are dropped, exactly
+        like Retake. Rotation is a framing adjustment: turn first, then capture.
+
+    Refused while Participant Auto is ON — re-aiming the camera mid-session
+    would change what a participant's drawing means halfway through it.
+    """
+    if _manual_locked(ws):
+        await server.send_capture_result(ws, False, error=_AUTO_LOCK_MSG)
+        return
+    try:
+        steps = int((params or {}).get("steps", 1))
+    except (TypeError, ValueError):
+        steps = 1
+
+    with state_lock:
+        old = shared_state.get("view_rotation", 0)
+        reference = shared_state.get("reference_depth")
+        gen_params = shared_state.get("participant_gen_params") or {}
+        crop_dict = gen_params.get("crop")
+        workspace = shared_state.get("workspace")
+    new = norm_deg(old + 90 * steps)
+    delta = norm_deg(new - old)
+
+    reference = rotate_image(reference, delta)
+    crop_dict = rotate_crop(crop_dict, delta)
+
+    with state_lock:
+        shared_state["view_rotation"] = new
+        shared_state["reference_depth"] = reference
+        shared_state["participant_gen_params"]["crop"] = crop_dict
+        # Same reset as Retake, plus the detection images the path was made of.
+        shared_state["captured_still"] = None
+        shared_state["still_dims"]     = None
+        shared_state["strokes"]        = []
+        shared_state["last_mask"]      = None
+        shared_state["last_skeleton"]  = None
+        shared_state["path_length_mm"] = 0.0
+        if shared_state["phase"] in ("editing", "captured", "done"):
+            shared_state["phase"] = "previewing"
+
+    camera_thread.set_view_rotation(new)
+    camera_thread.set_reference(reference)
+    camera_thread.set_live_crop(Crop.from_dict(crop_dict))
+
+    # frame_size is now the turned one, so re-derive anything shaped by it.
+    size = _frame_size()
+    if workspace is not None and size:
+        workspace = workspace.with_frame_aspect(size[0] / size[1])
+        with state_lock:
+            shared_state["workspace"] = workspace
+    with state_lock:
+        surface_model = shared_state.get("surface_model")
+    camera_thread.set_scale(_mm_per_px(workspace, surface_model, size))
+
+    save_settings({"view_rotation": new})
+    await server.broadcast_view_rotation(new, crop_dict)
+    where = f" — canvas now {size[0]}×{size[1]} px" if size else ""
+    module_trace.log(
+        "rotate",
+        f"View rotated to {new}°{where}; crop and reference turned with it, "
+        "captured still dropped — capture again",
+    )
+
+
+def _length_check(strokes, blend_mm: float, params: dict) -> tuple[bool, str]:
+    """
+    Enforce the Max Total Length box. Returns ``(ok, message)``.
+
+    The limit is read from the request when it carries one and from shared state
+    otherwise, so a Developer window's box and Participant Mode's synced copy
+    both land here. The length is recomputed from the strokes about to be used
+    with the blend about to be used — not the value cached at Generate time —
+    because Radius changes the drawn length and never triggers a regenerate.
+    """
+    limit = params.get("max_length_mm")
+    if limit is None:
+        with state_lock:
+            limit = shared_state.get("max_length_mm", MAX_PATH_LENGTH_MM)
+    try:
+        limit = min(max(float(limit), MAX_PATH_LENGTH_MIN_MM), MAX_PATH_LENGTH_MAX_MM)
+    except (TypeError, ValueError):
+        limit = MAX_PATH_LENGTH_MM
+
+    over, actual = exceeds_limit(strokes, blend_mm, limit)
+    with state_lock:
+        shared_state["path_length_mm"] = actual
+        shared_state["max_length_mm"] = limit
+    if not over:
+        return True, ""
+    return False, (f"Path too long: {actual:.0f} mm of drawing exceeds the "
+                   f"{limit:.0f} mm Max Total Length. Rake a smaller drawing, "
+                   f"or raise the limit.")
+
+
 async def on_run(ws, params: dict | None = None) -> None:
-    await server.send_capture_result(ws, False, error="Robot execution is not available in this repo -- see Charlotte's pipeline.")
+    if _manual_locked(ws):
+        await server.send_capture_result(ws, False, error=_AUTO_LOCK_MSG)
+        return
+    with state_lock:
+        strokes      = shared_state.get("strokes", [])
+        connected    = shared_state.get("robot_connected", False)
+        surface_mode = shared_state.get("strokes_surface", False)
+
+    if not strokes:
+        return
+    if not connected:
+        await server.send_capture_result(ws, False, error="Robot not connected.")
+        return
+    if path_executor.running:
+        return
+
+    # Execution settings from the preview bar: speed as % of the robot's max
+    # TCP speed, plus run-time offset / safety retract distances in mm.
+    params = params or {}
+
+    def _num(key, default, lo, hi):
+        try:
+            return min(max(float(params.get(key, default)), lo), hi)
+        except (TypeError, ValueError):
+            return default
+
+    speed_pct = _num("speed_pct", (DRAW_SPEED / MAX_TCP_SPEED) * 100.0, 1.0, 100.0)
+    offset_mm = _num("offset_mm", 0.0, -20.0, 200.0)
+    safety_mm = _num("safety_mm", TRAVEL_Z * 1000.0, 5.0, 300.0)
+    blend_mm  = _num("blend_mm", BLEND_ZONE_M * 1000.0, 0.0, BLEND_ZONE_MAX_MM)
+    draw_speed = (speed_pct / 100.0) * MAX_TCP_SPEED
+
+    ok, why = _length_check(strokes, blend_mm, params)
+    if not ok:
+        await server.send_capture_result(ws, False, error=why)
+        module_trace.log("run", f"[executor] refused — {why}")
+        return
+
+    with state_lock:
+        shared_state["participant_exec_params"] = {
+            "speed_pct": speed_pct, "offset_mm": offset_mm,
+            "safety_mm": safety_mm, "blend_mm": blend_mm}
+
+    # Surface strokes already carry contact depth along the surface normal, so
+    # the executor must not add the planar DRAW_Z on top.
+    path_executor.start(
+        strokes,
+        draw_z=0.0 if surface_mode else DRAW_Z,
+        draw_speed=draw_speed,
+        normal_offset=offset_mm / 1000.0,
+        travel_dist=safety_mm / 1000.0,
+        blend_m=blend_mm / 1000.0,
+    )
+    module_trace.log(
+        "run",
+        f"[executor] starting path: {len(strokes)} strokes, "
+        f"{speed_pct:.0f}% speed ({draw_speed:.3f} m/s), "
+        f"offset {offset_mm:.1f} mm, safety {safety_mm:.0f} mm, "
+        f"blend {blend_mm:.1f} mm"
+        + (" (surface mode)" if surface_mode else ""))
 
 
 async def on_cancel(ws) -> None:
-    pass
+    path_executor.cancel()
+    module_trace.log("cancel", "[executor] cancel requested")
 
 
 async def on_preview_image(params: dict) -> None:
+    """
+    A Developer window's screenshot of its 3D preview, sent unprompted after a
+    Generate Path while Participant Mode is running.
+
+    Participant Mode drives the pipeline server-side, so no Save click ever
+    carries an image up and preview.png would be the one missing file in an
+    automated bundle. The picture only exists in the browser (three.js draws it
+    on the client's GPU), so the browser volunteers it here instead.
+
+    Only kept if it is a real PNG of sane size AND belongs to the generate whose
+    strokes are currently loaded — same lockstep rule as last_mask/last_skeleton.
+    """
     params = params or {}
     image = params.get("image")
     try:
@@ -678,6 +1080,7 @@ async def on_preview_image(params: dict) -> None:
     if not is_png_data_url(image):
         return
     with state_lock:
+        # A screenshot from an earlier generate is worse than none at all.
         if serial != shared_state.get("path_serial"):
             return
         shared_state["last_preview_png"] = image
@@ -686,8 +1089,7 @@ async def on_preview_image(params: dict) -> None:
 
 
 async def on_save_path(ws, params: dict) -> None:
-    """Save the toolpath as JSON (+ preview/mask/skeleton images), then send
-    to Charlotte if a tile is set."""
+    """Save the toolpath as JSON + preview/mask/skeleton images."""
     from datetime import datetime
 
     with state_lock:
@@ -714,10 +1116,17 @@ async def on_save_path(ws, params: dict) -> None:
     speed_pct = _num("speed_pct", (DRAW_SPEED / MAX_TCP_SPEED) * 100.0, 1.0, 100.0)
     offset_mm = _num("offset_mm", 0.0, -20.0, 200.0)
     safety_mm = _num("safety_mm", TRAVEL_Z * 1000.0, 5.0, 300.0)
-    blend_mm  = _num("blend_mm", MOVEP_BLEND_M * 1000.0, 0.0, 5.0)
+    blend_mm  = _num("blend_mm", BLEND_ZONE_M * 1000.0, 0.0, BLEND_ZONE_MAX_MM)
     speed = (speed_pct / 100.0) * MAX_TCP_SPEED
 
+    ok, why = _length_check(strokes, blend_mm, params)
+    if not ok:
+        await server.send_save_result(ws, False, error=why)
+        module_trace.log("save", f"[save] refused — {why}")
+        return
+
     with state_lock:
+        length_mm = shared_state.get("path_length_mm", 0.0)
         shared_state["participant_exec_params"] = {
             "speed_pct": speed_pct, "offset_mm": offset_mm,
             "safety_mm": safety_mm, "blend_mm": blend_mm}
@@ -733,10 +1142,17 @@ async def on_save_path(ws, params: dict) -> None:
         "offset_mm": round(offset_mm, 2),
         "safety_mm": round(safety_mm, 1),
         "blend_mm": round(blend_mm, 2),
+        # Drawn length of what was saved — the number the Max Total Length box
+        # judges, recorded so a bundle says how much it lays down.
+        "path_length_mm": round(length_mm, 1),
         "stroke_count": len(strokes),
         "point_count": sum(len(s) for s in strokes),
     }
 
+    # Developer Mode: the Save click carries the screenshot. Participant Mode:
+    # nobody clicked, so fall back to whatever a Developer window pushed up for
+    # this same path. Neither available (no Developer window open) → no
+    # preview.png, exactly as before; a save must never fail over a picture.
     preview_png = params.get("image") or pushed_png
 
     loop = asyncio.get_running_loop()
@@ -764,8 +1180,14 @@ async def on_save_path(ws, params: dict) -> None:
     else:
         module_trace.log("save", "[zmq_bridge] no tile_id yet -- not sent")
 
-
 # ── Participant Mode (automated pipeline) ────────────────────────────────────
+# The Auto toggle + trigger threshold come from the ⧉ Participant popup; the
+# camera thread flags frames with anything closer than the trigger
+# (shared_state["trigger_below"]). The loop below feeds that flag to the state
+# machine; on an Alerted→clear edge the pipeline runs, reusing the SAME
+# handlers as the Developer-Mode buttons via server.broadcast_ws() — open
+# Developer windows see every step live. While Auto is ON, manual
+# capture/generate/run calls are refused (_manual_locked) and greyed out.
 def _sync_participant_state() -> None:
     with state_lock:
         shared_state["participant_status"] = automation.status
@@ -776,6 +1198,8 @@ _TRIGGER_HINT = "Enter a trigger distance (mm) to arm."
 
 
 def _update_trigger_hint() -> None:
+    """Auto ON without a trigger distance can never fire — say so in the popup.
+    Only ever writes/clears the hint, so pipeline outcome messages survive."""
     if automation.busy:
         return
     with state_lock:
@@ -787,6 +1211,8 @@ def _update_trigger_hint() -> None:
 
 
 def _manual_locked(ws) -> bool:
+    """True when Auto is ON and this pipeline call is NOT from the automation
+    itself (which uses the broadcast shim) — manual controls are locked out."""
     with state_lock:
         auto = bool(shared_state.get("auto_on"))
     return auto and ws is not server.broadcast_ws()
@@ -796,6 +1222,7 @@ _AUTO_LOCK_MSG = "Automation is ON — switch it off in the Participant window f
 
 
 async def on_set_automation(params: dict) -> None:
+    """Participant popup Auto toggle."""
     on = bool((params or {}).get("on"))
     with state_lock:
         shared_state["auto_on"] = on
@@ -806,6 +1233,11 @@ async def on_set_automation(params: dict) -> None:
 
 
 async def on_set_exec_params(params: dict) -> None:
+    """
+    Live sync of the Developer exec-bar values (debounced by the browser) so
+    Participant Mode always uses what Developer Mode currently shows — no Run
+    or Save Path needed to 'commit' them. Same clamps as on_run/on_save_path.
+    """
     params = params or {}
 
     def _num(key, default, lo, hi):
@@ -817,25 +1249,45 @@ async def on_set_exec_params(params: dict) -> None:
     speed_pct = _num("speed_pct", (DRAW_SPEED / MAX_TCP_SPEED) * 100.0, 1.0, 100.0)
     offset_mm = _num("offset_mm", 0.0, -20.0, 200.0)
     safety_mm = _num("safety_mm", TRAVEL_Z * 1000.0, 5.0, 300.0)
-    blend_mm  = _num("blend_mm", MOVEP_BLEND_M * 1000.0, 0.0, 5.0)
+    blend_mm  = _num("blend_mm", BLEND_ZONE_M * 1000.0, 0.0, BLEND_ZONE_MAX_MM)
     spacing_mm = _num("spacing_mm", RESAMPLE_SPACING_MM,
                       RESAMPLE_SPACING_MIN_MM, RESAMPLE_SPACING_MAX_MM)
     join_mm    = _num("join_mm", JOIN_DISTANCE_MM,
                       JOIN_DISTANCE_MIN_MM, JOIN_DISTANCE_MAX_MM)
+    max_length_mm = _num("max_length_mm", MAX_PATH_LENGTH_MM,
+                         MAX_PATH_LENGTH_MIN_MM, MAX_PATH_LENGTH_MAX_MM)
     with state_lock:
         shared_state["participant_exec_params"] = {
             "speed_pct": speed_pct, "offset_mm": offset_mm,
             "safety_mm": safety_mm, "blend_mm": blend_mm}
         shared_state["participant_gen_params"]["spacing_mm"] = spacing_mm
         shared_state["participant_gen_params"]["join_mm"]    = join_mm
+        shared_state["max_length_mm"] = max_length_mm
+        strokes = shared_state.get("strokes", [])
+
+    # Radius changes the drawn length but never regenerates the path, so the
+    # readout would go stale on a slider drag. Recompute here — this is already
+    # debounced by the browser, and it keeps ONE implementation of the maths.
+    if strokes:
+        length_mm = total_length_mm(strokes, blend_mm)
+        with state_lock:
+            shared_state["path_length_mm"] = length_mm
 
 
 async def on_set_trigger(params: dict) -> None:
+    """
+    Set (or clear with null/empty) the Participant-Mode trigger threshold.
+
+    The number is a height ABOVE THE SAND when a reference frame is set, and a
+    raw distance from the camera when there is none — the camera thread picks
+    the mode per frame, so nothing here has to know which is in force. One
+    range spans both, hence the low floor.
+    """
     raw = (params or {}).get("threshold_mm")
     mm = None
     try:
         if raw is not None and str(raw).strip() != "":
-            mm = min(max(float(raw), 50.0), 5000.0)
+            mm = min(max(float(raw), TRIGGER_MIN_MM), TRIGGER_MAX_MM)
     except (TypeError, ValueError):
         mm = None
     camera_thread.set_trigger_threshold(mm)
@@ -848,9 +1300,39 @@ async def on_set_trigger(params: dict) -> None:
     module_trace.log("participant", f"[participant] trigger {'set to %.0f mm' % mm if mm is not None else 'off'}", extra=("camera_thread",))
 
 
+async def on_set_max_draw_time(params: dict) -> None:
+    """
+    Set (or clear with null/empty) the Participant-Mode Max Drawing Time, in
+    MINUTES — how long one participant may keep the sand occupied, measured
+    from the trigger tripping to the frame going clear. Running out is judged
+    by the state machine itself (an Invalid verdict), not by the pipeline: the
+    point is to stop a drawing that never ends, so it cannot wait for one.
+    """
+    raw = (params or {}).get("minutes")
+    minutes = None
+    try:
+        if raw is not None and str(raw).strip() != "":
+            value = float(raw)
+            if value > 0:
+                minutes = min(max(value, PARTICIPANT_MAX_DRAW_MIN_MIN),
+                              PARTICIPANT_MAX_DRAW_MAX_MIN)
+    except (TypeError, ValueError):
+        minutes = None
+    automation.set_max_draw_s(None if minutes is None else minutes * 60.0)
+    with state_lock:
+        shared_state["max_draw_min"] = minutes
+        shared_state["participant_remaining_s"] = automation.remaining_s()
+    module_trace.log(
+        "participant",
+        "[participant] max drawing time "
+        + (f"set to {minutes:g} min" if minutes is not None else "off"),
+        extra=("automation",))
+
+
 async def _participant_pipeline() -> None:
     """One automated run: Sensing → Generating Paths → profanity guard →
-    save + send. A rejected drawing stops at the guard."""
+    Actuating (save + run). A rejected drawing stops at the guard: status
+    "Invalid", nothing saved, nothing sent to the robot."""
     bws = server.broadcast_ws()
     try:
         with state_lock:
@@ -860,6 +1342,8 @@ async def _participant_pipeline() -> None:
             automation.finish("Not ready — load a target surface (or Test Mode) in Developer Mode.")
             return
 
+        # ── Sensing: the averaged capture uses the PAST second of frames, so
+        # wait for the buffer to refill with hand-free frames first.
         _sync_participant_state()
         await asyncio.sleep(DEPTH_AVERAGE_FRAMES / DEPTH_FPS + 0.3)
         await on_capture_image(bws)
@@ -869,6 +1353,7 @@ async def _participant_pipeline() -> None:
             automation.finish("Capture failed — no depth frame.")
             return
 
+        # ── Generating Paths: latest Developer-Mode detection/spacing settings.
         automation.stage("Generating Paths")
         module_trace.log("generate", "[participant] stage: Generating Paths")
         _sync_participant_state()
@@ -877,11 +1362,38 @@ async def _participant_pipeline() -> None:
         await on_generate_path(bws, gen_params)
         with state_lock:
             strokes = shared_state.get("strokes", [])
+            connected = shared_state.get("robot_connected", False)
             mask = shared_state.get("last_mask")
+            exec_blend_mm = (shared_state.get("participant_exec_params") or {}).get(
+                "blend_mm", BLEND_ZONE_M * 1000.0)
+            max_length_mm = shared_state.get("max_length_mm", MAX_PATH_LENGTH_MM)
         if not strokes:
             automation.finish("No grooves detected — nothing to draw.")
             return
 
+        # ── Max Total Length: too much drawing to lay down. Refused like a
+        # profanity hit — Invalid, nothing saved, nothing run — because both
+        # are "this drawing is not acceptable", not "something went wrong".
+        over, actual_mm = exceeds_limit(strokes, exec_blend_mm, max_length_mm)
+        with state_lock:
+            shared_state["path_length_mm"] = actual_mm
+        if over:
+            automation.reject(
+                f"Drawing too long ({actual_mm / 1000.0:.2f} m of "
+                f"{max_length_mm / 1000.0:.2f} m allowed) — please rake it over "
+                "and draw something smaller.")
+            module_trace.log(
+                "run",
+                f"[participant] REJECTED: path {actual_mm:.0f} mm exceeds the "
+                f"{max_length_mm:.0f} mm Max Total Length",
+                extra=("automation",))
+            return
+
+        # ── Profanity guard: OCR the mask and stop here if it reads as
+        # offensive text. Participant Mode only — in Developer Mode the
+        # operator is present and decides. Nothing is saved and nothing is
+        # sent to the robot, and the status stays "Invalid" so whoever drew
+        # it sees the verdict.
         if PROFANITY_CHECK_ENABLED and mask is not None:
             loop = asyncio.get_running_loop()
             verdict = await loop.run_in_executor(None, text_guard.check_mask, mask)
@@ -896,13 +1408,23 @@ async def _participant_pipeline() -> None:
                 module_trace.log("guard",
                                  f"[participant] profanity guard skipped: {verdict.reason}")
 
+        # ── Actuating: save the bundle first (always), then run on the robot.
         automation.stage("Actuating")
         module_trace.log("run", "[participant] stage: Actuating", extra=("automation",))
         _sync_participant_state()
         with state_lock:
             exec_params = dict(shared_state.get("participant_exec_params") or {})
         await on_save_path(bws, exec_params)
-        automation.finish("Done — path saved and sent to Charlotte.")
+        if not connected:
+            automation.finish("Path saved — robot not connected, run skipped.")
+            return
+        await on_run(bws, exec_params)
+        await asyncio.sleep(0.5)                # let the executor thread spin up
+        while path_executor.running:
+            await asyncio.sleep(0.2)
+        with state_lock:
+            err = shared_state.get("exec_error")
+        automation.finish(f"Run failed: {err}" if err else "Done — path drawn and saved.")
     except Exception as exc:
         automation.finish(f"Automation error: {exc}")
         module_trace.log("participant", f"[participant] pipeline error: {exc}")
@@ -914,10 +1436,19 @@ async def _participant_pipeline() -> None:
 
 
 async def _participant_loop() -> None:
+    """Poll the camera trigger flag and drive the automation state machine."""
     while True:
         await asyncio.sleep(PARTICIPANT_TICK_S)
         with state_lock:
             below = shared_state.get("trigger_below")
+            executing = shared_state.get("executing", False)
+            # The countdown the popup shows is the state machine's own clock,
+            # republished each tick — one implementation, so what the
+            # participant reads is exactly what judges the drawing.
+            shared_state["participant_remaining_s"] = automation.remaining_s()
+        # A manually-started run owns the robot — don't trigger on top of it.
+        if executing and not automation.busy:
+            continue
         prev = (automation.status, automation.message)
         if automation.tick(below):
             asyncio.create_task(_participant_pipeline())
@@ -929,7 +1460,7 @@ async def _participant_loop() -> None:
 server = Server(
     shared_state,
     state_lock,
-    None,  # was `robot` -- no RobotController in this repo; see stubs above
+    robot,
     on_connect=on_robot_connect,
     on_disconnect=on_robot_disconnect,
     on_last_disconnect=on_last_client_disconnect,
@@ -952,14 +1483,45 @@ server = Server(
     on_register_freedrive=on_register_freedrive,
     on_register_corner=on_register_corner,
     on_set_trigger=on_set_trigger,
+    on_set_max_draw_time=on_set_max_draw_time,
     on_set_automation=on_set_automation,
     on_set_exec_params=on_set_exec_params,
     on_preview_image=on_preview_image,
+    on_rotate_view=on_rotate_view,
 )
+
+# The view rotation describes how the rig is mounted, so it outlives a restart.
+# Set BEFORE the thread starts: the canvas is published turned from the first
+# frame, and frame_size is right the first time anything reads it.
+_saved_rotation = norm_deg(load_settings().get("view_rotation", 0))
+if _saved_rotation:
+    shared_state["view_rotation"] = _saved_rotation
+    camera_thread.set_view_rotation(_saved_rotation)
+    print(f"[depth] view rotation {_saved_rotation}° restored from settings.json")
 
 # Camera starts immediately so both MJPEG feeds are live from the moment you open the browser
 camera_thread.start()
 
+
+# ── Live TCP poller ───────────────────────────────────────────────────────────
+# Nothing else writes shared_state["ee"], so without this the preview's TCP dot
+# would sit at the origin forever. Poll the robot's TCP frame at 10 Hz while
+# connected; the broadcast loop relays it to the browser.
+def _ee_poller() -> None:
+    import time
+    while True:
+        time.sleep(0.1)
+        if not robot.connected:
+            continue
+        try:
+            pose = robot.get_ee_position()
+            with state_lock:
+                shared_state["ee"] = list(pose)
+        except Exception:
+            pass
+
+
+threading.Thread(target=_ee_poller, daemon=True, name="ee_poller").start()
 tile_receiver = TileReceiver(shared_state, state_lock)
 tile_receiver.start()
 
@@ -970,6 +1532,7 @@ async def _open_browser() -> None:
 
 
 async def _main() -> None:
+    # Printed after every module has been imported, so the ✓/· marks are real.
     module_trace.print_banner()
     asyncio.create_task(_open_browser())
     asyncio.create_task(_participant_loop())
@@ -983,3 +1546,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nShutting down.")
         camera_thread.stop()
+        path_executor.cancel()
+        robot.end_freedrive()
+        robot.disconnect()
