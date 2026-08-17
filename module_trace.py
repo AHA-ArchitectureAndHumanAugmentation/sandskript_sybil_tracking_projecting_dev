@@ -30,7 +30,11 @@ from config import SHOW_MODULE_BANNER, SHOW_MODULE_TRACE
 # program tree in README.md and the pipeline list in CLAUDE.md.
 FEATURES: dict[str, tuple[str, ...]] = {
     "Core / server":      ("main", "server", "config", "settings"),
-    "Capture":            ("camera_thread", "depth_extractor"),
+    # Capture is multi-camera: every RealSense is read (realsense_source) and
+    # laid onto ONE combined canvas (stitcher) using the layout saved by the
+    # Multi-Cam Vision tool — that canvas is what the pipeline sees.
+    "Capture":            ("camera_thread", "realsense_source", "stitcher",
+                           "depth_extractor", "view_rotation"),
     "Groove detection":   ("depth_extractor",),
     "Stroke extraction":  ("path_extractor",),
     "Surface mapping":    ("surface", "workspace", "registration"),
@@ -38,6 +42,10 @@ FEATURES: dict[str, tuple[str, ...]] = {
     "Execution":          ("path_executor", "robot_controller"),
     "Export":             ("path_export",),
     "Participant Mode":   ("automation", "text_guard"),
+    # sound_design renders the cue .wav files ahead of time and is not imported
+    # by the running app (the projection window just fetches them), so it shows
+    # as not-loaded here on purpose.
+    "Sound cues":         ("sound_design", "server"),
 }
 
 # Pipeline action → the module chain that actually runs for it. Keys are the
@@ -45,9 +53,12 @@ FEATURES: dict[str, tuple[str, ...]] = {
 STAGES: dict[str, tuple[str, ...]] = {
     "connect":      ("robot_controller",),
     "disconnect":   ("robot_controller",),
-    "capture":      ("camera_thread", "depth_extractor"),
+    "capture":      ("camera_thread", "realsense_source", "stitcher", "depth_extractor"),
     "preview":      ("depth_extractor",),
     "reference":    ("camera_thread", "depth_extractor"),
+    # Turning the canvas re-bases the crop and reference (view_rotation) and the
+    # frame aspect the flat workspace is shaped by.
+    "rotate":       ("camera_thread", "view_rotation", "workspace"),
     "generate":     ("depth_extractor", "path_extractor"),
     "surface":      ("surface",),
     "register":     ("registration", "robot_controller", "surface"),

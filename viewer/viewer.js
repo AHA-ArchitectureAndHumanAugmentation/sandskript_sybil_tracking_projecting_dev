@@ -2,6 +2,15 @@
 const canvas   = document.getElementById("threejs-canvas");
 const panel    = document.getElementById("panel-3d");
 
+/* Every Path Preview control lives INSIDE #panel-3d, and "⧉ Pop out" moves that
+   whole panel into a second browser window — where this document's
+   getElementById can no longer find it (appendChild across documents adopts the
+   node out of this tree). So resolve those controls through the panel node,
+   which we keep across the move; the fallback covers ids outside the panel. */
+function execEl(id) {
+  return panel.querySelector("#" + id) || document.getElementById(id);
+}
+
 // preserveDrawingBuffer lets us grab the canvas as a PNG (for Save) at any time.
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
 renderer.setPixelRatio(window.devicePixelRatio);
@@ -192,9 +201,9 @@ function applySurfacePose(p) {
 /* Two layers:
    - skelGroup: the detected skeleton projected onto the surface — a dense
      WHITE line lying exactly ON the surface (zero offset). Pure geometry.
-   - pathGroup: the actual movep toolpath — waypoints at the chosen Spacing,
+   - pathGroup: the actual toolpath — waypoints at the chosen Spacing,
      lifted by the exec-bar Offset along each waypoint's tool axis, corners
-     rounded by the movep blend radius, with waypoint dots, amber safety
+     rounded by the corner zone radius, with waypoint dots, amber safety
      (retract) points and gray travel/approach moves. Rebuilt client-side
      whenever Offset or Safety change; Spacing re-generates on the server. */
 let pathGroup  = null;
@@ -231,13 +240,13 @@ function outOfReach(v) {
 }
 
 function readExecOffsetM() {
-  return (parseFloat(document.getElementById("exec-offset").value) || 0) / 1000;
+  return (parseFloat(execEl("exec-offset").value) || 0) / 1000;
 }
 function readExecSafetyM() {
-  return (parseFloat(document.getElementById("exec-safety").value) || 50) / 1000;
+  return (parseFloat(execEl("exec-safety").value) || 50) / 1000;
 }
 function readBlendMm() {
-  const v = parseFloat(document.getElementById("exec-blend").value);
+  const v = parseFloat(execEl("exec-blend").value);
   return Number.isFinite(v) ? v : 0.5;   // 0 is a valid value — no || fallback
 }
 
@@ -267,7 +276,7 @@ function buildSkeletonViz() {
 }
 
 /* Corner-blended colored segments for one stroke: interior corners are
-   trimmed by the movep blend radius and rounded with a small quadratic arc —
+   trimmed by the corner zone radius and rounded with a small quadratic arc —
    the shape the controller actually drives. Pushes [a,b] segment pairs. */
 function pushBlendedStroke(pts, flags, blend, okPts, badPts) {
   const n = pts.length;
@@ -420,7 +429,7 @@ function makeLabelSprite(text, scale) {
 
 function applyPathMode() {
   if (orderGroup) orderGroup.visible = (pathMode === "order");
-  const legend = document.getElementById("path-legend");
+  const legend = execEl("path-legend");
   if (legend) legend.classList.toggle("hidden", pathMode !== "order");
 }
 
@@ -479,6 +488,8 @@ function connectWS() {
       handleCaptureResult(data);
     } else if (data.type === "reference_status") {
       handleReferenceStatus(data);
+    } else if (data.type === "view_rotation") {
+      handleViewRotation(data);
     } else if (data.type === "surface_status") {
       handleSurfaceStatus(data);
     } else if (data.type === "save_result") {
@@ -527,25 +538,13 @@ function restoreSessionSettings(data) {
     crop = { x: c.x, y: c.y, w: c.w, h: c.h };
     renderCrop();
   }
-  if (Number.isFinite(d.spacing_mm)) {
-    document.getElementById("exec-spacing").value = d.spacing_mm;
-    document.getElementById("exec-spacing-val").textContent =
-      document.getElementById("exec-spacing").value + " mm";
-  }
-  if (Number.isFinite(d.join_mm)) document.getElementById("exec-join").value = d.join_mm;
-  const e = data.exec || {};
-  if (Number.isFinite(e.speed_pct)) {
-    document.getElementById("exec-speed").value = e.speed_pct;
-    document.getElementById("exec-speed-val").textContent =
-      document.getElementById("exec-speed").value + "%";
-  }
-  if (Number.isFinite(e.offset_mm)) document.getElementById("exec-offset").value = e.offset_mm;
-  if (Number.isFinite(e.safety_mm)) document.getElementById("exec-safety").value = e.safety_mm;
-  if (Number.isFinite(e.blend_mm)) {
-    document.getElementById("exec-blend").value = e.blend_mm;
-    document.getElementById("exec-blend-val").textContent =
-      document.getElementById("exec-blend").value + " mm";
-  }
+  // Spacing and Distance Threshold arrive under `detect` (they shape the path),
+  // the rest under `exec` — but they are one bar on screen, so one writer.
+  applyExecSettings({ ...(data.exec || {}),
+                      spacing_mm: d.spacing_mm, join_mm: d.join_mm });
+  // The canvas turn is a rig property restored from settings.json, not a
+  // per-window one — show the angle the pipeline is actually using.
+  showViewRotation(data.view_rotation);
 }
 
 function applyWorkspace(ws) {
@@ -564,6 +563,7 @@ function handleCaptureResult(data) {
   }
 
   document.getElementById("val-strokes").textContent = data.stroke_count;
+  showPathLength(data.length_mm, data.max_length_mm);
 
   if (data.strokes && data.strokes.length > 0) {
     setPathData(data.strokes, data.skeleton, data.exec_viz);
@@ -624,7 +624,7 @@ function updateScene(data) {
   }
 
   // Live TCP marker: bright blue + enlarged while the path is executing, so
-  // the dot visibly travels along the strokes during actuation (RTDE, 20 Hz).
+  // the dot visibly travels along the strokes during actuation (20 Hz poll).
   eeMat.color.setHex(data.executing ? 0x2e9fff : 0x4488ff);
   eeMat.emissive.setHex(data.executing ? 0x1a5acc : 0x223366);
   const s = data.executing ? 1.5 : 1.0;
@@ -639,6 +639,12 @@ function updateFooter(data) {
   if (typeof data.robot_connected === "boolean") robotConnected = data.robot_connected;
   if (typeof data.freedrive === "boolean") updateRegisterFreedrive(data.freedrive);
   if (data.participant) autoLocked = !!data.participant.auto;
+  showViewRotation(data.view_rotation);
+  showReferenceMode(data.reference_set);
+  // The server recomputes this whenever the Radius slider moves, so the
+  // readout follows a drag even though Radius never regenerates the path.
+  if (Number.isFinite(data.path_length_mm))
+    showPathLength(data.path_length_mm, data.max_length_mm);
 
   document.getElementById("val-phase").textContent   = data.phase || "idle";
   document.getElementById("val-strokes").textContent = data.stroke_count ?? 0;
@@ -679,14 +685,19 @@ function setButtonsForPhase(phase) {
   // manual buttons (the server refuses them too). Cancel stays live as the
   // emergency stop. Reapplied every state tick, so toggling Auto off in the
   // popup re-enables them within ~50 ms.
+  // Rotating re-aims the camera, so it is a pipeline action: the server refuses
+  // it while Auto owns the pipeline, and the button says so.
+  const rot = document.getElementById("btn-rotate-view");
   if (autoLocked) {
     cap.disabled = true;
     retake.disabled = true;
     gen.disabled = true;
     btnRun.disabled = true;
+    if (rot) rot.disabled = true;
   } else {
     retake.disabled = false;
     gen.disabled = false;
+    if (rot) rot.disabled = false;
   }
 }
 
@@ -884,14 +895,56 @@ document.getElementById("btn-capture-image").addEventListener("click", () => {
   setHeaderStatus("robot", true, "Capturing still…");
 });
 
-document.getElementById("btn-retake").addEventListener("click", () => {
+/* Drop the captured still and show the live feeds again. Shared by Retake and
+   by the rotate button, which invalidates a still taken at the old angle. */
+function backToLive(message) {
   stillLoaded = false;
   setPathData(null, null, null);
   showLive(true);
+  setHeaderStatus("robot", true, message);
+}
+
+document.getElementById("btn-retake").addEventListener("click", () => {
+  backToLive("Back to live feed.");
   sendWS({ type: "retake" });
   requestAdjust(true);                  // keep the live groove feed in sync with the panel
-  setHeaderStatus("robot", true, "Back to live feed.");
 });
+
+/* ⟳ on the Depth viewport: one quarter turn of the whole combined canvas per
+   press. The turn happens server-side, where the canvas is built, so RGB /
+   Skeleton / Mask, the projector and Participant Mode all turn with it — this
+   only asks for it and then renders whatever comes back. The server clears the
+   still (its strokes are already in robot space and cannot be turned), so drop
+   ours too rather than leave a stale picture on screen. */
+const btnRotate = document.getElementById("btn-rotate-view");
+btnRotate.addEventListener("click", () => {
+  if (stillLoaded) backToLive("View rotated — capture again.");
+  sendWS({ type: "rotate_view", params: { steps: 1 } });
+});
+
+/* The turn landed: show the new angle and take the crop the server re-based
+   onto the turned canvas, so the box keeps framing the same sand. The crop is
+   the server's to rotate — every window and Participant Mode read the same one. */
+function handleViewRotation(data) {
+  showViewRotation(data.deg);
+  const c = data.crop;
+  if (c && [c.x, c.y, c.w, c.h].every(Number.isFinite)) {
+    crop = { x: c.x, y: c.y, w: c.w, h: c.h };
+    renderCrop();
+  }
+  requestAdjust(true);          // live groove preview re-runs on the new framing
+}
+
+/* Also driven by every `state` tick, so a window that missed a broadcast heals
+   itself — hence the no-op when nothing changed, rather than 20 DOM writes a
+   second saying the same thing. */
+let shownRotation = null;
+function showViewRotation(deg) {
+  if (!Number.isFinite(deg) || deg === shownRotation) return;
+  shownRotation = deg;
+  btnRotate.textContent = "⟳ " + deg + "°";
+  btnRotate.classList.toggle("active", deg !== 0);
+}
 
 document.getElementById("btn-generate").addEventListener("click", () => {
   sendWS({ type: "generate_path", params: buildGenerateParams() });
@@ -901,23 +954,87 @@ document.getElementById("btn-generate").addEventListener("click", () => {
 /* Path generation params = detection params + crop + waypoint spacing (mm)
    + the endpoint-join Distance Threshold (mm, 0 = off). */
 function readSpacing() {
-  return parseFloat(document.getElementById("exec-spacing").value) || 10;
+  return parseFloat(execEl("exec-spacing").value) || 10;
 }
 
 function readJoinMm() {
-  const v = parseFloat(document.getElementById("exec-join").value);
+  const v = parseFloat(execEl("exec-join").value);
   return Number.isFinite(v) ? Math.min(Math.max(v, 0), 200) : 0;
+}
+
+function readMaxLengthMm() {
+  const v = parseFloat(execEl("exec-max-length").value);
+  return Number.isFinite(v) ? Math.min(Math.max(v, 0), 100000) : 0;
+}
+
+/* ── The Path Preview bar as one object ─────────────────────────────────────
+   Field names are the server's (`set_exec_params`, `init.exec`/`init.detect`),
+   so the session copy, a saved preset and a Run click all describe the bar the
+   same way. Read here, written back by applyExecSettings — one pair, used by
+   both the reconnect restore and the preset Load. */
+function readExecSettings() {
+  return {
+    spacing_mm:    readSpacing(),
+    join_mm:       readJoinMm(),
+    blend_mm:      readBlendMm(),
+    speed_pct:     parseFloat(execEl("exec-speed").value) || 5,
+    offset_mm:     parseFloat(execEl("exec-offset").value) || 0,
+    safety_mm:     parseFloat(execEl("exec-safety").value) || 50,
+    max_length_mm: readMaxLengthMm(),
+  };
+}
+
+/* Every field is optional and applied only if it is a real number: a preset
+   saved before the bar was part of one, or a partial init, must leave whatever
+   it does not mention exactly as it is rather than reset it to a default. */
+function applyExecSettings(e) {
+  if (!e || typeof e !== "object") return;
+  const put = (id, key, valId, unit) => {
+    const v = parseFloat(e[key]);
+    if (!Number.isFinite(v)) return;
+    document.getElementById(id).value = v;
+    if (valId) document.getElementById(valId).textContent =
+      document.getElementById(id).value + unit;
+  };
+  put("exec-spacing", "spacing_mm", "exec-spacing-val", " mm");
+  put("exec-join", "join_mm");
+  put("exec-blend", "blend_mm", "exec-blend-val", " mm");
+  put("exec-speed", "speed_pct", "exec-speed-val", "%");
+  put("exec-offset", "offset_mm");
+  put("exec-safety", "safety_mm");
+  put("exec-max-length", "max_length_mm");
 }
 
 function buildGenerateParams() {
   return { ...buildParams(), spacing_mm: readSpacing(), join_mm: readJoinMm() };
 }
 
+/* The drawn length of the current path, next to the Max Total Length box.
+   The number is the SERVER's — computed from the projected strokes with the
+   corner zone applied — so what is shown here is exactly what Run and Save
+   judge, rather than a second implementation that could drift from it. */
+function showPathLength(mm, limitMm) {
+  const el = execEl("exec-length-val");
+  if (!el) return;
+  if (!Number.isFinite(mm) || mm <= 0) {
+    el.textContent = "—";
+    el.classList.remove("over");
+    el.title = "Drawn length of the current path";
+    return;
+  }
+  el.textContent = mm >= 1000 ? (mm / 1000).toFixed(2) + " m" : mm.toFixed(0) + " mm";
+  const over = Number.isFinite(limitMm) && limitMm > 0 && mm > limitMm;
+  el.classList.toggle("over", over);
+  el.title = over
+    ? `Drawn length ${mm.toFixed(0)} mm exceeds the ${limitMm.toFixed(0)} mm limit — Run and Save will refuse this path`
+    : `Drawn length of the current path (${mm.toFixed(0)} mm)`;
+}
+
 /* Spacing lives in the Path Preview bar. Update the label live; re-generate on
    release (not every drag tick) so the path rebuilds at the new mm spacing. */
-const spacingSlider = document.getElementById("exec-spacing");
+const spacingSlider = execEl("exec-spacing");
 spacingSlider.addEventListener("input", (e) => {
-  document.getElementById("exec-spacing-val").textContent = e.target.value + " mm";
+  execEl("exec-spacing-val").textContent = e.target.value + " mm";
 });
 spacingSlider.addEventListener("change", () => {
   if (stillLoaded && lastStrokes) {
@@ -928,7 +1045,7 @@ spacingSlider.addEventListener("change", () => {
 
 /* Distance Threshold changes which strokes are connected, so — like Spacing,
    and unlike Offset/Safety/Radius — the path must be rebuilt server-side. */
-const joinBox = document.getElementById("exec-join");
+const joinBox = execEl("exec-join");
 joinBox.addEventListener("change", () => {
   if (stillLoaded && lastStrokes) {
     const mm = readJoinMm();
@@ -1049,16 +1166,25 @@ document.getElementById("btn-reset-adjust").addEventListener("click", () => {
   requestAdjust(true);
 });
 
-/* ── Save / Load detection-parameter presets ───────────────────────────────
+/* ── Save / Load parameter presets ─────────────────────────────────────────
    Save POSTs the current slider values (readAdjustments) to the server, which
    writes them to presets/<date_time>.json. Load lists that folder in a popup
-   and applies the chosen file back onto the sliders. */
+   and applies the chosen file back onto the sliders.
+
+   The file also carries the Path Preview bar under `exec` (Spacing, Distance
+   Threshold, Radius, Speed, Offset, Safety, Max Total Length): those decide
+   what the same detection settings actually draw, so a preset that restored
+   only the detection half would come back looking right and running wrong.
+   It is a nested block on purpose — the flat keys stay exactly what they were,
+   so presets saved before this still load, and their missing `exec` simply
+   leaves the bar alone. */
 document.getElementById("btn-save-adjust").addEventListener("click", async () => {
   try {
     const res = await fetch("/presets", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ params: readAdjustments() }),
+      body: JSON.stringify({ params: { ...readAdjustments(),
+                                       exec: readExecSettings() } }),
     });
     const data = await res.json();
     if (data.ok) setHeaderStatus("robot", true, "✓ Parameters saved to presets/" + data.name);
@@ -1123,7 +1249,18 @@ async function applyPreset(name) {
       }
     });
     if (p.detect) document.getElementById("detect-mode").value = p.detect;
+    applyExecSettings(p.exec);
     requestAdjust(true);
+    // The bar is now this window's, but the server holds the copy Participant
+    // Mode and any other window read — push it, the same as a manual edit does.
+    if (p.exec) syncExecParams();
+    // Spacing and Distance Threshold changed the path's GEOMETRY, so a path
+    // already on screen has to be rebuilt server-side; Offset/Safety/Radius
+    // only redraw here. Both are no-ops when nothing has been generated yet.
+    if (p.exec && stillLoaded && lastStrokes) {
+      sendWS({ type: "generate_path", params: buildGenerateParams() });
+      rebuildToolpathViz();
+    }
     closePresetPopup();
     setHeaderStatus("robot", true, "✓ Parameters loaded from presets/" + name);
   } catch (err) {
@@ -1152,13 +1289,33 @@ function handleReferenceStatus(data) {
   btn.classList.toggle("active", data.active);
   btn.textContent = data.active ? "Reference set ✓ (re-capture)" : "Set Reference (empty sand)";
   setHeaderStatus("robot", true, data.message || "");
+  showReferenceMode(data.active);
   // Re-run detection so the change is reflected immediately (live or captured).
   requestAdjust(true);
 }
 
+/* A reference frame is a picture of the empty sand, so it CONTAINS the camera's
+   tilt — subtracting it turns "distance from the camera" into "height above the
+   sand", per pixel. That flips what the near-object cutoff measures, and the
+   two readings differ by an order of magnitude (tens of mm above the sand vs
+   hundreds from the camera), so the box has to say which one it wants. Driven
+   off `state`, so it is right in a window opened at any moment. */
+let refModeShown = null;
+function showReferenceMode(active) {
+  if (typeof active !== "boolean" || active === refModeShown) return;
+  refModeShown = active;
+  const row = document.getElementById("mask-ignore");
+  const label = document.getElementById("ignore-closer-label");
+  if (!row || !label) return;
+  label.textContent = active ? "Ignore above sand" : "Ignore closer than";
+  row.title = active
+    ? "Near-object filter: anything standing more than this many mm ABOVE the sand surface (a hand raking, a person leaning over) — and every mask blob touching it — is left out of the mask and the live projection. Measured against the reference frame, so it is unaffected by camera tilt. 0 or empty = off."
+    : "Near-object filter: anything closer to the depth camera than this absolute distance (a hand raking, a person leaning over the sand) — and every mask blob touching it — is left out of the mask and the live projection. No reference frame is set, so on a tilted camera one value may not suit the whole sandbox — press Set Reference to switch to height above the sand. 0 or empty = off.";
+}
+
 /* ── Register Corner → TCP (touch-off surface placement) ──────────────────
    Optional popup: pick a numbered mesh corner (markers appear in the Path
-   Preview), freedrive the tool tip onto the physical corner, confirm — the
+   Preview), hand-guide the tool tip onto the physical corner, confirm — the
    server recomputes the surface pose (1-point: translation only) and the
    sliders/preview update via the normal surface_status broadcast. Closing
    the popup without confirming changes nothing. */
@@ -1187,7 +1344,7 @@ function openRegisterPopup() {
   regOverlay.classList.remove("hidden");
   regStatus(robotConnected
     ? `Pick a corner: click a numbered marker in the Path Preview, or a row below.`
-    : "Robot NOT connected — you can look at the corners, but freedrive/confirm need a connection.");
+    : "Robot NOT connected — you can look at the corners, but touch-off/confirm need a connection.");
 }
 
 function closeRegisterPopup() {
@@ -1204,7 +1361,7 @@ function selectCorner(i) {
   [...regList.children].forEach((el, j) => el.classList.toggle("sel", j === i));
   updateCornerHighlight();
   btnRegConfirm.disabled = !robotConnected;
-  regStatus(`Corner ${i + 1} selected (green in the preview). Freedrive the tool tip onto it, then Confirm.`);
+  regStatus(`Corner ${i + 1} selected (green in the preview). Hand-guide the tool tip onto it, then Confirm.`);
 }
 
 function setHoveredCorner(i) {
@@ -1301,10 +1458,10 @@ function handleRegisterResult(data) {
   }
 }
 
-/* Keep the freedrive toggle button in sync with the robot (state broadcast). */
+/* Keep the touch-off toggle button in sync with the robot (state broadcast). */
 function updateRegisterFreedrive(on) {
   regFreedrive = !!on;
-  btnRegFreedrive.textContent = regFreedrive ? "Freedrive ON — click to stop" : "Start Freedrive";
+  btnRegFreedrive.textContent = regFreedrive ? "Touch-off armed — click to disarm" : "Arm touch-off";
   btnRegFreedrive.classList.toggle("active", regFreedrive);
 }
 
@@ -1465,6 +1622,17 @@ function renderCrop() {
   cropBox.style.height = (crop.h * r.h) + "px";
 }
 
+/* The crop box is positioned in pixels over the depth image, so it must be
+   redrawn whenever that image's box changes. A view rotation is the case that
+   needs this: the canvas's aspect flips, but the first frame at the new shape
+   only arrives with the next MJPEG frame (~200 ms later), long after the click
+   was handled. Window resizes get fixed for free. */
+if (window.ResizeObserver) {
+  const cropRedraw = new ResizeObserver(() => renderCrop());
+  cropRedraw.observe(feedDepth);
+  cropRedraw.observe(stillDepth);
+}
+
 function clamp01(v) { return Math.min(Math.max(v, 0), 1); }
 
 function ptNorm(e) {
@@ -1480,6 +1648,11 @@ let dragMode = null, dragStart = null, cropStart = null;
 vpDepth.addEventListener("mousedown", (e) => {
   // No cropping when the overlay is hidden (idle).
   if (cropBox.classList.contains("hidden")) return;
+  // The viewport's own buttons (⧉ Participant Mode, ⟳ rotate) sit inside it and
+  // outside the crop rect, so without this a press reads as "start a new crop
+  // here" — and the zero-size rect it leaves is reset to the FULL frame on
+  // mouseup. Pressing ⟳ would then throw away the crop it just re-based.
+  if (e.target.closest("button")) return;
   const handle = e.target.closest(".crop-handle");
   const p = ptNorm(e);
   if (handle) {
@@ -1585,6 +1758,7 @@ btnPopout.addEventListener("click", () => {
   d.body.style.cssText = "margin:0;background:#0e0e0e;overflow:hidden;";
   d.body.appendChild(panel);
   panel.style.cssText = "position:absolute;inset:0;";
+  panel.classList.add("popped");   // no Detection Parameters panel to dodge here
   btnPopout.textContent = "⇱ Pop in";
   popupWin.addEventListener("resize", resizeRenderer);
   popupWin.addEventListener("pagehide", popIn);   // fires when the popup closes
@@ -1595,6 +1769,7 @@ function popIn() {
   if (panel.ownerDocument === document) return;   // already home
   panelHome.appendChild(panel);
   panel.style.cssText = "";                       // back to the CSS grid placement
+  panel.classList.remove("popped");
   btnPopout.textContent = "⧉ Pop out";
   popupWin = null;
   setTimeout(resizeRenderer, 50);
@@ -1607,18 +1782,19 @@ window.addEventListener("beforeunload", () => {
 /* ── Run / Cancel buttons ──────────────────────────────────────────────── */
 document.getElementById("btn-run").addEventListener("click", () => {
   sendWS({ type: "run", params: {
-    speed_pct: parseFloat(document.getElementById("exec-speed").value) || 5,
-    offset_mm: parseFloat(document.getElementById("exec-offset").value) || 0,
-    safety_mm: parseFloat(document.getElementById("exec-safety").value) || 50,
+    speed_pct: parseFloat(execEl("exec-speed").value) || 5,
+    offset_mm: parseFloat(execEl("exec-offset").value) || 0,
+    safety_mm: parseFloat(execEl("exec-safety").value) || 50,
     blend_mm: readBlendMm(),
+    max_length_mm: readMaxLengthMm(),
   }});
   setButtonsForPhase("executing");
   setProgress(0);
   document.getElementById("val-phase").textContent = "executing";
 });
 
-document.getElementById("exec-speed").addEventListener("input", (e) => {
-  document.getElementById("exec-speed-val").textContent = e.target.value + "%";
+execEl("exec-speed").addEventListener("input", (e) => {
+  execEl("exec-speed-val").textContent = e.target.value + "%";
 });
 
 /* Offset / Safety / Radius change the run-time toolpath geometry (lift along
@@ -1632,8 +1808,8 @@ let execVizTimer = null;
   });
 });
 
-document.getElementById("exec-blend").addEventListener("input", (e) => {
-  document.getElementById("exec-blend-val").textContent = e.target.value + " mm";
+execEl("exec-blend").addEventListener("input", (e) => {
+  execEl("exec-blend-val").textContent = e.target.value + " mm";
 });
 
 /* Keep the server's session copy of the exec-bar values fresh so Participant
@@ -1643,12 +1819,13 @@ let execSyncTimer = null;
 function syncExecParams() {
   if (execSyncTimer) clearTimeout(execSyncTimer);
   execSyncTimer = setTimeout(() => sendWS({ type: "set_exec_params", params: {
-    speed_pct: parseFloat(document.getElementById("exec-speed").value) || 5,
-    offset_mm: parseFloat(document.getElementById("exec-offset").value) || 0,
-    safety_mm: parseFloat(document.getElementById("exec-safety").value) || 50,
+    speed_pct: parseFloat(execEl("exec-speed").value) || 5,
+    offset_mm: parseFloat(execEl("exec-offset").value) || 0,
+    safety_mm: parseFloat(execEl("exec-safety").value) || 50,
     blend_mm: readBlendMm(),
     spacing_mm: readSpacing(),
     join_mm: readJoinMm(),
+    max_length_mm: readMaxLengthMm(),
   }}), 300);
 }
 ["exec-speed", "exec-offset", "exec-safety", "exec-blend"].forEach((id) =>
@@ -1656,7 +1833,14 @@ function syncExecParams() {
 spacingSlider.addEventListener("change", syncExecParams);
 joinBox.addEventListener("change", syncExecParams);
 
-/* ── Save toolpath (URScript + JSON + preview image) ────────────────────── */
+/* Max Total Length is a LIMIT, not geometry — it changes nothing about the
+   path, so unlike Spacing and Distance Threshold it never regenerates. It only
+   has to reach the server, which re-judges the length on Run/Save. */
+const maxLenBox = execEl("exec-max-length");
+maxLenBox.addEventListener("change", syncExecParams);
+maxLenBox.addEventListener("input", syncExecParams);
+
+/* ── Save toolpath (JSON + preview image) ───────────────────────────── */
 
 /* The 3D preview as a PNG data URL. Renders first: the drawing buffer is not
    preserved between frames, so reading it without a fresh render can come back
@@ -1673,10 +1857,11 @@ function capturePreviewPng() {
 document.getElementById("btn-save-path").addEventListener("click", () => {
   const image = capturePreviewPng();
   sendWS({ type: "save_path", params: {
-    speed_pct: parseFloat(document.getElementById("exec-speed").value) || 5,
-    offset_mm: parseFloat(document.getElementById("exec-offset").value) || 0,
-    safety_mm: parseFloat(document.getElementById("exec-safety").value) || 50,
+    speed_pct: parseFloat(execEl("exec-speed").value) || 5,
+    offset_mm: parseFloat(execEl("exec-offset").value) || 0,
+    safety_mm: parseFloat(execEl("exec-safety").value) || 50,
     blend_mm: readBlendMm(),
+    max_length_mm: readMaxLengthMm(),
     image,
   }});
   setHeaderStatus("robot", true, "Saving toolpath…");

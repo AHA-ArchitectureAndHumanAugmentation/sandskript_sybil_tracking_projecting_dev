@@ -1,0 +1,72 @@
+# The ROS bridge this app talks to.
+#
+#   main.py  →  rosbridge (9090)  →  RRC driver  →  RRC RAPID task  →  GoFa 10
+#
+# Start it with `docker compose up` from this folder and leave the terminal
+# open. The app then connects to 127.0.0.1 — the machine running THESE
+# containers — never to the robot's own IP. The only place the robot's address
+# is entered is `robot_ip` below.
+#
+# This file is committed on purpose rather than borrowed from the compas_rrc
+# repo at run time: the image tag is pinned, so an upstream release cannot
+# change what the installation runs from one day to the next.
+#
+# No `version:` key — it is obsolete in modern Docker Compose and only produces
+# a warning.
+
+services:
+  ros-master:
+    image: compasrrc/compas_rrc_driver:v1.1.2
+    container_name: ros-master
+    environment:
+      - ROS_HOSTNAME=ros-master
+      - ROS_MASTER_URI=http://ros-master:11311
+    ports:
+      - "11311:11311"
+    command:
+      - roscore
+
+  ros-bridge:
+    image: compasrrc/compas_rrc_driver:v1.1.2
+    container_name: ros-bridge
+    environment:
+      - ROS_HOSTNAME=ros-bridge
+      - ROS_MASTER_URI=http://ros-master:11311
+    ports:
+      - "9090:9090"          # the websocket the app connects to (RRC_ROS_PORT)
+    depends_on:
+      - ros-master
+    command:
+      - roslaunch
+      - --wait
+      - rosbridge_server
+      - rosbridge_websocket.launch
+      # 8 hours instead of the ~10 s default. rosbridge otherwise unregisters a
+      # quiet connection and the link dies on its own — which for an
+      # installation sitting idle between visitors is the normal case, not an
+      # edge one. Workaround for:
+      # https://github.com/RobotWebTools/rosbridge_suite/issues/138
+      - unregister_timeout:=28800
+
+  abb-driver:
+    image: compasrrc/compas_rrc_driver:v1.1.2
+    container_name: abb-driver
+    environment:
+      - ROS_HOSTNAME=abb-driver
+      - ROS_MASTER_URI=http://ros-master:11311
+    depends_on:
+      - ros-master
+    command:
+      - roslaunch
+      - --wait
+      - compas_rrc_driver
+      - bringup.launch
+      # THE ROBOT'S ADDRESS — the one shown on the pendant, under network
+      # settings. 192.168.125.1 is the ABB service-port default, which is what
+      # a laptop plugged straight into the controller sees.
+      - robot_ip:=192.168.125.1
+      #- robot_ip:=host.docker.internal   # uncomment instead for RobotStudio
+      - robot_streaming_port:=30101
+      - robot_state_port:=30201
+      # Must match config.RRC_NAMESPACE ("/rob1") in the app.
+      - namespace:=rob1

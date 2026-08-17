@@ -203,14 +203,24 @@ def _relief_and_base_mask(
     mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     mask_u8 = _remove_small(mask_u8, params.min_blob_px)
 
-    # Near-object rejection: anything closer to the camera than the ABSOLUTE
-    # cutoff (a hand raking, a person leaning in) is not sand — the object and
-    # the phantom relief the detrend paints around it must not become grooves.
-    # Uses the RAW depth (reference subtraction shifts d), grows the region by
-    # a safety margin, then drops every mask blob touching it.
+    # Near-object rejection: anything standing proud of the sand (a hand raking,
+    # a person leaning in) is not sand — the object and the phantom relief the
+    # detrend paints around it must not become grooves. Grows the region by a
+    # safety margin, then drops every mask blob touching it.
+    #
+    # With a reference the cutoff is a HEIGHT ABOVE THE SAND, which is what makes
+    # it usable on a tilted camera — an absolute distance there would reject one
+    # end of the box and nothing at the other. Without one it stays an absolute
+    # distance, as before. Either way it reads the RAW depth, never `d`, which
+    # the ref_strength blend above has already shifted.
     if params.ignore_closer_mm > 0:
-        near = valid & (np.asarray(depth_m, np.float32)
-                        < params.ignore_closer_mm / 1000.0)
+        relative = surface_height_mm(depth_m, valid, reference)
+        if relative is not None:
+            height_mm, ok_ref = relative
+            near = ok_ref & (height_mm > params.ignore_closer_mm)
+        else:
+            near = valid & (np.asarray(depth_m, np.float32)
+                            < params.ignore_closer_mm / 1000.0)
         if near.any():
             k = 2 * GROOVE_NEAR_MARGIN_PX + 1
             near_u8 = cv2.dilate(
@@ -356,21 +366,78 @@ def colorize_depth(
     return color
 
 
-def depth_below_threshold(
+def surface_height_mm(
+    depth_m: np.ndarray,
+    valid: np.ndarray,
+    reference: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Per-pixel height ABOVE the baseline sand surface, in mm: positive = nearer
+    the camera than the reference (a hand, an arm), negative = farther (a
+    groove), ~0 = untouched sand. Returns ``(height_mm, ok)`` or None.
+
+    This is what makes a TILTED camera workable. Distance-from-camera is a
+    useless quantity on a tilted rig: the sand itself spans the whole box's
+    depth, so no single cutoff separates "hand" from "far end of the sand".
+    The reference frame CONTAINS that tilt, so subtracting it cancels the
+    gradient pixel by pixel and a hand 80 mm above the sand reads 80 mm
+    wherever it is. Note this needs a per-pixel baseline — rescaling the depth
+    axis as a whole cannot do it, because scaling the sand's spread and the
+    hand's clearance by the same factor leaves their ratio, and therefore every
+    threshold test, exactly where it was.
+
+    None means "no usable baseline" (no reference captured, or one whose shape
+    no longer matches because the canvas was turned or re-frozen). Every caller
+    treats that as "fall back to absolute distance" — the behaviour before a
+    reference existed. A tilted rig without a reference is a worse trigger,
+    never a broken one.
+    """
+    if reference is None:
+        return None
+    z = np.asarray(depth_m, dtype=np.float32)
+    ref = np.asarray(reference, dtype=np.float32)
+    if ref.shape != z.shape:
+        return None
+    ok = np.asarray(valid, dtype=bool) & np.isfinite(ref) & (ref > 0)
+    if not ok.any():
+        return None
+    height_mm = np.zeros(z.shape, np.float32)
+    height_mm[ok] = (ref[ok] - z[ok]) * 1000.0
+    return height_mm, ok
+
+
+def presence_trigger(
     depth_m: np.ndarray,
     valid: np.ndarray,
     threshold_mm: float | None,
     min_px: int = TRIGGER_MIN_AREA_PX,
+    reference: np.ndarray | None = None,
 ) -> bool:
     """
     Participant-mode presence trigger: True when at least ``min_px`` valid
-    pixels are CLOSER to the camera than ``threshold_mm`` (e.g. a hand raking
-    above the sand). The area minimum keeps sensor speckle from firing.
+    pixels read as "something is there". The area minimum keeps sensor speckle
+    from firing.
+
+    Two modes, and which one runs depends only on whether a reference frame is
+    available (see ``surface_height_mm``):
+
+      * WITH a reference — ``threshold_mm`` is a height ABOVE THE SAND. Immune
+        to camera tilt, and the number means the same thing everywhere in the
+        box. This is the mode to use.
+      * without one — ``threshold_mm`` is an absolute distance from the camera,
+        as before. Works on a level rig; on a tilted one the sand's own depth
+        range eats the margin a hand would have provided.
     """
     if threshold_mm is None or threshold_mm <= 0:
         return False
-    below = valid & (depth_m < threshold_mm / 1000.0)
-    return int(np.count_nonzero(below)) >= int(min_px)
+    relative = surface_height_mm(depth_m, valid, reference)
+    if relative is not None:
+        height_mm, ok = relative
+        hit = ok & (height_mm > threshold_mm)
+    else:
+        hit = (np.asarray(valid, dtype=bool)
+               & (np.asarray(depth_m, dtype=np.float32) < threshold_mm / 1000.0))
+    return int(np.count_nonzero(hit)) >= int(min_px)
 
 
 def depth_region_labels(
@@ -379,13 +446,23 @@ def depth_region_labels(
     interval_mm: float,
     min_area_px: int = DEPTH_LABELS_MIN_AREA_PX,
     max_labels: int = DEPTH_LABELS_MAX,
+    reference: np.ndarray | None = None,
 ) -> list[list[float]]:
     """
-    Labels for the depth-number overlay popup: quantize depth into bands
+    Labels for the depth-number overlay popup: quantize into bands
     ``interval_mm`` wide, find each band's connected regions, and return one
-    ``[u, v, depth_mm]`` per region at its centroid (u/v in pixels of the
-    given ``depth_m`` array — the caller passes the cropped region, so labels
-    are crop-relative; depth_mm = the band's centre distance from the camera).
+    ``[u, v, mm]`` per region at its centroid (u/v in pixels of the given
+    ``depth_m`` array — the caller passes the cropped region, so labels are
+    crop-relative).
+
+    What ``mm`` measures follows the trigger, so the operator reads the numbers
+    in the same units they type into the trigger box:
+
+      * WITH a reference — height above the sand: ~0 on untouched sand,
+        negative in a groove, strongly positive on a hand. On a tilted rig this
+        is the only readable version, since absolute distance would just paint
+        the camera's tilt across the picture.
+      * without one — distance from the camera, as before.
 
     Reference display only — never feeds path generation. Runs at half
     resolution for speed; regions smaller than ``min_area_px`` (half-res px)
@@ -397,9 +474,19 @@ def depth_region_labels(
     if not np.any(ok):
         return []
 
-    # Band index per pixel (0 is reserved for invalid).
-    q = np.zeros(z.shape, np.int32)
-    q[ok] = np.rint((z[ok] * 1000.0) / interval_mm).astype(np.int32) + 1
+    relative = surface_height_mm(
+        z, ok, None if reference is None
+        else np.asarray(reference, dtype=np.float32)[::2, ::2])
+    if relative is not None:
+        value_mm, ok = relative
+    else:
+        value_mm = z * 1000.0
+
+    # Band index per pixel. Invalid pixels get a sentinel rather than 0: heights
+    # above the sand are signed, so band 0 is a REAL band (the sand itself) and
+    # would otherwise swallow every invalid pixel in the frame.
+    q = np.full(z.shape, np.iinfo(np.int32).min, np.int32)
+    q[ok] = np.rint(value_mm[ok] / interval_mm).astype(np.int32)
 
     vals, counts = np.unique(q[ok], return_counts=True)
     order = np.argsort(counts)[::-1]                 # biggest bands first
@@ -414,7 +501,7 @@ def depth_region_labels(
                 continue
             u, v = cents[j]
             out.append([int(u * 2), int(v * 2),
-                        round(float((vals[i] - 1) * interval_mm), 1)])
+                        round(float(vals[i] * interval_mm), 1)])
             if len(out) >= max_labels:
                 return out
     return out

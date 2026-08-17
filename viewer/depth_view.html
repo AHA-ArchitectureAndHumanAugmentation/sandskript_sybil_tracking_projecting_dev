@@ -42,6 +42,26 @@
   .chip-invalid    { border-color: #ff2d55 !important; color: #ff2d55 !important;
                      background: rgba(255, 45, 85, 0.12) !important; }
 
+  /* Max Drawing Time countdown — the opposite (top-left) corner to the status
+     chip, so the participant reads "what is happening" and "how long is left"
+     without the two crowding each other. */
+  #countdown {
+    position: absolute; top: 10px; left: 10px; z-index: 2;
+    font-size: clamp(20px, 4vw, 40px); font-weight: 700; letter-spacing: 0.5px;
+    padding: 4px 14px; border-radius: 8px;
+    background: rgba(0, 0, 0, 0.65); border: 2px solid #555; color: #999;
+    font-variant-numeric: tabular-nums; pointer-events: none;
+  }
+  #countdown.hidden   { display: none; }
+  #countdown.counting { border-color: #5599ff; color: #5599ff; }
+  /* Last seconds: red and blinking, so it is impossible to miss mid-drawing. */
+  #countdown.warn {
+    border-color: #ff2d55; color: #ff2d55;
+    background: rgba(255, 45, 85, 0.15);
+    animation: cd-blink 1s steps(1, end) infinite;
+  }
+  @keyframes cd-blink { 50% { opacity: 0.35; } }
+
   footer {
     flex-shrink: 0;
     display: flex; align-items: center; gap: 10px;
@@ -51,11 +71,11 @@
   }
   footer label { color: #999; white-space: nowrap; }
   footer input[type="range"] { width: 140px; accent-color: #5599ff; height: 14px; }
-  #trigger {
+  #trigger, #maxtime {
     width: 72px; padding: 3px 6px; font: inherit; color: #e8e8e8;
     background: #101010; border: 1px solid #333; border-radius: 4px;
   }
-  #trigger:focus { outline: none; border-color: #5599ff; }
+  #trigger:focus, #maxtime:focus { outline: none; border-color: #5599ff; }
   #auto-toggle {
     font: inherit; font-weight: 700; padding: 4px 14px; cursor: pointer;
     color: #999; background: #101010; border: 2px solid #555; border-radius: 5px;
@@ -74,6 +94,7 @@
            (like the skeleton/mask views), never the full frame. -->
       <img id="feed" src="/depth/cropped" alt="depth feed" />
       <canvas id="overlay"></canvas>
+      <div id="countdown" class="hidden"></div>
       <div id="status-wrap">
         <div id="status-chip" class="chip-off">Auto Off</div>
         <div id="status-msg"></div>
@@ -83,9 +104,17 @@
 
   <footer>
     <button id="auto-toggle" title="Automation ON runs capture → generate → save+run from the trigger, and locks the manual buttons in Developer Mode">Auto: OFF</button>
+    <!-- Label + title are rewritten by depth_overlay.js: with a reference set
+         this is a height ABOVE THE SAND (tilt-proof), without one it is a raw
+         distance from the camera. The range spans both — a hand clears the sand
+         by tens of mm, but a camera sits hundreds away. -->
     <label for="trigger">Trigger below</label>
-    <input type="number" id="trigger" min="50" max="5000" step="10" placeholder="mm" />
+    <input type="number" id="trigger" min="5" max="5000" step="5" placeholder="mm" />
     <span class="val">mm</span>
+    <div class="sep"></div>
+    <label for="maxtime" title="How long one participant may draw, measured from the trigger tripping to the sand being clear again. Running out is an Invalid drawing: nothing is saved and nothing is run. Empty = no limit.">Max drawing time</label>
+    <input type="number" id="maxtime" min="0.1" max="120" step="0.5" placeholder="off" />
+    <span class="val">min</span>
     <div class="sep"></div>
     <label for="interval">Region interval</label>
     <input type="range" id="interval" min="1" max="100" step="1" value="10" />

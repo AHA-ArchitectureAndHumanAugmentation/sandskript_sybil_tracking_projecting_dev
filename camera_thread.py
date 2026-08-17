@@ -1,4 +1,5 @@
 import threading
+import time
 from collections import deque
 from typing import Optional
 
@@ -6,34 +7,60 @@ import cv2
 import numpy as np
 
 from config import (
-    DEPTH_WIDTH, DEPTH_HEIGHT, DEPTH_FPS, DEPTH_AVERAGE_FRAMES,
-    DEPTH_LABELS_EVERY, DEPTH_LABELS_INTERVAL_MM,
+    DEPTH_AVERAGE_FRAMES, DEPTH_LABELS_EVERY, DEPTH_LABELS_INTERVAL_MM,
+    STITCH_MAIN_BIND_TIMEOUT_S, STITCH_MAIN_EVERY_S,
 )
 from depth_extractor import (
-    Crop, DepthGrooveParams, colorize_depth, depth_below_threshold,
-    depth_region_labels, grooves_and_mask, encode_jpeg,
+    Crop, DepthGrooveParams, colorize_depth, depth_region_labels,
+    grooves_and_mask, encode_jpeg, presence_trigger,
 )
+import realsense_source
+from stitcher import (
+    CameraFrame, CanvasGrid, StitchCalib, bind_placements, footprint_mm,
+    load_calib, rotate_frame, stitch, with_default_row,
+)
+from view_rotation import norm_deg, rotate_image, rotate_size
 
-# How often (in frames) to recompute the live groove preview. Groove detection
-# is heavier than colorizing, and the sand is static, so we don't need it every
-# frame — the captured still gets a clean, fully-thinned pass anyway.
-_LIVE_GROOVE_EVERY = 4
+# How often (in canvases) to recompute the live groove preview. Groove detection
+# is heavier than colorizing — more so on a combined canvas, which is several
+# frames wide — and the sand is static, so we don't need it every canvas: the
+# captured still gets a clean, fully-thinned pass anyway.
+_LIVE_GROOVE_EVERY = 2
 
 
 class DepthCameraThread:
     """
-    Captures depth + colour frames from an Intel RealSense (D435i) and produces
-    three JPEG streams:
-      - depth:   the depth map colorized so depth reads as colour
-      - rgb:     the aligned colour image
+    Captures depth + colour from EVERY Intel RealSense (D435i) on the rig, lays
+    them onto one combined canvas using the layout saved by Multi-Cam Vision
+    (stitch_calibration.json), and produces three JPEG streams from it:
+      - depth:   the combined depth map colorized so depth reads as colour
+      - rgb:     the combined aligned colour image
       - grooves: detected groove centrelines (live preview of what gets drawn)
 
-    All three are stored in shared_state and served as MJPEG by the server. The
-    colour stream is aligned to the depth frame so a crop in normalized
-    coordinates selects the same region in both. The raw metric depth of recent
-    frames is buffered so Capture can return a temporally averaged frame — the
+    The canvas — not any single camera's frame — is what the whole pipeline
+    sees, so a crop, a reference frame, the Participant-Mode trigger and the
+    captured still all live in canvas pixels. One camera is a perfectly valid
+    rig; the canvas is then that camera's frame through its placement.
+
+    All three streams are stored in shared_state and served as MJPEG by the
+    server. The colour stream is aligned to depth per camera before stitching,
+    so a crop in normalized coordinates selects the same region in both. The raw
+    metric depth of recent frames is buffered PER CAMERA at the full frame rate
+    so Capture can average (~1 s, noise ↓√N) and stitch the averages — the
     single biggest win for resolving sub-millimetre grooves. A separate lock
     guards the buffers so capture_frame() doesn't block MJPEG delivery.
+
+    The canvas geometry is frozen (`CanvasGrid`) once every camera has delivered
+    its first frame, and never changes afterwards: a canvas that resized mid
+    session would move the crop, the reference and the captured still with it.
+
+    On top of that frozen geometry sits the VIEW ROTATION (`set_view_rotation`,
+    Developer Mode's ⟳ button): a quarter-turn applied to the finished canvas on
+    its way out, in `_publish` and `capture_frame` alike. Because it is applied
+    at that single seam, every view and the captured still turn together — but a
+    quarter turn does swap the frame's width and height, which the mm-per-pixel
+    scale and the surface fit both read, so `set_view_rotation` republishes
+    `frame_size` and main.py re-bases the crop and the reference frame on it.
 
     The live groove preview honours `set_live_params()` so the browser's Detect
     Grooves controls update the feed in real time, before any image is captured.
@@ -45,9 +72,16 @@ class DepthCameraThread:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._frame_lock = threading.Lock()
-        # Rolling buffer of (depth_m float32, valid bool) for temporal averaging.
-        self._buffer: deque[tuple[np.ndarray, np.ndarray]] = deque(maxlen=DEPTH_AVERAGE_FRAMES)
-        self._last_rgb: Optional[np.ndarray] = None
+        # Per-camera rolling buffers of (depth_m float32, valid bool) for
+        # temporal averaging, plus each camera's latest aligned colour frame.
+        self._buffers: list[deque[tuple[np.ndarray, np.ndarray]]] = []
+        self._last_rgb: list[Optional[np.ndarray]] = []
+        self._serials: list[str] = []
+        self._intrinsics: list = []
+        # The saved layout, bound to the cameras actually present, and the
+        # canvas geometry frozen from the first complete stitch.
+        self._calib = StitchCalib()
+        self._grid: Optional[CanvasGrid] = None
         # Live detection params + crop (atomically swapped by the setters).
         self._live_params = DepthGrooveParams()
         self._live_crop = Crop()
@@ -55,14 +89,39 @@ class DepthCameraThread:
         self._mm_per_px: Optional[float] = None        # workspace scale for mm filters
         self._label_interval_mm = DEPTH_LABELS_INTERVAL_MM  # depth-number overlay band
         self._trigger_mm: Optional[float] = None       # Participant-Mode trigger threshold
+        self._rotation = 0                             # view rotation, 0/90/180/270 CW
+        # Last encoded groove/mask/projector JPEGs — kept between canvases so the
+        # throttled previews hold their picture instead of blinking.
+        self._cached: tuple = (None, None, None)
 
     @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    @property
+    def camera_count(self) -> int:
+        """How many cameras are combined into the canvas (0 before start-up)."""
+        with self._frame_lock:
+            return len(self._serials)
+
+    @property
+    def frame_size(self) -> Optional[tuple[int, int]]:
+        """(width, height) of the combined canvas AS PUBLISHED, or None before it
+        is frozen. This is the frame size the whole pipeline maps from —
+        mm-per-pixel and the surface fit both need it, it is NOT 640×480 any
+        more, and on a quarter view rotation width and height are swapped."""
+        grid = self._grid
+        return (None if grid is None
+                else rotate_size((grid.width, grid.height), self._rotation))
+
+    @property
+    def view_rotation(self) -> int:
+        """Current view rotation in clockwise degrees (0/90/180/270)."""
+        return self._rotation
+
     def start(self, index: Optional[int] = None) -> None:
-        # `index` is accepted for API compatibility but ignored — the RealSense is
-        # selected by the SDK, not an OpenCV device index.
+        # `index` is accepted for API compatibility but ignored — cameras are
+        # selected by the SDK (all of them), not by an OpenCV device index.
         if self.running:
             return
         self._stop_event.clear()
@@ -72,7 +131,7 @@ class DepthCameraThread:
     def stop(self) -> None:
         self._stop_event.set()
         if self._thread:
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=3.0)
             self._thread = None
 
     def set_live_params(self, params: DepthGrooveParams) -> None:
@@ -99,172 +158,291 @@ class DepthCameraThread:
         """Participant-Mode trigger distance (mm from camera); None disables."""
         self._trigger_mm = mm
 
+    def set_view_rotation(self, deg) -> int:
+        """
+        Turn the published canvas by a quarter-turn multiple (clockwise) and
+        return the angle actually set. Every view and the captured still come
+        out of the same seam, so they all turn together.
+
+        Republishes `frame_size`, because a quarter turn swaps width and height
+        and the mm-per-pixel scale divides by width. The canvas GEOMETRY is
+        untouched — the frozen grid, the layout file and the stitch are all
+        exactly as before; this only re-indexes the finished picture, so it is
+        safe to change mid session in a way that re-freezing never would be.
+        """
+        self._rotation = norm_deg(deg)
+        size = self.frame_size
+        if size is not None:
+            with self._state_lock:
+                self._state["frame_size"] = [size[0], size[1]]
+        return self._rotation
+
     def capture_frame(self) -> Optional[tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]]:
         """
-        Return a temporally averaged (depth_m, valid, rgb) over the buffered
-        frames, or None if no frame has arrived yet. ``rgb`` is the most recent
-        aligned colour frame (BGR), or None if the colour stream produced nothing.
-        Averaging cuts per-pixel depth noise by ~sqrt(n_frames).
-        """
-        with self._frame_lock:
-            if not self._buffer:
-                return None
-            frames = list(self._buffer)
-            rgb = None if self._last_rgb is None else self._last_rgb.copy()
+        Return a temporally averaged, combined (depth_m, valid, rgb) over the
+        buffered frames, or None if no camera has produced one yet. ``rgb`` is
+        the stitched aligned colour, or None if no colour arrived at all.
 
-        acc = np.zeros_like(frames[0][0], dtype=np.float32)
-        cnt = np.zeros_like(acc, dtype=np.float32)
-        for z, ok in frames:
-            acc[ok] += z[ok]
-            cnt += ok
-        valid = cnt > 0
-        depth_m = np.zeros_like(acc)
-        depth_m[valid] = acc[valid] / cnt[valid]
-        return depth_m, valid, rgb
+        Each camera is averaged on its OWN buffer and the averages are stitched,
+        so noise is cut per camera (~sqrt(n_frames)) before any warping — the
+        opposite order would average an already-resampled canvas. The view
+        rotation is applied last, exactly as it is for the live views, so a
+        captured still is in the same orientation as the picture it was taken
+        from.
+        """
+        if self._grid is None:
+            return None            # canvas geometry not settled yet — not ready
+        with self._frame_lock:
+            buffers = [list(b) for b in self._buffers]
+            rgbs = [None if r is None else r.copy() for r in self._last_rgb]
+            intrinsics = list(self._intrinsics)
+            serials = list(self._serials)
+        frames = []
+        for i, buffer in enumerate(buffers):
+            if not buffer:
+                continue
+            depth_m, valid = _average(buffer)
+            frames.append(CameraFrame(depth_m, valid, intrinsics[i], rgbs[i], serials[i]))
+        if not frames:
+            return None
+        result = stitch(frames, self._calib, grid=self._grid)
+        rgb = result.rgb if result.rgb_valid.any() else None
+        rot = self._rotation          # read once: all three must agree
+        return (rotate_image(result.depth_m, rot), rotate_image(result.valid, rot),
+                rotate_image(rgb, rot))
+
+    # ── acquisition ──────────────────────────────────────────────────────────
+    def _latest_frames(self) -> list[CameraFrame]:
+        """The most recent frame from every camera that has one, ready to stitch."""
+        with self._frame_lock:
+            latest = [(b[-1] if b else None) for b in self._buffers]
+            rgbs = list(self._last_rgb)
+            intrinsics = list(self._intrinsics)
+            serials = list(self._serials)
+        return [CameraFrame(pair[0], pair[1], intrinsics[i], rgbs[i], serials[i])
+                for i, pair in enumerate(latest) if pair is not None]
+
+    def _bind_calib(self, frames: list[CameraFrame]) -> None:
+        """
+        Match the saved layout to the cameras actually plugged in (by serial),
+        and give anything unplaced its slot in the default row. Done ONCE, at
+        start-up: unlike the placement tool, nothing here may re-bind mid
+        session — the pipeline's frame size depends on it.
+        """
+        bound = bind_placements(load_calib(), frames)
+        footprints = [footprint_mm(rotate_frame(f, bound.placement_for(f.serial, i).rot_deg))
+                      for i, f in enumerate(frames)]
+        self._calib = with_default_row(bound, footprints)
 
     def _run(self) -> None:
-        try:
-            import pyrealsense2 as rs  # noqa: local import so the module loads without the SDK
-        except ImportError:
-            print("[depth] ERROR: pyrealsense2 not installed — run `pip install pyrealsense2`")
+        cameras, note = realsense_source.open_cameras()
+        if not cameras:
+            print(f"[depth] ERROR: {note}")
             return
+        if note:
+            print(f"[depth] {note}")
 
-        pipe = rs.pipeline()
-        cfg = rs.config()
-        cfg.enable_stream(rs.stream.depth, DEPTH_WIDTH, DEPTH_HEIGHT, rs.format.z16, DEPTH_FPS)
-        cfg.enable_stream(rs.stream.color, DEPTH_WIDTH, DEPTH_HEIGHT, rs.format.bgr8, DEPTH_FPS)
+        # A restarted thread re-reads the layout and re-freezes the canvas: the
+        # rig may have changed while it was stopped.
+        self._grid = None
+        self._calib = StitchCalib()
+        self._cached = (None, None, None)
+        with self._frame_lock:
+            self._buffers = [deque(maxlen=DEPTH_AVERAGE_FRAMES) for _ in cameras]
+            self._last_rgb = [None] * len(cameras)
+            self._serials = [c.serial for c in cameras]
+            self._intrinsics = [c.intr for c in cameras]
+        print(f"[depth] started {len(cameras)} RealSense camera(s) "
+              f"({', '.join(c.serial for c in cameras)}) — combined view")
 
-        try:
-            profile = pipe.start(cfg)
-        except Exception as exc:
-            print(f"[depth] ERROR: cannot start RealSense streams: {exc}")
-            return
-
-        scale = profile.get_device().first_depth_sensor().get_depth_scale()  # metres/unit
-        align = rs.align(rs.stream.depth)  # bring colour into the depth pixel grid
-        print(f"[depth] started RealSense {DEPTH_WIDTH}×{DEPTH_HEIGHT}@{DEPTH_FPS} "
-              f"depth+colour (depth scale {scale:.6f} m/unit)")
-
-        frame_i = 0
-        last_groove_jpg: Optional[bytes] = None
-        last_mask_jpg: Optional[bytes] = None
-        last_mask_full_jpg: Optional[bytes] = None
+        canvas_i = 0
+        started = time.monotonic()
+        last_canvas = 0.0
         try:
             while not self._stop_event.is_set():
-                try:
-                    frames = align.process(pipe.wait_for_frames(2000))
-                except Exception:
+                got = False
+                for i, camera in enumerate(cameras):
+                    frame = realsense_source.poll(camera)
+                    if frame is None:
+                        continue
+                    z, ok, rgb = frame
+                    with self._frame_lock:
+                        self._buffers[i].append((z, ok))
+                        if rgb is not None:
+                            self._last_rgb[i] = rgb
+                    got = True
+                if not got:
+                    time.sleep(0.005)
+
+                now = time.monotonic()
+                if (now - last_canvas) < STITCH_MAIN_EVERY_S:
                     continue
-                depth_frame = frames.get_depth_frame()
-                if not depth_frame:
+                frames = self._latest_frames()
+                if not frames:
                     continue
-                color_frame = frames.get_color_frame()
+                # Freeze the canvas only once the whole rig has reported, so a
+                # camera that starts a beat late still shapes the geometry.
+                if self._grid is None and len(frames) < len(cameras) \
+                        and (now - started) < STITCH_MAIN_BIND_TIMEOUT_S:
+                    continue
+                last_canvas = now
 
-                z = np.asarray(depth_frame.get_data(), dtype=np.float32) * scale  # metres
-                ok = z > 0
-                params = self._live_params
-                h, w = z.shape[:2]
-                x0, y0, x1, y1 = self._live_crop.pixel_box(w, h)
-
-                # Colorized depth (FULL frame — the crop box overlays it client-side).
-                color = colorize_depth(z, ok, params.near_m, params.far_m)
-                ok_color, color_jpg = cv2.imencode(".jpg", color, [cv2.IMWRITE_JPEG_QUALITY, 80])
-
-                # Participant popup: the SAME colorized depth but restricted to
-                # the Developer-Mode crop, so the popup shows exactly the
-                # region paths are generated from (like the skeleton/mask
-                # views). Composed only while a popup is connected; the popup
-                # never changes the crop — only users adjust it.
-                with self._state_lock:
-                    overlay_on = self._state.get("depth_overlay_clients", 0) > 0
-                crop_jpg = encode_jpeg(color[y0:y1, x0:x1]) if overlay_on else None
-
-                # Aligned RGB: buffer the FULL frame for Capture, but serve the
-                # live "rgb" view CROPPED so only the selected region shows.
-                rgb = np.asarray(color_frame.get_data()) if color_frame else None
-                rgb_jpg = encode_jpeg(rgb[y0:y1, x0:x1]) if rgb is not None else None
-
-                # Live groove + mask preview, restricted to the live crop (throttled).
-                if frame_i % _LIVE_GROOVE_EVERY == 0:
-                    ref = self._reference
-                    ref_sub = ref[y0:y1, x0:x1] if (ref is not None and ref.shape == z.shape) else None
-                    mask, skel = grooves_and_mask(
-                        z[y0:y1, x0:x1], ok[y0:y1, x0:x1], params, ref_sub, self._mm_per_px
-                    )
-                    sj, mj = encode_jpeg(skel), encode_jpeg(mask)
-                    if sj is not None:
-                        last_groove_jpg = sj
-                    if mj is not None:
-                        last_mask_jpg = mj
-
-                    # Full-frame mask for the projector: the cropped mask pasted
-                    # back at its frame position, so the projection homography
-                    # has stable full-frame coordinates regardless of the crop.
-                    # Composed ONLY while a projection window is connected.
+                if self._grid is None:
+                    self._bind_calib(frames)
+                result = stitch(frames, self._calib, grid=self._grid)
+                if self._grid is None:
+                    self._grid = CanvasGrid.from_result(result)
+                    gh, gw = result.depth_m.shape[:2]
+                    # frame_size is what the pipeline sees, i.e. AFTER the view
+                    # rotation — the stitch size is only half the story once the
+                    # canvas is turned.
+                    pw, ph = self.frame_size
+                    turned = (f" → published {pw}×{ph} (turned {self._rotation}°)"
+                              if self._rotation else "")
+                    print(f"[depth] combined canvas {gw}×{gh} px "
+                          f"@ {result.mm_per_px:.2f} mm/px from {len(frames)} camera(s)"
+                          + turned)
                     with self._state_lock:
-                        proj_on = self._state.get("projection_clients", 0) > 0
-                    if proj_on:
-                        full = np.zeros(z.shape, np.uint8)
-                        full[y0:y1, x0:x1] = mask
-                        fj = encode_jpeg(full)
-                        if fj is not None:
-                            last_mask_full_jpg = fj
-                    else:
-                        last_mask_full_jpg = None
+                        self._state["frame_size"] = [pw, ph]
+                        self._state["camera_count"] = len(cameras)
 
-                # Depth-number overlay labels: computed ONLY while a /depths
-                # popup is connected (zero overhead otherwise), throttled
-                # harder than the groove preview — it's a reference display.
-                # Labels cover the CROPPED region only (coords relative to the
-                # crop, matching the popup's cropped depth stream).
-                if frame_i % DEPTH_LABELS_EVERY == 0:
-                    labels = (depth_region_labels(z[y0:y1, x0:x1], ok[y0:y1, x0:x1],
-                                                  self._label_interval_mm)
-                              if overlay_on else None)
-                    with self._state_lock:
-                        self._state["depth_labels"] = labels
-                        self._state["depth_labels_size"] = (
-                            [x1 - x0, y1 - y0] if labels is not None else None)
-                frame_i += 1
-
-                # Participant-Mode trigger: is anything closer than the
-                # threshold? One vectorized compare per frame — cheap enough
-                # to run unthrottled so the automation reacts promptly.
-                # Watches ONLY the cropped region — the popup shows just the
-                # crop, so motion outside it must not arm/hold the trigger.
-                thr = self._trigger_mm
-                trigger_below = (depth_below_threshold(z[y0:y1, x0:x1], ok[y0:y1, x0:x1], thr)
-                                 if thr is not None else None)
-                with self._state_lock:
-                    self._state["trigger_below"] = trigger_below
-
-                if ok_color:
-                    with self._state_lock:
-                        self._state["last_depth_color_jpg"] = color_jpg.tobytes()
-                        self._state["last_depth_crop_jpg"] = crop_jpg
-                        self._state["last_rgb_jpg"] = rgb_jpg
-                        self._state["last_groove_jpg"] = last_groove_jpg
-                        self._state["last_mask_jpg"] = last_mask_jpg
-                        self._state["last_mask_full_jpg"] = last_mask_full_jpg
-
-                # Buffer raw metric depth (+ latest RGB) for averaged Capture.
-                with self._frame_lock:
-                    self._buffer.append((z, ok))
-                    if rgb is not None:
-                        self._last_rgb = rgb
+                rot = self._rotation   # read once: the three views must agree
+                rgb = result.rgb if result.rgb_valid.any() else None
+                self._publish(rotate_image(result.depth_m, rot),
+                              rotate_image(result.valid, rot),
+                              rotate_image(rgb, rot), canvas_i)
+                canvas_i += 1
         finally:
-            pipe.stop()
+            realsense_source.close(cameras)
             with self._state_lock:
-                self._state["last_depth_color_jpg"] = None
-                self._state["last_depth_crop_jpg"] = None
-                self._state["last_rgb_jpg"] = None
-                self._state["last_groove_jpg"] = None
-                self._state["last_mask_jpg"] = None
-                self._state["last_mask_full_jpg"] = None
-                self._state["depth_labels"] = None
-                self._state["depth_labels_size"] = None
-                self._state["trigger_below"] = None
+                for key in ("last_depth_color_jpg", "last_depth_crop_jpg", "last_rgb_jpg",
+                            "last_groove_jpg", "last_mask_jpg", "last_mask_full_jpg",
+                            "depth_labels", "depth_labels_size",
+                            "depth_labels_relative", "trigger_below"):
+                    self._state[key] = None
             with self._frame_lock:
-                self._buffer.clear()
-                self._last_rgb = None
+                self._buffers = []
+                self._last_rgb = []
             print("[depth] stopped")
+
+    # ── one canvas → every live view ─────────────────────────────────────────
+    def _publish(self, z: np.ndarray, ok: np.ndarray, rgb: Optional[np.ndarray],
+                 canvas_i: int) -> None:
+        """
+        Derive everything the browser sees from ONE combined canvas: the
+        colorized depth view, the cropped popup view, colour, the groove/mask
+        previews, the projector's full-frame mask, the depth-number labels and
+        the Participant-Mode trigger flag.
+
+        The arrays arrive already turned by the view rotation, so every view
+        below inherits it — including the crop, which is normalized and
+        therefore lands on the turned canvas exactly where main.py re-based it.
+        """
+        last_groove_jpg, last_mask_jpg, last_mask_full_jpg = self._cached
+        params = self._live_params
+        h, w = z.shape[:2]
+        x0, y0, x1, y1 = self._live_crop.pixel_box(w, h)
+
+        # The baseline sand, cropped to match — the ONE thing that lets the
+        # trigger, the depth labels and near-object rejection all speak in
+        # height above the sand instead of distance from the camera, which is
+        # what a tilted rig needs. None (no reference, or a stale shape after a
+        # view rotation) simply means every one of them falls back to absolute.
+        ref = self._reference
+        ref_sub = (ref[y0:y1, x0:x1]
+                   if (ref is not None and ref.shape == z.shape) else None)
+
+        # Colorized depth (FULL canvas — the crop box overlays it client-side).
+        color = colorize_depth(z, ok, params.near_m, params.far_m)
+        ok_color, color_jpg = cv2.imencode(".jpg", color, [cv2.IMWRITE_JPEG_QUALITY, 80])
+
+        # Participant popup: the SAME colorized depth but restricted to the
+        # Developer-Mode crop, so the popup shows exactly the region paths are
+        # generated from (like the skeleton/mask views). Composed only while a
+        # popup is connected; the popup never changes the crop — only users
+        # adjust it in Developer Mode.
+        with self._state_lock:
+            overlay_on = self._state.get("depth_overlay_clients", 0) > 0
+        crop_jpg = encode_jpeg(color[y0:y1, x0:x1]) if overlay_on else None
+
+        # Combined colour: buffer the FULL canvas for Capture, but serve the
+        # live "rgb" view CROPPED so only the selected region shows.
+        rgb_jpg = encode_jpeg(rgb[y0:y1, x0:x1]) if rgb is not None else None
+
+        # Live groove + mask preview, restricted to the live crop (throttled).
+        if canvas_i % _LIVE_GROOVE_EVERY == 0:
+            mask, skel = grooves_and_mask(
+                z[y0:y1, x0:x1], ok[y0:y1, x0:x1], params, ref_sub, self._mm_per_px
+            )
+            sj, mj = encode_jpeg(skel), encode_jpeg(mask)
+            if sj is not None:
+                last_groove_jpg = sj
+            if mj is not None:
+                last_mask_jpg = mj
+
+            # Full-canvas mask for the projector: the cropped mask pasted back
+            # at its canvas position, so the projection homography has stable
+            # coordinates regardless of the crop. Composed ONLY while a
+            # projection window is connected.
+            with self._state_lock:
+                proj_on = self._state.get("projection_clients", 0) > 0
+            if proj_on:
+                full = np.zeros(z.shape, np.uint8)
+                full[y0:y1, x0:x1] = mask
+                fj = encode_jpeg(full)
+                if fj is not None:
+                    last_mask_full_jpg = fj
+            else:
+                last_mask_full_jpg = None
+
+        # Depth-number overlay labels: computed ONLY while a /depths popup is
+        # connected (zero overhead otherwise), throttled harder than the groove
+        # preview — it's a reference display. Labels cover the CROPPED region
+        # only (coords relative to the crop, matching the popup's stream).
+        if canvas_i % DEPTH_LABELS_EVERY == 0:
+            labels = (depth_region_labels(z[y0:y1, x0:x1], ok[y0:y1, x0:x1],
+                                          self._label_interval_mm,
+                                          reference=ref_sub)
+                      if overlay_on else None)
+            with self._state_lock:
+                self._state["depth_labels"] = labels
+                self._state["depth_labels_size"] = (
+                    [x1 - x0, y1 - y0] if labels is not None else None)
+                # Which quantity those numbers are, so the popup can say so
+                # rather than leaving the operator to guess.
+                self._state["depth_labels_relative"] = ref_sub is not None
+
+        # Participant-Mode trigger: is anything there? One vectorized compare per
+        # canvas. Watches ONLY the cropped region — the popup shows just the
+        # crop, so motion outside it must not arm/hold it. With a reference the
+        # threshold is a height above the sand (tilt-proof); without one it is
+        # the old absolute distance from the camera.
+        thr = self._trigger_mm
+        trigger_below = (presence_trigger(z[y0:y1, x0:x1], ok[y0:y1, x0:x1], thr,
+                                          reference=ref_sub)
+                         if thr is not None else None)
+        with self._state_lock:
+            self._state["trigger_below"] = trigger_below
+            if ok_color:
+                self._state["last_depth_color_jpg"] = color_jpg.tobytes()
+                self._state["last_depth_crop_jpg"] = crop_jpg
+                self._state["last_rgb_jpg"] = rgb_jpg
+                self._state["last_groove_jpg"] = last_groove_jpg
+                self._state["last_mask_jpg"] = last_mask_jpg
+                self._state["last_mask_full_jpg"] = last_mask_full_jpg
+
+        self._cached = (last_groove_jpg, last_mask_jpg, last_mask_full_jpg)
+
+
+def _average(buffer: list[tuple[np.ndarray, np.ndarray]]
+             ) -> tuple[np.ndarray, np.ndarray]:
+    """Temporal average of one camera's (depth, valid) buffer, ignoring dropouts."""
+    acc = np.zeros_like(buffer[0][0], dtype=np.float32)
+    cnt = np.zeros_like(acc, dtype=np.float32)
+    for z, ok in buffer:
+        acc[ok] += z[ok]
+        cnt += ok
+    valid = cnt > 0
+    depth_m = np.zeros_like(acc)
+    depth_m[valid] = acc[valid] / cnt[valid]
+    return depth_m, valid

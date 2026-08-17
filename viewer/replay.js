@@ -37,23 +37,18 @@ function renderList(items) {
     label.textContent = it.name;
     const fmts = document.createElement("span");
     fmts.className = "fmts";
-    // Each format is its own badge: click one to load that file explicitly
-    // (clicking the row loads the default — json when present).
-    const sources = [it.has_json ? "json" : null, it.has_script ? "script" : null]
-      .filter(Boolean);
-    sources.forEach((src, i) => {
-      if (i) fmts.append(" · ");
-      const b = document.createElement("a");
-      b.textContent = src;
-      b.title = `Load path.${src === "json" ? "json" : "script"}`;
-      b.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        selectedName = it.name;
-        highlightSelected();
-        send("select", { name: it.name, source: src });
-      });
-      fmts.appendChild(b);
+    // path.json is the only executable file in a bundle now — the old URScript
+    // export went away with the UR, so there is nothing to choose between.
+    const b = document.createElement("a");
+    b.textContent = "json";
+    b.title = "Load path.json";
+    b.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      selectedName = it.name;
+      highlightSelected();
+      send("select", { name: it.name, source: "json" });
     });
+    fmts.appendChild(b);
     li.append(label, fmts);
     li.addEventListener("click", () => {
       selectedName = it.name;

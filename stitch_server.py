@@ -27,7 +27,7 @@ from config import (
     HTTP_HOST, STITCH_CALIB_FILE, STITCH_HTTP_PORT, STITCH_MAX_CAMERAS,
 )
 from multi_camera import MultiCameraThread, cam_key
-from stitcher import StitchCalib
+from stitcher import StitchCalib, load_calib
 
 _VIEWER_DIR = Path(__file__).parent / "viewer"
 
@@ -108,6 +108,8 @@ class StitchServer:
             "calib": self._camera.get_calib().to_dict(),
             "colour": self._camera.get_colour(),
             "max_cameras": STITCH_MAX_CAMERAS,
+            "dirty": self._camera.dirty,
+            "calib_file": str(STITCH_CALIB_FILE),
         }))
         try:
             async for msg in ws:
@@ -150,9 +152,17 @@ class StitchServer:
         elif mtype == "save_calib":
             calib = self._camera.get_calib().to_dict()
             STITCH_CALIB_FILE.write_text(json.dumps(calib, indent=2))
+            # Only now is what's on screen what the main app will use.
+            self._camera.mark_saved()
             await ws.send_str(json.dumps({
                 "type": "save_result", "success": True,
-                "message": f"Layout saved to {STITCH_CALIB_FILE}"}))
+                "message": f"Layout saved to {STITCH_CALIB_FILE} — "
+                           "restart the main app to use it"}))
+        elif mtype == "revert_calib":
+            self._camera.revert_calib()
+            await ws.send_str(json.dumps({
+                "type": "save_result", "success": True,
+                "message": f"Reverted to the layout in {STITCH_CALIB_FILE}"}))
 
     # ── state broadcast + last-tab shutdown ──────────────────────────────────
     async def _broadcast_loop(self) -> None:
@@ -163,7 +173,7 @@ class StitchServer:
                 note = self._state.get("stitch_note")
                 calib = self._state.get("stitch_calib")
             text = json.dumps({"type": "state", "info": info, "note": note,
-                               "calib": calib})
+                               "calib": calib, "dirty": self._camera.dirty})
             for ws in list(self._ws_clients):
                 try:
                     await ws.send_str(text)
@@ -199,8 +209,7 @@ def _as_steps(value, default: int) -> int:
 
 
 def load_saved_calib() -> StitchCalib:
-    """Read stitch_calibration.json if present, else an empty rig."""
-    try:
-        return StitchCalib.from_dict(json.loads(STITCH_CALIB_FILE.read_text()))
-    except (OSError, json.JSONDecodeError, ValueError):
-        return StitchCalib()
+    """Read stitch_calibration.json if present, else an empty rig. The parsing
+    lives in stitcher so the main app (which reads the same file to build its
+    combined view) cannot drift from what this tool writes."""
+    return load_calib()

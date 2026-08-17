@@ -16,7 +16,7 @@ const $ = (id) => document.getElementById(id);
 // The files save_bundle writes. Listed in a fixed order so every row's file
 // line reads the same way, and a bundle missing one is obvious at a glance
 // rather than being spotted by its absence.
-const EXPECTED = ["path.script", "path.json", "preview.png", "mask.png",
+const EXPECTED = ["path.json", "path.script", "preview.png", "mask.png",
                   "skeleton.png"];
 
 let ws = null;

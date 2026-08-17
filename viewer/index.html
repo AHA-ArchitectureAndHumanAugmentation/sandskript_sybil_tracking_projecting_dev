@@ -27,6 +27,10 @@
         <div class="panel vp" id="vp-depth">
           <div class="panel-label">Depth</div>
           <button id="btn-depth-numbers" title="Open Participant Mode: absolute depths (mm from camera) on the live view, plus the Auto toggle + trigger that run the pipeline automatically">⧉ Participant Mode</button>
+          <!-- Turns the whole combined canvas a quarter turn per press. Every
+               other view (RGB, Skeleton, Mask, the projector and Participant
+               Mode) is derived from that canvas, so they all turn with it. -->
+          <button id="btn-rotate-view" title="Rotate the camera view 90° clockwise. The RGB, Skeleton and Mask views, the projection and Participant Mode all turn with it, and the crop follows the sand. Drops any captured still — rotate first, then capture.">⟳ 0°</button>
           <img class="cam-live" id="feed-depth" src="/depth" alt="colorized depth feed" />
           <img class="cam-still hidden" id="still-depth" alt="captured depth still" />
           <!-- Crop overlay lives on the Depth viewport (live feed or captured still) -->
@@ -61,9 +65,13 @@
           <button id="btn-project-cal" title="Open the calibration window on this screen — drag its handles and the projector output follows live">⧉ Calibrate</button>
           <img class="cam-live" id="feed-mask" src="/depth/mask" alt="mask feed" />
           <img class="cam-still hidden" id="prev-mask" alt="mask preview" />
+          <!-- Label + title are rewritten by viewer.js: with a reference frame
+               set this cutoff is a height ABOVE THE SAND (tilt-proof), without
+               one it is an absolute distance from the camera. Same switch the
+               Participant trigger uses. -->
           <div class="adj-row adj-num" id="mask-ignore" data-key="ignore_closer_mm" data-min="0" data-max="5000" data-step="1" data-default="0"
                title="Near-object filter: anything closer to the depth camera than this absolute distance (a hand raking, a person leaning over the sand) — and every mask blob touching it — is left out of the mask and the live projection. 0 or empty = off.">
-            <label for="ignore-closer-input">Ignore closer than</label>
+            <label for="ignore-closer-input" id="ignore-closer-label">Ignore closer than</label>
             <input type="number" id="ignore-closer-input" placeholder="off" />
             <label for="ignore-closer-input">mm</label>
           </div>
@@ -80,8 +88,8 @@
       <div id="edit-panel-header">
         <span>Detection Parameters</span>
         <div class="hdr-btns">
-          <button id="btn-save-adjust" class="hdr-btn" title="Save the current detection parameters to a dated file">Save</button>
-          <button id="btn-load-adjust" class="hdr-btn" title="Load detection parameters from a saved file">Load</button>
+          <button id="btn-save-adjust" class="hdr-btn" title="Save these detection parameters AND the Path Preview bar (Spacing, Distance Threshold, Radius, Speed, Offset, Safety, Max Total Length) to a dated file">Save</button>
+          <button id="btn-load-adjust" class="hdr-btn" title="Load detection parameters and the Path Preview bar from a saved file">Load</button>
           <button id="btn-reset-adjust" class="hdr-btn" title="Reset all detection parameters">Reset</button>
         </div>
       </div>
@@ -222,7 +230,7 @@
         <button id="btn-register" class="adj-btn" title="Touch one corner of the physical surface with the tool tip to place the mesh exactly (optional)">Register Corner → TCP…</button>
       </div>
       <p class="adj-note">Optional touch-off: instead of guessing X/Y/Z with the sliders,
-        pick a corner of the mesh, freedrive the tool tip onto that physical corner and
+        pick a corner of the mesh, hand-guide the tool tip onto that physical corner and
         confirm — the surface snaps there. Rotation keeps the slider values.
         Needs the robot connected; cancel keeps the current placement.</p>
 
@@ -241,37 +249,61 @@
         <button class="seg active" data-path="path">Path</button>
         <button class="seg" data-path="order">Order</button>
       </div>
-      <div id="path-legend" class="hidden">
-        <span class="legend-dot start"></span>Start
-        <span class="legend-dot end"></span>End
-        <span class="legend-sep"></span>
-        <label for="order-size">Size</label>
-        <input type="range" id="order-size" min="0.05" max="3" step="0.05" value="1" />
-      </div>
-      <div id="exec-bar" title="Spacing and Distance Threshold re-generate the path; Speed / Offset / Safety apply when Run is clicked">
-        <label for="exec-spacing" title="Distance between robot waypoints along each stroke — re-generates the path">Spacing</label>
-        <input type="range" id="exec-spacing" min="10" max="100" step="1" value="10" />
-        <span id="exec-spacing-val">10 mm</span>
+      <!-- Legend + execution settings, stacked bottom-left. The stack stops
+           short of the right edge so the Detection Parameters overlay (270 px,
+           top-right of <main>) can never cover a control. -->
+      <div id="preview-controls">
+        <div id="path-legend" class="hidden">
+          <span class="legend-dot start"></span>Start
+          <span class="legend-dot end"></span>End
+          <span class="legend-sep"></span>
+          <label for="order-size">Size</label>
+          <input type="range" id="order-size" min="0.05" max="3" step="0.05" value="1" />
+        </div>
+        <!-- Two rows on purpose: what SHAPES the drawn line on top, what the
+             Run/Save click uses underneath. .exec-break forces the split; the
+             groups keep each label glued to its input if a row wraps again on a
+             narrow window. -->
+        <div id="exec-bar" title="Spacing and Distance Threshold re-generate the path; Speed / Offset / Safety apply when Run is clicked">
+          <span class="exec-row-label">Path</span>
+          <span class="exec-group">
+            <label for="exec-spacing" title="Distance between robot waypoints along each stroke — re-generates the path">Spacing</label>
+            <input type="range" id="exec-spacing" min="10" max="100" step="1" value="10" />
+            <span id="exec-spacing-val">10 mm</span>
+          </span>
+          <span class="exec-group">
+            <label for="exec-join" title="Distance Threshold — when the endpoints of two different strokes are closer than this, they are connected and the strokes merge into one continuous toolpath. If another stroke crosses the line that would close the gap, the threshold doubles for that pair. Each endpoint joins only its nearest eligible neighbour. 0 = off; re-generates the path">Distance Threshold</label>
+            <input type="number" id="exec-join" value="0" step="1" min="0" max="200" /> mm
+          </span>
+          <span class="exec-group">
+            <label for="exec-blend" title="corner zone radius — how far before each waypoint the robot starts curving into the next segment. Rounded corners show live in the Path Preview; clamped per stroke to 45% of the shortest segment, so a radius larger than the spacing allows simply rounds as much as it can">Radius</label>
+            <input type="range" id="exec-blend" min="0" max="50" step="0.1" value="0.5" />
+            <span id="exec-blend-val">0.5 mm</span>
+          </span>
 
-        <label for="exec-blend" title="movep corner blend radius — how far before each waypoint the robot starts curving into the next segment. Rounded corners show live in the Path Preview; clamped per stroke so the controller never rejects the path">Radius</label>
-        <input type="range" id="exec-blend" min="0" max="5" step="0.1" value="0.5" />
-        <span id="exec-blend-val">0.5 mm</span>
-        <span class="legend-sep"></span>
-        <label for="exec-speed">Speed</label>
-        <input type="range" id="exec-speed" min="1" max="100" step="1" value="5" />
-        <span id="exec-speed-val">5%</span>
-        <span class="legend-sep"></span>
-        <label for="exec-offset">Offset</label>
-        <input type="number" id="exec-offset" value="0" step="0.5" min="-20" max="200" /> mm
-        <span class="legend-sep"></span>
-        <label for="exec-safety">Safety</label>
-        <input type="number" id="exec-safety" value="50" step="5" min="5" max="300" /> mm
-        <span class="legend-sep"></span>
+          <span class="exec-break"></span>
 
-        <label for="exec-join" title="Distance Threshold — when the endpoints of two different strokes are closer than this, they are connected and the strokes merge into one continuous toolpath. If another stroke crosses the line that would close the gap, the threshold doubles for that pair. Each endpoint joins only its nearest eligible neighbour. 0 = off; re-generates the path">Distance Threshold</label>
-        <input type="number" id="exec-join" value="0" step="1" min="0" max="200" /> mm
-        <span class="legend-sep"></span>
-        <button id="btn-save-path" title="Save this toolpath (URScript + JSON + preview image) to a dated folder under paths/">💾 Save Path</button>
+          <span class="exec-row-label">Run</span>
+          <span class="exec-group">
+            <label for="exec-speed">Speed</label>
+            <input type="range" id="exec-speed" min="1" max="100" step="1" value="5" />
+            <span id="exec-speed-val">5%</span>
+          </span>
+          <span class="exec-group">
+            <label for="exec-offset">Offset</label>
+            <input type="number" id="exec-offset" value="0" step="0.5" min="-20" max="200" /> mm
+          </span>
+          <span class="exec-group">
+            <label for="exec-safety">Safety</label>
+            <input type="number" id="exec-safety" value="50" step="5" min="5" max="300" /> mm
+          </span>
+          <span class="exec-group">
+            <label for="exec-max-length" title="Max Total Length — a ceiling on how far the tool travels WHILE DRAWING (the green line, measured on the projected surface at real scale, with Spacing, Radius and Distance Threshold all applied). Pen-up travels and retracts do not count. Over the limit the path is refused: Run and Save Path both decline, and in Participant Mode the drawing is marked Invalid. 0 = off">Max Total Length</label>
+            <input type="number" id="exec-max-length" value="0" step="50" min="0" max="100000" /> mm
+            <span id="exec-length-val" title="Drawn length of the current path">—</span>
+          </span>
+          <button id="btn-save-path" title="Save this toolpath (JSON + preview image) to a dated folder under paths/">💾 Save Path</button>
+        </div>
       </div>
       <canvas id="threejs-canvas"></canvas>
     </div>
@@ -302,7 +334,7 @@
           <span>Load Detection Parameters</span>
           <button id="btn-preset-close" class="hdr-btn" title="Close">✕</button>
         </div>
-        <p class="adj-note">Pick a saved settings file to load it into the sliders.</p>
+        <p class="adj-note">Pick a saved settings file to load it into the sliders and the Path Preview bar. Files saved before the bar was included restore the sliders only.</p>
         <ul id="preset-list"></ul>
       </div>
     </div>
@@ -320,14 +352,14 @@
           below — hovering either highlights the marker <b style="color:#66d9ff">cyan</b>;
           the selected one turns <b style="color:#00e5a0">green</b>. The preview stays
           visible and orbitable while this dialog is open.
-          <b>2.</b> <b>Start Freedrive</b> and move the robot by hand until
+          <b>2.</b> <b>Arm touch-off</b>, then hold the lead-through button on the arm and move it by hand until
           the <b>tool tip touches that physical corner</b>. <b>3.</b> <b>Confirm</b> — the
           surface moves so the selected corner sits exactly at the TCP. Rotation keeps the
           slider values (set those first). Closing without confirming keeps the current
           placement.</p>
         <ul id="register-list"></ul>
         <div id="register-actions">
-          <button id="btn-register-freedrive" class="adj-btn">Start Freedrive</button>
+          <button id="btn-register-freedrive" class="adj-btn">Arm touch-off</button>
           <button id="btn-register-confirm" class="adj-btn" disabled>Confirm: corner = TCP</button>
         </div>
         <p class="adj-note" id="register-status">No corner selected.</p>

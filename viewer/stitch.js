@@ -137,6 +137,27 @@ $("btn-reset-corners").addEventListener("click", () =>
   command("reset_camera", { corners_only: true }));
 $("btn-reset-cam").addEventListener("click", () => command("reset_camera"));
 $("btn-save").addEventListener("click", () => send("save_calib"));
+/* Discard is the one control that throws away work, so it arms on the first
+   click and fires on the second — no modal (nothing else in this tool uses
+   one, and a blocked dialog would leave the button dead). */
+let revertArmed = null;
+$("btn-revert").addEventListener("click", () => {
+  const btn = $("btn-revert");
+  if (revertArmed) {
+    clearTimeout(revertArmed);
+    revertArmed = null;
+    btn.textContent = "Discard changes";
+    // command() (not send()) so the panels re-fit onto the corners that come
+    // back — a revert moves every quad, exactly like a reset does.
+    command("revert_calib");
+    return;
+  }
+  btn.textContent = "Click again to discard";
+  revertArmed = setTimeout(() => {
+    revertArmed = null;
+    btn.textContent = "Discard changes";
+  }, 4000);
+});
 $("btn-colour").addEventListener("click", () => {
   colour = !colour;
   applyColour();
@@ -549,13 +570,35 @@ function showMsg(text, isError) {
   m.classList.toggle("err", !!isError);
 }
 
+/* Saved vs. adjusted. The main app builds its combined view from the FILE, not
+   from this window, so "you have changes" and "the app is still on the old
+   layout" are the same statement — say it once, here. */
+let calibFile = "stitch_calibration.json";
+function showSaved(dirty) {
+  $("btn-save").classList.toggle("dirty", !!dirty);
+  $("btn-revert").disabled = !dirty;
+  if (!dirty && revertArmed) {          // nothing left to discard — disarm
+    clearTimeout(revertArmed);
+    revertArmed = null;
+    $("btn-revert").textContent = "Discard changes";
+  }
+  const el = $("saved-state");
+  el.className = dirty ? "dirty" : "saved";
+  el.textContent = dirty
+    ? `Adjusted — not saved. The app still uses the layout in ${calibFile}.`
+    : "Saved — this is what the app uses";
+}
+
 function handle(data) {
   if (data.type === "init") {
     colour = !!data.colour;
     applyColour();
+    if (data.calib_file) calibFile = data.calib_file;
     applyCalib(data.calib);
+    showSaved(data.dirty);
   } else if (data.type === "state") {
     applyCalib(data.calib);
+    showSaved(data.dirty);
     info = data.info;
     if (info && info.count !== undefined) buildStrip(info.count);
     $("info").textContent = !info
