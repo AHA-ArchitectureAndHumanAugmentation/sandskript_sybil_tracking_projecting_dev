@@ -46,6 +46,7 @@ from config import (
     STITCH_MM_PER_PX, STITCH_MAX_GRID_W, STITCH_MAX_GRID_H,
     STITCH_NOMINAL_HFOV_DEG, STITCH_NOMINAL_VFOV_DEG,
 )
+from profiling import NULL_TIMER, StageTimer
 
 # Corner order shared with the projector calibration: handles 1-4 on screen.
 CORNER_NAMES = ("top-left", "top-right", "bottom-left", "bottom-right")
@@ -554,7 +555,8 @@ def _empty_result(n_cams: int, mm_per_px: float) -> StitchResult:
 
 def stitch(frames: list[CameraFrame], calib: StitchCalib,
            mm_per_px: Optional[float] = None,
-           grid: Optional[CanvasGrid] = None) -> StitchResult:
+           grid: Optional[CanvasGrid] = None,
+           timer: StageTimer = NULL_TIMER) -> StitchResult:
     """
     Lay every camera's frame onto the shared canvas through its corner-pin.
     `frames` are the raw per-device captures in enumeration order; the rotation,
@@ -564,12 +566,19 @@ def stitch(frames: list[CameraFrame], calib: StitchCalib,
     this cycle's cameras — see CanvasGrid. With a grid, a cycle where no camera
     had data returns a correctly-sized EMPTY canvas rather than a stub, so the
     pipeline downstream keeps its frame size.
+
+    ``timer`` is diagnostic only (see profiling.py). This is the most expensive
+    stage of the live loop, and its parts scale differently: prepare and the
+    warps grow with the CAMERA COUNT, while alloc and blend grow only with the
+    CANVAS AREA. A rig that got slower when a camera was added is one or the
+    other, and the breakdown is what tells them apart. Default = no measuring.
     """
     if mm_per_px is None:
         mm_per_px = calib.mm_per_px
 
-    prepared = [_prepare(f, calib.placement_for(f.serial, i), i)
-                for i, f in enumerate(frames)]
+    with timer.stage("stitch.prepare"):
+        prepared = [_prepare(f, calib.placement_for(f.serial, i), i)
+                    for i, f in enumerate(frames)]
     live = [q for q in prepared if q is not None]
     if not live and grid is None:
         return _empty_result(len(frames), mm_per_px if mm_per_px > 0 else 2.0)
@@ -598,10 +607,11 @@ def stitch(frames: list[CameraFrame], calib: StitchCalib,
             gh = max(1, int(math.ceil((ymax - ymin) / mm_per_px)))
         gw, gh = max(gw, 16), max(gh, 16)
 
-    depth_sum = np.zeros((gh, gw), np.float32)
-    coverage = np.zeros((gh, gw), np.uint8)
-    rgb_sum = np.zeros((gh, gw, 3), np.float32)
-    rgb_cnt = np.zeros((gh, gw), np.float32)
+    with timer.stage("stitch.alloc"):
+        depth_sum = np.zeros((gh, gw), np.float32)
+        coverage = np.zeros((gh, gw), np.uint8)
+        rgb_sum = np.zeros((gh, gw, 3), np.float32)
+        rgb_cnt = np.zeros((gh, gw), np.float32)
     quads_px: list[Optional[list[tuple[float, float]]]] = []
 
     for q in prepared:
@@ -611,32 +621,38 @@ def stitch(frames: list[CameraFrame], calib: StitchCalib,
         dst = (q.quad - np.array([xmin, ymin], np.float32)) / mm_per_px
         quads_px.append([(float(u), float(v)) for u, v in dst])
         h = cv2.getPerspectiveTransform(q.src, dst.astype(np.float32))
-        # NEAREST everywhere: interpolating depth across a dropout would invent
-        # surface that is not there, and the mask must stay strictly binary.
-        src_depth = np.where(q.valid, q.frame.depth_m, 0.0).astype(np.float32)
-        warped = cv2.warpPerspective(src_depth, h, (gw, gh), flags=cv2.INTER_NEAREST)
-        hit = cv2.warpPerspective(q.valid.astype(np.uint8), h, (gw, gh),
-                                  flags=cv2.INTER_NEAREST) > 0
-        depth_sum[hit] += warped[hit] + q.height_m
-        coverage += hit.astype(np.uint8)
+        # One `warp_*` call per CAMERA per canvas, so ms/call is the cost of one
+        # camera and ms/cyc is what the whole rig costs — which is the pair a
+        # scaling test wants.
+        with timer.stage("stitch.warp_depth"):
+            # NEAREST everywhere: interpolating depth across a dropout would invent
+            # surface that is not there, and the mask must stay strictly binary.
+            src_depth = np.where(q.valid, q.frame.depth_m, 0.0).astype(np.float32)
+            warped = cv2.warpPerspective(src_depth, h, (gw, gh), flags=cv2.INTER_NEAREST)
+            hit = cv2.warpPerspective(q.valid.astype(np.uint8), h, (gw, gh),
+                                      flags=cv2.INTER_NEAREST) > 0
+            depth_sum[hit] += warped[hit] + q.height_m
+            coverage += hit.astype(np.uint8)
         if q.frame.rgb is not None:
-            colour = np.where(q.valid[..., None], q.frame.rgb, 0)
-            cw = cv2.warpPerspective(colour, h, (gw, gh), flags=cv2.INTER_NEAREST)
-            has = hit & (cw.sum(axis=2) > 0)   # aligned-RGB black = outside colour FOV
-            rgb_sum[has] += cw[has]
-            rgb_cnt += has.astype(np.float32)
+            with timer.stage("stitch.warp_rgb"):
+                colour = np.where(q.valid[..., None], q.frame.rgb, 0)
+                cw = cv2.warpPerspective(colour, h, (gw, gh), flags=cv2.INTER_NEAREST)
+                has = hit & (cw.sum(axis=2) > 0)   # aligned-RGB black = outside colour FOV
+                rgb_sum[has] += cw[has]
+                rgb_cnt += has.astype(np.float32)
 
-    valid = coverage > 0
-    depth = np.zeros((gh, gw), np.float32)
-    depth[valid] = depth_sum[valid] / coverage[valid]
-    overlap = coverage >= 2
-    depth, valid = fill_small_holes(depth, valid)
+    with timer.stage("stitch.blend"):
+        valid = coverage > 0
+        depth = np.zeros((gh, gw), np.float32)
+        depth[valid] = depth_sum[valid] / coverage[valid]
+        overlap = coverage >= 2
+        depth, valid = fill_small_holes(depth, valid)
 
-    rgb = np.zeros((gh, gw, 3), np.uint8)
-    rgb_valid = rgb_cnt > 0
-    if rgb_valid.any():
-        rgb[rgb_valid] = np.clip(
-            rgb_sum[rgb_valid] / rgb_cnt[rgb_valid, None], 0, 255).astype(np.uint8)
+        rgb = np.zeros((gh, gw, 3), np.uint8)
+        rgb_valid = rgb_cnt > 0
+        if rgb_valid.any():
+            rgb[rgb_valid] = np.clip(
+                rgb_sum[rgb_valid] / rgb_cnt[rgb_valid, None], 0, 255).astype(np.uint8)
 
     return StitchResult(depth, valid, rgb, rgb_valid, coverage, overlap,
                         mm_per_px, (xmin, ymin), quads_px)

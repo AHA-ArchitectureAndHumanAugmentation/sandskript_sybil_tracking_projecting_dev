@@ -37,6 +37,7 @@ from config import (
     DEPTH_FPS, DEPTH_WIDTH, DEPTH_HEIGHT, DEPTH_AVERAGE_FRAMES,
     DEPTH_LABELS_MIN_AREA_PX, DEPTH_LABELS_MAX, TRIGGER_MIN_AREA_PX,
 )
+from profiling import NULL_TIMER, StageTimer
 
 try:
     from skimage.morphology import skeletonize as _sk_skeletonize
@@ -151,57 +152,96 @@ class DepthGrooveParams:
         )
 
 
+def _threshold_relief(
+    relief_mm: np.ndarray, params: DepthGrooveParams, strictness: float = 1.0
+) -> np.ndarray:
+    """
+    Which pixels count as groove, at a given strictness. 1.0 is the threshold the
+    parameters ask for; below 1.0 is a more lenient test on the SAME relief —
+    which is what hysteresis needs for its release threshold. "Lenient" means a
+    shallower cut for valley/ridge and a wider band for band.
+    """
+    s = max(float(strictness), 1e-6)
+    if params.detect == "ridge":
+        return relief_mm < -params.groove_depth_mm * s
+    if params.detect == "band":
+        half = params.band_width_mm / s
+        return np.abs(relief_mm - params.band_center_mm) <= half
+    return relief_mm > params.groove_depth_mm * s      # "valley" (default)
+
+
 def _relief_and_base_mask(
     depth_m: np.ndarray,
     valid: np.ndarray | None,
     params: DepthGrooveParams,
     reference: np.ndarray | None,
+    prev_mask: np.ndarray | None = None,
+    hysteresis: float = 1.0,
+    timer: StageTimer = NULL_TIMER,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Shared front-end: optional reference subtraction → detrend → threshold →
     morphological close → small-blob removal. Returns (relief_mm, base_mask_u8,
     valid). The per-stroke consistency/length filters run on top of this.
+
+    ``prev_mask`` + ``hysteresis`` add a thermostat-style deadband for the LIVE
+    preview: a pixel that was already lit stays lit while its relief holds above
+    ``hysteresis`` × the entry threshold. Defaults are off, so the captured
+    still — the one the robot actually draws from — is judged purely on its own
+    frame and never inherits a previous picture.
+
+    ``timer`` is diagnostic only (profiling.py). Every step here costs in
+    proportion to the CROPPED AREA, so the breakdown says how detection will
+    scale as a bigger rig grows the canvas — and which step to reach for. The
+    two Gaussians dominate; detrend_sigma_px is the wide one. Default = no
+    measuring, so the capture path is unaffected.
     """
-    d = np.asarray(depth_m, dtype=np.float32).copy()
-    if valid is None:
-        valid = np.isfinite(d) & (d > 0)
+    with timer.stage("detect.prep"):
+        d = np.asarray(depth_m, dtype=np.float32).copy()
+        if valid is None:
+            valid = np.isfinite(d) & (d > 0)
 
-    # Reference (background) subtraction: cancel pre-existing natural grooves by
-    # subtracting a baseline frame of the undrawn sand. ref_strength blends it in
-    # (0 = off, 1 = full) so its effect can be compared. The detrend below removes
-    # any constant offset this introduces, so only the spatial ripple cancels.
-    if reference is not None and params.ref_strength > 0:
-        ref = np.asarray(reference, dtype=np.float32)
-        if ref.shape == d.shape:
-            both = valid & np.isfinite(ref) & (ref > 0)
-            d[both] = d[both] - params.ref_strength * ref[both]
+        # Reference (background) subtraction: cancel pre-existing natural grooves by
+        # subtracting a baseline frame of the undrawn sand. ref_strength blends it in
+        # (0 = off, 1 = full) so its effect can be compared. The detrend below removes
+        # any constant offset this introduces, so only the spatial ripple cancels.
+        if reference is not None and params.ref_strength > 0:
+            ref = np.asarray(reference, dtype=np.float32)
+            if ref.shape == d.shape:
+                both = valid & np.isfinite(ref) & (ref > 0)
+                d[both] = d[both] - params.ref_strength * ref[both]
 
-    d[~valid] = np.nan
+        d[~valid] = np.nan
 
-    # Fill gaps so blurring doesn't bleed invalid pixels into the surface estimate.
-    d_filled = _fill_invalid(d)
+        # Fill gaps so blurring doesn't bleed invalid pixels into the surface estimate.
+        d_filled = _fill_invalid(d)
 
-    if params.smooth_sigma_px > 0:
-        d_filled = cv2.GaussianBlur(d_filled, (0, 0), params.smooth_sigma_px)
+    with timer.stage("detect.blur"):
+        if params.smooth_sigma_px > 0:
+            d_filled = cv2.GaussianBlur(d_filled, (0, 0), params.smooth_sigma_px)
 
-    # Bare-sand surface = low-frequency component. Subtract → local relief in mm.
-    # Positive = farther from the (top-down) camera = a depression = a groove.
-    surface = cv2.GaussianBlur(d_filled, (0, 0), params.detrend_sigma_px)
-    relief_mm = (d_filled - surface) * 1000.0
+        # Bare-sand surface = low-frequency component. Subtract → local relief in mm.
+        # Positive = farther from the (top-down) camera = a depression = a groove.
+        surface = cv2.GaussianBlur(d_filled, (0, 0), params.detrend_sigma_px)
+        relief_mm = (d_filled - surface) * 1000.0
 
-    if params.detect == "ridge":
-        mask = relief_mm < -params.groove_depth_mm
-    elif params.detect == "band":
-        lo = params.band_center_mm - params.band_width_mm
-        hi = params.band_center_mm + params.band_width_mm
-        mask = (relief_mm >= lo) & (relief_mm <= hi)
-    else:  # "valley" (default)
-        mask = relief_mm > params.groove_depth_mm
-    mask = mask & valid
+    with timer.stage("detect.threshold"):
+        mask = _threshold_relief(relief_mm, params)
 
-    mask_u8 = (mask.astype(np.uint8)) * 255
-    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-    mask_u8 = _remove_small(mask_u8, params.min_blob_px)
+        # Hysteresis: hold what was already lit if it still clears the (lower)
+        # release threshold. Applied BEFORE the morphology and the small-blob cut so
+        # a held pixel keeps its blob over min_blob_px too — the blob popping in and
+        # out whole is what reads as the mask changing LENGTH, not just width.
+        if prev_mask is not None and 0.0 < hysteresis < 1.0 \
+                and prev_mask.shape == mask.shape:
+            mask |= _threshold_relief(relief_mm, params, hysteresis) & (prev_mask > 0)
+
+        mask = mask & valid
+
+    with timer.stage("detect.morph"):
+        mask_u8 = (mask.astype(np.uint8)) * 255
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        mask_u8 = _remove_small(mask_u8, params.min_blob_px)
 
     # Near-object rejection: anything standing proud of the sand (a hand raking,
     # a person leaning in) is not sand — the object and the phantom relief the
@@ -214,19 +254,20 @@ def _relief_and_base_mask(
     # distance, as before. Either way it reads the RAW depth, never `d`, which
     # the ref_strength blend above has already shifted.
     if params.ignore_closer_mm > 0:
-        relative = surface_height_mm(depth_m, valid, reference)
-        if relative is not None:
-            height_mm, ok_ref = relative
-            near = ok_ref & (height_mm > params.ignore_closer_mm)
-        else:
-            near = valid & (np.asarray(depth_m, np.float32)
-                            < params.ignore_closer_mm / 1000.0)
-        if near.any():
-            k = 2 * GROOVE_NEAR_MARGIN_PX + 1
-            near_u8 = cv2.dilate(
-                near.astype(np.uint8),
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-            mask_u8 = _remove_touching(mask_u8, near_u8)
+        with timer.stage("detect.near"):
+            relative = surface_height_mm(depth_m, valid, reference)
+            if relative is not None:
+                height_mm, ok_ref = relative
+                near = ok_ref & (height_mm > params.ignore_closer_mm)
+            else:
+                near = valid & (np.asarray(depth_m, np.float32)
+                                < params.ignore_closer_mm / 1000.0)
+            if near.any():
+                k = 2 * GROOVE_NEAR_MARGIN_PX + 1
+                near_u8 = cv2.dilate(
+                    near.astype(np.uint8),
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+                mask_u8 = _remove_touching(mask_u8, near_u8)
 
     return relief_mm, mask_u8, valid
 
@@ -292,16 +333,27 @@ def grooves_and_mask(
     params: DepthGrooveParams = DepthGrooveParams(),
     reference: np.ndarray | None = None,
     mm_per_px: float | None = None,
+    prev_mask: np.ndarray | None = None,
+    hysteresis: float = 1.0,
+    timer: StageTimer = NULL_TIMER,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Return (thick mask, skeleton), both after natural-groove rejection. The mask
     is computed once and thinned, so both views share one detrend pass. Pass
     ``reference`` (a baseline depth frame, same shape) for background subtraction
     and ``mm_per_px`` to enable the mm-based width/length filters.
+
+    ``prev_mask`` + ``hysteresis`` are the live preview's anti-flicker deadband
+    (see `_relief_and_base_mask`); both default to off, so a Capture is judged
+    on its own frame alone. ``timer`` is diagnostic only, and records under
+    "detect.*" so the report nests it inside the caller's own `detect` stage.
     """
-    relief_mm, base, _valid = _relief_and_base_mask(depth_m, valid, params, reference)
-    skel = _skeletonize(base)
-    return _apply_stroke_filters(base, skel, relief_mm, params, mm_per_px)
+    relief_mm, base, _valid = _relief_and_base_mask(
+        depth_m, valid, params, reference, prev_mask, hysteresis, timer)
+    with timer.stage("detect.skeleton"):
+        skel = _skeletonize(base)
+    with timer.stage("detect.filters"):
+        return _apply_stroke_filters(base, skel, relief_mm, params, mm_per_px)
 
 
 def groove_mask(

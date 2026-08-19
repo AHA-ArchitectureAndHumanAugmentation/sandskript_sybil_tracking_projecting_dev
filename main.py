@@ -19,7 +19,7 @@ for _stream in (sys.stdout, sys.stderr):
 from config import (
     HTTP_HOST, HTTP_PORT, CONTOUR_MIN_PIXELS,
     DEPTH_LABELS_INTERVAL_MM,
-    DEPTH_FPS, DEPTH_AVERAGE_FRAMES, SURFACE_DIR,
+    SURFACE_DIR,
     DRAW_SPEED, TRAVEL_Z, MAX_TCP_SPEED,
     RESAMPLE_SPACING_MM, RESAMPLE_SPACING_MIN_MM, RESAMPLE_SPACING_MAX_MM,
     JOIN_DISTANCE_MM, JOIN_DISTANCE_MIN_MM, JOIN_DISTANCE_MAX_MM,
@@ -530,7 +530,7 @@ async def on_capture_image(ws) -> None:
         proj = shared_state.get("projection_clients", 0) > 0
     if proj:
         await server.broadcast_projection_blank(True)
-        await asyncio.sleep(DEPTH_AVERAGE_FRAMES / DEPTH_FPS + 0.3)
+        await asyncio.sleep(camera_thread.refill_seconds() + 0.3)
 
     try:
         captured = camera_thread.capture_frame()
@@ -1172,10 +1172,13 @@ async def _participant_pipeline() -> None:
             automation.finish("Not ready — load a target surface (or Test Mode) in Developer Mode.")
             return
 
-        # ── Sensing: the averaged capture uses the PAST second of frames, so
-        # wait for the buffer to refill with hand-free frames first.
+        # ── Sensing: the averaged capture reaches BACK over the rolling buffer,
+        # so wait for it to refill with hand-free frames first. How far back it
+        # reaches is measured, not assumed — a rig that cannot read every camera
+        # frame holds a buffer spanning several seconds, and a wait sized for
+        # one would leave the participant's hand in the picture the robot draws.
         _sync_participant_state()
-        await asyncio.sleep(DEPTH_AVERAGE_FRAMES / DEPTH_FPS + 0.3)
+        await asyncio.sleep(camera_thread.refill_seconds() + 0.3)
         await on_capture_image(bws)
         with state_lock:
             captured = shared_state.get("captured_still") is not None

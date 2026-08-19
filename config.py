@@ -1,5 +1,26 @@
 import math
+import os
 from pathlib import Path
+
+
+# Two diagnostic settings may be overridden from the environment (see
+# PROFILE_PIPELINE and CAMERA_LIMIT below). Everything else in this file is a
+# plain constant. The point is that a measuring session — which wants profiling
+# on and the rig capped to N cameras, several times over — leaves no edit behind
+# in a file that decides what the robot does.
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip())
+    except (TypeError, ValueError):
+        return default
+
 
 # ── Server ────────────────────────────────────────────────────────────────────
 # The 51xx block is deliberately off the common 8080/8000 range so this depth app
@@ -111,6 +132,15 @@ DEPTH_WIDTH          = 640
 DEPTH_HEIGHT         = 480
 DEPTH_FPS            = 30
 DEPTH_AVERAGE_FRAMES = 30     # frames temporally averaged on Capture (cuts noise ~√n)
+# How long the camera reader waits when no camera has a frame ready. It runs on
+# its own thread precisely so this stays short without competing with the canvas
+# work — see camera_thread._reader.
+CAMERA_POLL_IDLE_S   = 0.002
+# Ceiling on the MEASURED buffer-refill wait (camera_thread.refill_seconds).
+# That wait is how long Participant Mode holds off after a hand leaves, so a
+# camera that has stopped delivering must not be able to stall the installation
+# indefinitely — past this it captures anyway rather than waiting forever.
+CAPTURE_REFILL_MAX_S = 5.0
 
 # Colormap range (metres) for the live depth view. 0 = auto (per-frame percentile).
 DEPTH_COLOR_NEAR_M = 0.0
@@ -254,6 +284,54 @@ STITCH_MAIN_EVERY_S    = 0.2    # seconds between live canvas rebuilds (~5 Hz)
 # its cost at the price of doubling its latency.
 LIVE_GROOVE_EVERY      = 1
 
+# ── Live mask steadiness (the projected picture must not shimmer) ─────────────
+# Capture averages DEPTH_AVERAGE_FRAMES before the robot draws, but the LIVE
+# detection ran on one raw frame — and a D435i's per-pixel noise (~1-2 mm at a
+# metre) is the same size as the ~1.5 mm relief GROOVE_DEPTH_MM looks for. Every
+# pixel near a groove edge was therefore a coin flip, 10 times a second, which
+# on the projector reads as a mask twitching in width and length over sand
+# nobody is touching. Two dampers, both LIVE-ONLY: the captured still and the
+# path the robot draws are produced by a separate code path and are untouched.
+#
+# 1. Exponential average of the canvas depth used for detection. Each cycle
+#    keeps ALPHA of the new frame; noise falls by ~sqrt(ALPHA/(2-ALPHA)) — 0.25
+#    is about a 2.6x reduction, settling in ~0.4 s. 1.0 = off.
+LIVE_DEPTH_EMA_ALPHA   = 0.25
+# A pixel the sensor drops keeps its last value for this many cycles rather than
+# punching a hole in the mask. Bounded on purpose: a camera that dies must still
+# blank its part of the canvas within a moment, or a dead feed looks like a live
+# one. 0 = don't hold.
+LIVE_DEPTH_HOLD_CYCLES = 5
+# 2. Hysteresis on the mask, like a thermostat's deadband: a pixel already lit
+#    stays lit while its relief holds above this FRACTION of GROOVE_DEPTH_MM,
+#    instead of dropping out the instant it dips a hair below. Kills the residual
+#    crawling at groove edges that averaging alone leaves. 1.0 = off.
+LIVE_MASK_HYSTERESIS   = 0.7
+
+# ── Sending only what actually changed ────────────────────────────────────────
+# `_mjpeg_stream` already skips writing a frame it has written before, but it
+# compares the JPEG OBJECT, and the encoder hands back a fresh one every cycle —
+# so a picture that never changes was still re-encoded and re-sent 10x/s. Every
+# one of those costs the browser a decode plus, in the projection window, a
+# re-composite of a full-screen GPU layer at projector resolution. Comparing the
+# PICTURE instead lets a mask that is holding still be sent once and then left
+# alone. This only works because the live mask is now steady (LIVE_* above): a
+# shimmering mask differs every frame and would never match.
+PROJECTION_KEEPALIVE_S = 2.0   # resend an unchanged picture at least this often,
+                               # so a deliberately quiet stream is never mistaken
+                               # for a dead one
+# Floor on the interval between CHANGED projector frames. 0 = off, i.e. a change
+# goes out on the very next canvas — which is what you want, since the projector
+# is the one view whose latency a participant can see. Raise it (0.2 = 5 Hz) only
+# if a bigger rig makes the projection window fall progressively further behind.
+PROJECTION_EVERY_S     = 0.0
+# How many pixels must differ before the PROJECTOR's picture is worth resending.
+# Exact comparison turned out to be too sharp: one pixel flipping somewhere
+# along a groove edge forces a whole frame through, which is invisible once the
+# mask is warped and thrown across a sandbox. The dev-mode Mask/Skeleton views
+# stay EXACT — they are diagnostic, and cheap.
+PROJECTION_CHANGE_PX   = 32
+
 # ── Live-view profiling (diagnostic; off by default) ──────────────────────────
 # Both live views come off ONE thread, so a slow stage delays every stage after
 # it. Switch this on to print, every PROFILE_EVERY_S, where the canvas cycle's
@@ -262,8 +340,16 @@ LIVE_GROOVE_EVERY      = 1
 # pictures. Read the achieved Hz first: near target = the cadence is the limit
 # and the work has headroom; well under = the work is the limit, and the top
 # stage in the list is where the time is. Costs nothing while False.
-PROFILE_PIPELINE = False
+# SANDSKRIPT_PROFILE=1 switches it on for one run without editing this file —
+# the flag must stay False in git, and a leftover True slows every run silently.
+PROFILE_PIPELINE = _env_flag("SANDSKRIPT_PROFILE", False)
 PROFILE_EVERY_S  = 5.0    # seconds between profile reports
+# Cap how many cameras the MAIN APP opens; 0 = every one it finds (up to
+# STITCH_MAX_CAMERAS). Cameras are enumerated by serial and sorted, so a cap
+# takes the same first N every time — useful for a 1-then-2-then-3 scaling
+# test without crawling behind the rig to unplug USB. Set it for one run with
+# SANDSKRIPT_CAMERAS=2 rather than editing this.
+CAMERA_LIMIT = max(_env_int("SANDSKRIPT_CAMERAS", 0), 0)
 # Wait this long for every camera's first frame before freezing the canvas
 # geometry. Freezing early would size the canvas to a partial rig.
 STITCH_MAIN_BIND_TIMEOUT_S = 4.0
