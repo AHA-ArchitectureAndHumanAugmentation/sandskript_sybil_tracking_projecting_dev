@@ -129,6 +129,17 @@
   .hint { font-size: 11px; color: #6d727c; margin: 0; line-height: 1.45; }
   #msg { font-size: 12px; min-height: 16px; color: #7ec8a8; }
   #msg.err { color: #ff7a6e; }
+  /* Seam agreement, under the sidebar buttons. Colour IS the summary: green
+     means the cameras agree, amber means one Height nudge away, red means the
+     mismatch varies across the seam and no single offset will fix it. */
+  #seams {
+    font-size: 11px; line-height: 1.5; white-space: pre-line;
+    margin-top: 6px; padding: 6px 8px; border-radius: 4px;
+  }
+  #seams:empty { display: none; }
+  #seams.seam-ok     { color: #7ec8a8; background: #14241d; border: 1px solid #24473a; }
+  #seams.seam-height { color: #e0b562; background: #241f14; border: 1px solid #4a3d22; }
+  #seams.seam-tilt   { color: #ff9a8e; background: #241614; border: 1px solid #4a2622; }
 </style>
 </head>
 <body>
@@ -194,6 +205,10 @@
              adjustment is a picture only this window can see. -->
         <div id="saved-state" class="saved">Saved — this is what the app uses</div>
         <div id="msg"></div>
+        <!-- Seam agreement: do the cameras report the same depth where their
+             views overlap? Filled by stitch.js from info.seams; hidden while
+             there is nothing overlapping to compare. -->
+        <div id="seams"></div>
       </div>
       <p class="hint">Use <b>Turn</b> and <b>Move</b> until each camera sits
       the way it really does on the rig. Then work in the panels below: drag a

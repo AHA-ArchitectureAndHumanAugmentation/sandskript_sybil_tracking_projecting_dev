@@ -606,11 +606,37 @@ function handle(data) {
       : `${info.count} camera${info.count === 1 ? "" : "s"} · ` +
         `${info.size[0]}×${info.size[1]} px · ${info.mm_per_px} mm/px · ` +
         `overlap ${info.overlap_pct}%`;
+    showSeams(info && info.seams);
     $("note").textContent = data.note || (info && info.synthetic ? "SYNTHETIC scene" : "");
     redraw();
   } else if (data.type === "save_result") {
     showMsg(data.message, !data.success);
   }
+}
+
+/* ── Seam agreement ────────────────────────────────────────────────────────
+   Where two cameras see the same sand, stitch AVERAGES their depths — so a
+   per-camera bias does not show as one step but as a plateau with a step at
+   each edge of the overlap. A raked groove is ~1.5 mm deep, so even a few mm
+   here is several times the signal, and detection will paint phantom grooves
+   along the seam. The verdict is the useful part: "height" means one number is
+   wrong and the Height ▼▲ buttons can cancel it; "tilt" means the gap changes
+   across the seam, so no single offset will do. */
+function showSeams(seams) {
+  const el = $("seams");
+  if (!el) return;
+  if (!seams || !seams.length) {
+    el.textContent = "";
+    el.className = "";
+    return;
+  }
+  const worst = seams.reduce((a, s) =>
+    Math.abs(s.mean_mm) > Math.abs(a.mean_mm) ? s : a, seams[0]);
+  el.className = worst.verdict === "aligned" ? "seam-ok"
+               : worst.verdict === "height" ? "seam-height" : "seam-tilt";
+  el.textContent = seams.map((s) =>
+    `cam ${s.a + 1}↔${s.b + 1}: ${s.mean_mm >= 0 ? "+" : ""}${s.mean_mm.toFixed(1)} mm` +
+    ` (±${s.std_mm.toFixed(1)}) — ${s.hint}`).join("\n");
 }
 
 /* ── connection ── */
