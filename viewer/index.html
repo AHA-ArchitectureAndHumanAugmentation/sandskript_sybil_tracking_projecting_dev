@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Developer Mode</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+  <header>
+    <h1>Developer Mode</h1>
+    <div id="header-status">
+      <div id="status-dot"></div>
+      <span id="header-status-label">Disconnected</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- Left column: 2×2 grid of viewports (Depth | RGB  /  Skeleton | Mask) -->
+    <div id="camera-column">
+
+      <!-- Row 1: Depth + RGB side by side -->
+      <div class="cam-row" id="row-depth">
+        <button class="swap-btn" id="swap-depth" title="Swap left/right">⇄</button>
+
+        <div class="panel vp" id="vp-depth">
+          <div class="panel-label">Depth</div>
+          <button id="btn-depth-numbers" title="Open Participant Mode: absolute depths (mm from camera) on the live view, plus the Auto toggle + trigger that run the pipeline automatically">⧉ Participant Mode</button>
+          <!-- Turns the whole combined canvas a quarter turn per press. Every
+               other view (RGB, Skeleton, Mask, the projector and Participant
+               Mode) is derived from that canvas, so they all turn with it. -->
+          <button id="btn-rotate-view" title="Rotate the camera view 90° clockwise. The RGB, Skeleton and Mask views, the projection and Participant Mode all turn with it, and the crop follows the sand. Drops any captured still — rotate first, then capture.">⟳ 0°</button>
+          <img class="cam-live" id="feed-depth" src="/depth" alt="colorized depth feed" />
+          <img class="cam-still hidden" id="still-depth" alt="captured depth still" />
+          <!-- Crop overlay lives on the Depth viewport (live feed or captured still) -->
+          <div id="crop-box" class="hidden">
+            <div class="crop-handle" data-h="nw"></div>
+            <div class="crop-handle" data-h="ne"></div>
+            <div class="crop-handle" data-h="sw"></div>
+            <div class="crop-handle" data-h="se"></div>
+          </div>
+        </div>
+
+        <div class="panel vp" id="vp-rgb">
+          <div class="panel-label">RGB</div>
+          <img class="cam-live" id="feed-rgb" src="/rgb" alt="colour feed" />
+          <img class="cam-still hidden" id="still-rgb" alt="captured colour still" />
+        </div>
+      </div>
+
+      <!-- Row 2: Skeleton + Mask side by side -->
+      <div class="cam-row" id="row-grooves">
+        <button class="swap-btn" id="swap-grooves" title="Swap left/right">⇄</button>
+
+        <div class="panel vp" id="vp-skeleton">
+          <div class="panel-label">Skeleton</div>
+          <img class="cam-live" id="feed-skeleton" src="/depth/grooves" alt="skeleton feed" />
+          <img class="cam-still hidden" id="prev-skeleton" alt="skeleton preview" />
+        </div>
+
+        <div class="panel vp" id="vp-mask">
+          <div class="panel-label">Mask</div>
+          <button id="btn-project" title="Open the projection window — drag it onto the projector display and press F11">⧉ Project</button>
+          <button id="btn-project-cal" title="Open the calibration window on this screen — drag its handles and the projector output follows live">⧉ Calibrate</button>
+          <img class="cam-live" id="feed-mask" src="/depth/mask" alt="mask feed" />
+          <img class="cam-still hidden" id="prev-mask" alt="mask preview" />
+          <!-- Label + title are rewritten by viewer.js: with a reference frame
+               set this cutoff is a height ABOVE THE SAND (tilt-proof), without
+               one it is an absolute distance from the camera. Same switch the
+               Participant trigger uses. -->
+          <div class="adj-row adj-num" id="mask-ignore" data-key="ignore_closer_mm" data-min="0" data-max="5000" data-step="1" data-default="0"
+               title="Near-object filter: anything closer to the depth camera than this absolute distance (a hand raking, a person leaning over the sand) — and every mask blob touching it — is left out of the mask and the live projection. 0 or empty = off.">
+            <label for="ignore-closer-input" id="ignore-closer-label">Ignore closer than</label>
+            <input type="number" id="ignore-closer-input" placeholder="off" />
+            <label for="ignore-closer-input">mm</label>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Drag to resize the 4-view block vs. the path preview -->
+    <div id="col-splitter" title="Drag to resize"></div>
+
+    <!-- Groove detection controls (shown while editing a captured depth still) -->
+    <div id="edit-panel" class="hidden">
+      <div id="edit-panel-header">
+        <span>Detection Parameters</span>
+        <div class="hdr-btns">
+          <button id="btn-save-adjust" class="hdr-btn" title="Save these detection parameters AND the Path Preview bar (Spacing, Distance Threshold, Radius, Speed, Offset, Safety, Max Total Length) to a dated file">Save</button>
+          <button id="btn-load-adjust" class="hdr-btn" title="Load detection parameters and the Path Preview bar from a saved file">Load</button>
+          <button id="btn-reset-adjust" class="hdr-btn" title="Reset all detection parameters">Reset</button>
+        </div>
+      </div>
+      <p id="edit-hint">All four views update live, even before you capture: <b>Depth</b> / <b>RGB</b> on top, <b>Skeleton</b> / <b>Mask</b> below (⇄ swaps a row's left/right). Tune until the raked grooves read as clean white centrelines, drag a crop on the Depth view to limit the area (grooves + path preview then show only that region), then <b>Capture Image</b> → <b>Generate Path</b>.</p>
+
+      <div class="adj-group-title">Detection</div>
+      <div class="adj-row">
+        <label>Mode</label>
+        <select id="detect-mode">
+          <option value="valley" selected>Valley (grooves, deeper)</option>
+          <option value="ridge">Ridge (raised lines)</option>
+          <option value="band">Band (absolute iso-depth)</option>
+        </select>
+      </div>
+      <p class="adj-note">
+        <b>Valley</b> finds anything a few mm <i>deeper</i> than the surrounding sand —
+        the hand-drawn grooves. <b>Ridge</b> finds raised lines instead. <b>Band</b>
+        keeps a fixed depth interval (use the Band sliders below).
+      </p>
+
+      <div class="adj-row" data-key="groove_depth_mm" data-min="0.1" data-max="10" data-step="0.1" data-default="1.5">
+        <label>Groove depth (mm)</label><input type="range" /><span class="adj-val"></span></div>
+      <p class="adj-note">How much deeper than the surrounding surface a pixel must be to
+        count as a groove. Lower it to catch fainter rake marks; raise it if noise/grain
+        gets picked up.</p>
+
+      <div class="adj-row" data-key="detrend_sigma_px" data-min="2" data-max="100" data-step="1" data-default="25">
+        <label>Surface scale (px)</label><input type="range" /><span class="adj-val"></span></div>
+      <p class="adj-note">Blur radius used to estimate the smooth bare-sand surface that
+        gets subtracted off. Should be larger than your groove width but smaller than the
+        slow sag/tilt of the sandbox. Larger = flattens broader undulations.</p>
+
+      <div class="adj-row" data-key="smooth_sigma_px" data-min="0" data-max="6" data-step="0.1" data-default="1.5">
+        <label>Denoise (px)</label><input type="range" /><span class="adj-val"></span></div>
+      <p class="adj-note">Smooths per-pixel depth noise before detection. Raise it if the
+        grooves come out speckly; lower it to keep the thinnest marks.</p>
+
+      <div class="adj-row" data-key="min_blob_px" data-min="0" data-max="500" data-step="5" data-default="40">
+        <label>Min blob (px)</label><input type="range" /><span class="adj-val"></span></div>
+      <p class="adj-note">Discards detected specks smaller than this many pixels before
+        thinning — clears isolated noise that isn't part of a real groove.</p>
+
+
+      <div class="adj-group-title">Reject natural grooves</div>
+      <p class="adj-note">Tools to suppress pre-existing/natural sand grooves and keep only the
+        deliberate hand-raked ones. Each is independent — set any slider to 0 to disable it
+        (so you can compare the difference it makes).</p>
+
+      <div class="adj-row">
+        <button id="btn-set-reference" class="adj-btn">Set Reference (empty sand)</button>
+      </div>
+      <div class="adj-row">
+        <button id="btn-clear-reference" class="adj-btn">Clear Reference</button>
+      </div>
+      <div class="adj-row" data-key="ref_strength" data-min="0" data-max="1" data-step="0.05" data-default="0">
+        <label>Reference subtract</label><input type="range" /><span class="adj-val"></span></div>
+      <p class="adj-note"><b>Background subtraction.</b> Capture the undrawn sand with
+        <i>Set Reference</i>, then raise this to subtract that baseline — pre-existing natural
+        grooves appear in both frames and cancel, leaving only what you drew. 0 = off, 1 = full.
+        (Camera and sandbox must stay still between reference and capture.)</p>
+
+      <div class="adj-row" data-key="min_mean_depth_mm" data-min="0" data-max="10" data-step="0.1" data-default="0">
+        <label>Min mean depth (mm)</label><input type="range" /><span class="adj-val"></span></div>
+      <p class="adj-note">Drops whole grooves whose <i>average</i> depth is shallower than this.
+        Hand-raked grooves are consistently a few mm deep; faint natural ripples that only
+        graze the threshold get rejected. 0 = off.</p>
+
+      <div class="adj-row" data-key="min_width_mm" data-min="0" data-max="30" data-step="0.5" data-default="0">
+        <label>Min width (mm)</label><input type="range" /><span class="adj-val"></span></div>
+      <div class="adj-row" data-key="max_width_mm" data-min="0" data-max="30" data-step="0.5" data-default="0">
+        <label>Max width (mm)</label><input type="range" /><span class="adj-val"></span></div>
+      <p class="adj-note">Keep only grooves whose width matches the raking tool. A hand rake
+        makes a consistent width; thin natural scratches or broad dishes fall outside the band.
+        0 = off (max 0 = no upper limit). Needs a workspace for the mm scale.</p>
+
+      <div class="adj-row" data-key="min_length_mm" data-min="0" data-max="200" data-step="1" data-default="0">
+        <label>Min length (mm)</label><input type="range" /><span class="adj-val"></span></div>
+      <p class="adj-note">Drops grooves shorter than this along their centreline — natural texture
+        tends to break into short fragments. 0 = off. Needs a workspace for the mm scale.</p>
+
+      <div class="adj-group-title">Band mode</div>
+      <div class="adj-row" data-key="band_center_mm" data-min="-20" data-max="20" data-step="0.5" data-default="0">
+        <label>Band center (mm)</label><input type="range" /><span class="adj-val"></span></div>
+      <div class="adj-row" data-key="band_width_mm" data-min="0.1" data-max="20" data-step="0.1" data-default="1">
+        <label>Band ± (mm)</label><input type="range" /><span class="adj-val"></span></div>
+      <p class="adj-note">Only used in Band mode: keep pixels whose depth (relative to the
+        estimated surface) falls within ±width of the center.</p>
+
+      <div class="adj-group-title">Depth view range</div>
+      <div class="adj-row" data-key="near_m" data-min="0" data-max="2" data-step="0.01" data-default="0">
+        <label>Near (m)</label><input type="range" /><span class="adj-val"></span></div>
+      <div class="adj-row" data-key="far_m" data-min="0" data-max="2" data-step="0.01" data-default="0">
+        <label>Far (m)</label><input type="range" /><span class="adj-val"></span></div>
+      <p class="adj-note">Colormap range for the depth view only (does not affect detection).
+        Leave both at 0 for auto-range.</p>
+
+      <div class="adj-group-title">Crop</div>
+      <div class="adj-row">
+        <button id="btn-crop-reset" class="adj-btn">Reset Crop (full frame)</button>
+      </div>
+
+      <div class="adj-group-title">Target surface (3D)</div>
+      <p class="adj-note">Project the drawing onto a non-planar surface instead of the flat
+        workspace. Mesh your Rhino surface and export <b>STL/OBJ in millimetres</b>, then load
+        it here. The drawing is shone straight down onto the surface; the TCP stays
+        perpendicular to it. With no surface loaded, paths map to the flat workspace as before.</p>
+      <p class="adj-note"><b>Load more than one</b> to build a multi-part target: each file keeps
+        the position it was authored at, so surfaces exported from the same Rhino document
+        assemble themselves. They then behave as ONE surface — the drawing spreads across all
+        of them, and the pose sliders and <b>Register Corner → TCP</b> move them together.
+        Loading a file again replaces that part.</p>
+      <div class="adj-row">
+        <input type="file" id="surface-file" accept=".stl,.obj" class="hidden" multiple />
+        <button id="btn-surface-load" class="adj-btn">Load Surface (STL/OBJ)</button>
+      </div>
+      <div class="adj-row">
+        <button id="btn-surface-clear" class="adj-btn">Clear All Surfaces</button>
+      </div>
+      <ul id="surface-list"></ul>
+      <p class="adj-note" id="surface-status">No surface loaded.</p>
+
+      <div class="adj-row" data-skey="tx" data-min="-1.5" data-max="1.5" data-step="0.005" data-default="0.4">
+        <label>Surface X (m)</label><input type="range" /><span class="adj-val"></span></div>
+      <div class="adj-row" data-skey="ty" data-min="-1.5" data-max="1.5" data-step="0.005" data-default="0">
+        <label>Surface Y (m)</label><input type="range" /><span class="adj-val"></span></div>
+      <div class="adj-row" data-skey="tz" data-min="-1" data-max="1.5" data-step="0.005" data-default="0">
+        <label>Surface Z (m)</label><input type="range" /><span class="adj-val"></span></div>
+      <div class="adj-row" data-skey="rx" data-min="-180" data-max="180" data-step="1" data-default="0">
+        <label>Rot X (°)</label><input type="range" /><span class="adj-val"></span></div>
+      <div class="adj-row" data-skey="ry" data-min="-180" data-max="180" data-step="1" data-default="0">
+        <label>Rot Y (°)</label><input type="range" /><span class="adj-val"></span></div>
+      <div class="adj-row" data-skey="rz" data-min="-180" data-max="180" data-step="1" data-default="0">
+        <label>Rot Z (°)</label><input type="range" /><span class="adj-val"></span></div>
+      <p class="adj-note">Places the surface in the <b>robot base frame</b> — the 3D preview
+        shows it at true location and scale relative to the robot origin (axes marker).</p>
+
+      <div class="adj-row">
+        <button id="btn-register" class="adj-btn" title="Touch one corner of the physical surface with the tool tip to place the mesh exactly (optional)">Register Corner → TCP…</button>
+      </div>
+      <p class="adj-note">Optional touch-off: instead of guessing X/Y/Z with the sliders,
+        pick a corner of the mesh, hand-guide the tool tip onto that physical corner and
+        confirm — the surface snaps there. Rotation keeps the slider values.
+        Needs the robot connected; cancel keeps the current placement.</p>
+
+      <div class="adj-row" data-skey="offset_mm" data-min="-10" data-max="50" data-step="0.5" data-default="0">
+        <label>TCP offset (mm)</label><input type="range" /><span class="adj-val"></span></div>
+      <p class="adj-note">Lifts the TCP off the surface along the local normal: 0 = contact,
+        positive = hover above, negative = plunge in. Re-run <b>Generate Path</b> after
+        changing surface settings to update the path.</p>
+    </div>
+
+    <!-- Right column: Three.js path viewer -->
+    <div class="panel" id="panel-3d">
+      <div class="panel-label">Path Preview</div>
+      <button id="btn-popout" title="Open the path preview in its own window">⧉ Pop out</button>
+      <div id="path-toggle">
+        <button class="seg active" data-path="path">Path</button>
+        <button class="seg" data-path="order">Order</button>
+      </div>
+      <!-- Legend + execution settings, stacked bottom-left. The stack stops
+           short of the right edge so the Detection Parameters overlay (270 px,
+           top-right of <main>) can never cover a control. -->
+      <div id="preview-controls">
+        <div id="path-legend" class="hidden">
+          <span class="legend-dot start"></span>Start
+          <span class="legend-dot end"></span>End
+          <span class="legend-sep"></span>
+          <label for="order-size">Size</label>
+          <input type="range" id="order-size" min="0.05" max="3" step="0.05" value="1" />
+        </div>
+        <!-- Two rows on purpose: what SHAPES the drawn line on top, what the
+             Run/Save click uses underneath. .exec-break forces the split; the
+             groups keep each label glued to its input if a row wraps again on a
+             narrow window. -->
+        <div id="exec-bar" title="Spacing and Distance Threshold re-generate the path; Speed / Offset / Safety apply when Run is clicked">
+          <span class="exec-row-label">Path</span>
+          <span class="exec-group">
+            <label for="exec-spacing" title="Distance between robot waypoints along each stroke — re-generates the path">Spacing</label>
+            <input type="range" id="exec-spacing" min="10" max="100" step="1" value="10" />
+            <span id="exec-spacing-val">10 mm</span>
+          </span>
+          <span class="exec-group">
+            <label for="exec-join" title="Distance Threshold — when the endpoints of two different strokes are closer than this, they are connected and the strokes merge into one continuous toolpath. If another stroke crosses the line that would close the gap, the threshold doubles for that pair. Each endpoint joins only its nearest eligible neighbour. 0 = off; re-generates the path">Distance Threshold</label>
+            <input type="number" id="exec-join" value="0" step="1" min="0" max="200" /> mm
+          </span>
+          <span class="exec-group">
+            <label for="exec-blend" title="corner zone radius — how far before each waypoint the robot starts curving into the next segment. Rounded corners show live in the Path Preview; clamped per stroke to 45% of the shortest segment, so a radius larger than the spacing allows simply rounds as much as it can">Radius</label>
+            <input type="range" id="exec-blend" min="0" max="50" step="0.1" value="0.5" />
+            <span id="exec-blend-val">0.5 mm</span>
+          </span>
+
+          <span class="exec-break"></span>
+
+          <span class="exec-row-label">Run</span>
+          <span class="exec-group">
+            <label for="exec-speed">Speed</label>
+            <input type="range" id="exec-speed" min="1" max="100" step="1" value="5" />
+            <span id="exec-speed-val">5%</span>
+          </span>
+          <span class="exec-group">
+            <label for="exec-offset">Offset</label>
+            <input type="number" id="exec-offset" value="0" step="0.5" min="-20" max="200" /> mm
+          </span>
+          <span class="exec-group">
+            <label for="exec-safety">Safety</label>
+            <input type="number" id="exec-safety" value="50" step="5" min="5" max="300" /> mm
+          </span>
+          <span class="exec-group">
+            <label for="exec-max-length" title="Max Total Length — a ceiling on how far the tool travels WHILE DRAWING (the green line, measured on the projected surface at real scale, with Spacing, Radius and Distance Threshold all applied). Pen-up travels and retracts do not count. Over the limit the path is refused: Run and Save Path both decline, and in Participant Mode the drawing is marked Invalid. 0 = off">Max Total Length</label>
+            <input type="number" id="exec-max-length" value="0" step="50" min="0" max="100000" /> mm
+            <span id="exec-length-val" title="Drawn length of the current path">—</span>
+          </span>
+          <button id="btn-save-path" title="Save this toolpath (JSON + preview image) to a dated folder under paths/">💾 Save Path</button>
+        </div>
+      </div>
+      <canvas id="threejs-canvas"></canvas>
+    </div>
+
+    <!-- Drawing-target setup overlay (shown after connect until a surface is loaded) -->
+    <div id="ws-overlay" class="hidden">
+      <div id="ws-panel">
+        <div id="ws-panel-header">
+          <span>Drawing Target</span>
+          <span id="ws-instructions">Load the target surface the robot will draw on.</span>
+        </div>
+
+        <div id="ws-surface-skip">
+          <p class="ws-step-desc">
+            Mesh your Rhino surface and export it as <b>STL/OBJ in millimetres</b>, then
+            load it here. Place it relative to the robot with the Surface X/Y/Z and
+            rotation sliders, and check the Path Preview before running.
+          </p>
+          <button id="btn-ws-load-surface">Load 3D Surface (STL/OBJ)</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Load-preset popup: lists saved Detection Parameter files to choose from -->
+    <div id="preset-overlay" class="hidden">
+      <div id="preset-panel">
+        <div id="preset-panel-header">
+          <span>Load Detection Parameters</span>
+          <button id="btn-preset-close" class="hdr-btn" title="Close">✕</button>
+        </div>
+        <p class="adj-note">Pick a saved settings file to load it into the sliders and the Path Preview bar. Files saved before the bar was included restore the sliders only.</p>
+        <ul id="preset-list"></ul>
+      </div>
+    </div>
+
+    <!-- Corner→TCP registration popup: touch-off placement of the loaded surface -->
+    <div id="register-overlay" class="hidden">
+      <div id="register-panel">
+        <div id="register-panel-header">
+          <span>Register Corner → TCP</span>
+          <button id="btn-register-close" class="hdr-btn" title="Close without changing the placement">✕</button>
+        </div>
+        <p class="adj-note">Numbered markers now show the mesh's corners in the
+          <b>Path Preview</b> (vertices nearest the bounding-box corners).
+          <b>1.</b> Pick a corner: <b>click its marker in the preview</b> or a row
+          below — hovering either highlights the marker <b style="color:#66d9ff">cyan</b>;
+          the selected one turns <b style="color:#00e5a0">green</b>. The preview stays
+          visible and orbitable while this dialog is open.
+          <b>2.</b> <b>Arm touch-off</b>, then hold the lead-through button on the arm and move it by hand until
+          the <b>tool tip touches that physical corner</b>. <b>3.</b> <b>Confirm</b> — the
+          surface moves so the selected corner sits exactly at the TCP. Rotation keeps the
+          slider values (set those first). Closing without confirming keeps the current
+          placement.</p>
+        <ul id="register-list"></ul>
+        <div id="register-actions">
+          <button id="btn-register-freedrive" class="adj-btn">Arm touch-off</button>
+          <button id="btn-register-confirm" class="adj-btn" disabled>Confirm: corner = TCP</button>
+        </div>
+        <p class="adj-note" id="register-status">No corner selected.</p>
+      </div>
+    </div>
+
+  </main>
+
+  <footer>
+    <div class="footer-group">
+      <label for="ip-input">Robot IP</label>
+      <input id="ip-input" type="text" value="192.168.1.100" spellcheck="false" />
+      <button id="btn-connect">Connect</button>
+      <button id="btn-disconnect">Disconnect</button>
+    </div>
+
+    <div class="footer-separator"></div>
+
+    <div class="footer-group">
+      <button id="btn-simulate" title="Set a synthetic workspace to test the vision pipeline without a robot">Test Mode (no robot)</button>
+      <button id="btn-capture-image" disabled title="Freeze the current camera frame for cropping and adjustment">Capture Image</button>
+      <button id="btn-retake" class="hidden" title="Discard the still and go back to the live feed">Retake</button>
+      <button id="btn-generate" class="hidden" title="Crop + adjustments → tool path">Generate Path</button>
+      <button id="btn-run" disabled>Run</button>
+      <button id="btn-cancel" class="hidden btn-cancel">Cancel</button>
+    </div>
+
+    <div class="footer-separator"></div>
+
+    <div id="progress-bar-wrap" class="hidden">
+      <div id="progress-bar"></div>
+    </div>
+
+    <div class="stat">Phase <span id="val-phase">idle</span></div>
+    <div class="stat">Strokes <span id="val-strokes">0</span></div>
+
+    <div class="footer-separator"></div>
+
+    <div id="connection-msg">Not connected</div>
+  </footer>
+
+  <script src="/static/lib/three.min.js"></script>
+  <script src="/static/lib/OrbitControls.js"></script>
+  <script src="/static/viewer.js"></script>
+</body>
+</html>

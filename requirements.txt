@@ -1,0 +1,15 @@
+opencv-python>=4.8.0
+# ABB GoFa 10 link. compas_rrc talks to the RRC task on the controller through
+# a ROS bridge (run in Docker — see the README), not to the robot directly.
+# It pulls compas + compas_fab + roslibpy in with it; compas_fab's planning is
+# deliberately unused, it just arrives as a dependency.
+compas_rrc>=2.0.0
+aiohttp>=3.9.0
+numpy>=1.26.0
+pyrealsense2>=2.54.0
+scikit-image>=0.22.0
+trimesh>=4.0.0
+rtree>=1.0.0
+scipy>=1.11.0
+pytesseract>=0.3.10
+pyzmq>=25.0.0

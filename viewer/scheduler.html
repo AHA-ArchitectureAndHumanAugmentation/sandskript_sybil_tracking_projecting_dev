@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Scheduler</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #101114; color: #d8d8d8;
+    font-family: "Segoe UI", system-ui, sans-serif; font-size: 14px;
+    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 14px;
+    padding: 10px 16px; background: #17181c; border-bottom: 1px solid #2a2b30;
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  #count { font-size: 12px; color: #8a8f98; }
+  #base {
+    font-size: 11.5px; color: #6d727c; margin-left: auto;
+    font-family: Consolas, "Courier New", monospace;
+  }
+  .tools { display: flex; gap: 8px; padding: 8px 16px; background: #15161a;
+           border-bottom: 1px solid #2a2b30; align-items: center; }
+  button, .btn {
+    background: #23262c; color: #d8d8d8; border: 1px solid #3a3d44;
+    border-radius: 5px; padding: 6px 12px; cursor: pointer; font-size: 13px;
+    text-decoration: none; display: inline-block; line-height: 1.3;
+  }
+  button:hover, .btn:hover { background: #2c3038; }
+  #status { font-size: 12px; color: #8a8f98; margin-left: auto; }
+  #status.err { color: #ff7a6e; }
+
+  .sheet { flex: 1; overflow: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  thead th {
+    position: sticky; top: 0; z-index: 1;
+    background: #1c1e23; color: #9aa0aa; text-align: left; font-weight: 600;
+    font-size: 11.5px; letter-spacing: .05em; text-transform: uppercase;
+    padding: 9px 14px; border-bottom: 1px solid #33363d; white-space: nowrap;
+  }
+  tbody td {
+    padding: 9px 14px; border-bottom: 1px solid #212328; vertical-align: top;
+  }
+  tbody tr:nth-child(even) { background: #131418; }
+  tbody tr:hover { background: #1b2430; }
+  /* Numbers and timestamps read as data: fixed width, aligned. */
+  .col-index { width: 64px; text-align: right; color: #6d727c;
+               font-variant-numeric: tabular-nums; }
+  .col-when  { width: 200px; white-space: nowrap;
+               font-family: Consolas, "Courier New", monospace; }
+  .col-mask { width: 160px; }
+  /* The mask is white-on-black already, so it sits in the dark table without
+     a plate behind it; the border is what gives an all-black mask an edge. */
+  .col-mask img {
+    display: block; width: 140px; height: auto; border: 1px solid #2f333a;
+    border-radius: 3px; background: #000;
+  }
+  .col-mask a:hover img { border-color: #00e5a0; }
+  .col-mask .none { color: #4d5159; }
+  .name { font-family: Consolas, "Courier New", monospace; color: #d8d8d8; }
+  .files { font-size: 11px; color: #6d727c; margin-top: 3px; }
+  .files span { margin-right: 10px; white-space: nowrap; }
+  .files .missing { color: #7a5a2a; }
+  /* A time we had to infer rather than read off the folder name. */
+  .guess { color: #c8a34a; }
+  .guess::after { content: " ~"; }
+  .empty { padding: 40px 16px; color: #6d727c; text-align: center; }
+  footer {
+    padding: 7px 16px; background: #15161a; border-top: 1px solid #2a2b30;
+    font-size: 11px; color: #6d727c; line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Scheduler</h1>
+    <span id="count">reading…</span>
+    <span id="base"></span>
+  </header>
+  <div class="tools">
+    <button id="btn-refresh" title="Re-scan the paths folder now">Refresh</button>
+    <a class="btn" id="btn-csv" href="/schedule.csv" download>Download CSV</a>
+    <span id="status">connecting…</span>
+  </div>
+  <div class="sheet">
+    <table>
+      <thead>
+        <tr>
+          <th class="col-index">#</th>
+          <th>Path executed</th>
+          <th class="col-when">Date and time</th>
+          <th class="col-mask">Mask</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty" hidden>
+      No saved toolpaths yet. Save a path in Developer Mode, or let Participant
+      Mode run, and the row appears here by itself.
+    </div>
+  </div>
+  <footer>
+    Oldest first — row 1 is the earliest path saved. The time is when the bundle
+    was <b>written</b>: in Participant Mode that is the moment before the robot
+    ran; in Developer Mode it is when Save Path was pressed. A
+    <span class="guess">marked</span> time was inferred from the file date
+    rather than read from the folder name. The <b>Mask</b> is the groove image
+    that path was traced from — click it for full size; a dash means the bundle
+    predates mask saving. Read-only — nothing here is deleted or changed.
+  </footer>
+  <script src="/static/scheduler.js"></script>
+</body>
+</html>

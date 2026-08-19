@@ -1,0 +1,905 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+.hidden { display: none !important; }
+
+body {
+  font-family: "SF Mono", "Fira Code", monospace;
+  background: #0e0e0e;
+  color: #d0d0d0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── Header ─────────────────────────────────────────────────── */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  background: #161616;
+  border-bottom: 1px solid #2a2a2a;
+  flex-shrink: 0;
+  height: 44px;
+}
+
+header h1 { font-size: 14px; font-weight: 600; letter-spacing: 0.05em; color: #e8e8e8; }
+
+#header-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+}
+
+#status-dot {
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: #555;
+  transition: background 0.3s;
+}
+#status-dot.connected { background: #3dcc6e; box-shadow: 0 0 6px #3dcc6e88; }
+#status-dot.error     { background: #e05252; box-shadow: 0 0 6px #e0525288; }
+
+/* ── Main layout: CSS grid ───────────────────────────────────── */
+main {
+  display: grid;
+  grid-template-columns: var(--cam-w, 33%) 6px 1fr;
+  grid-template-rows: 1fr 1fr;
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+#camera-column {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Draggable divider between the 4-view block and the path preview. */
+#col-splitter {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  background: #2a2a2a;
+  cursor: col-resize;
+  z-index: 20;
+}
+#col-splitter:hover,
+#col-splitter.dragging { background: #3a6ea5; }
+
+/* ── Left column: 2×2 grid of viewports (Depth|RGB / Skeleton|Mask) ───── */
+.cam-row {
+  flex: 1;
+  display: flex;
+  position: relative;
+  overflow: hidden;
+  min-height: 0;
+}
+#row-depth { border-bottom: 1px solid #2a2a2a; }
+.cam-row.swapped { flex-direction: row-reverse; }
+
+.vp {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+}
+.vp + .vp { border-left: 1px solid #2a2a2a; }
+
+/* Viewport images sized to the image (contain) so the crop overlay aligns to
+   the actual pixels rather than the letterboxed panel. */
+.cam-live, .cam-still {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  display: block;
+  background: #111;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+.cam-live.hidden, .cam-still.hidden { display: none; }
+
+/* Swap the two viewports left/right — small button at the row's top-centre. */
+.swap-btn {
+  position: absolute;
+  top: 50%; left: 50%;   /* vertically centred — clear of viewport labels and popup buttons */
+  transform: translate(-50%, -50%);
+  z-index: 11;
+  padding: 2px 8px;
+  font-size: 12px;
+  line-height: 1;
+  background: #161616cc;
+  border: 1px solid #3a3a3a;
+  color: #bbb;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.swap-btn:hover { background: #2a2a2a; color: #fff; }
+
+/* Open the projector / calibration windows from the Mask viewport, and the
+   depth-numbers reference window from the Depth viewport. */
+#btn-project,
+#btn-project-cal,
+#btn-depth-numbers,
+#btn-rotate-view {
+  position: absolute;
+  top: 6px;
+  z-index: 11;
+  padding: 2px 8px;
+  font-size: 11px;
+  line-height: 1.4;
+  background: #161616cc;
+  border: 1px solid #3a3a3a;
+  color: #bbb;
+  border-radius: 4px;
+  cursor: pointer;
+}
+#btn-project { right: 6px; }
+#btn-project-cal { right: 84px; }
+#btn-depth-numbers { right: 6px; }
+/* Stacked UNDER the Participant Mode button rather than beside it: that button's
+   width is text, and a right-offset guessed from it would break the moment the
+   label changed. */
+#btn-rotate-view { right: 6px; top: 32px; }
+#btn-project:hover, #btn-project-cal:hover, #btn-depth-numbers:hover,
+#btn-rotate-view:hover { background: #2a2a2a; color: #fff; }
+#btn-project.active, #btn-project-cal.active, #btn-depth-numbers.active,
+#btn-rotate-view.active { border-color: #00e5a0; color: #00e5a0; }
+#btn-rotate-view:disabled { opacity: 0.45; cursor: default; }
+
+#panel-3d {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  position: relative;
+  overflow: hidden;
+}
+
+.panel-label {
+  position: absolute;
+  top: 10px; left: 12px;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #555;
+  pointer-events: none;
+  z-index: 10;
+}
+
+/* ── Crop overlay (lives on the Depth viewport) ──────────────── */
+#crop-box {
+  position: absolute;
+  border: 1px solid #5599ff;
+  box-shadow: 0 0 0 9999px rgba(8, 10, 14, 0.55);
+  cursor: move;
+}
+#crop-box.hidden { display: none; }
+
+.crop-handle {
+  position: absolute;
+  width: 12px; height: 12px;
+  background: #5599ff;
+  border: 1px solid #0e0e0e;
+  border-radius: 2px;
+}
+.crop-handle[data-h="nw"] { top: -6px;  left: -6px;  cursor: nwse-resize; }
+.crop-handle[data-h="ne"] { top: -6px;  right: -6px; cursor: nesw-resize; }
+.crop-handle[data-h="sw"] { bottom: -6px; left: -6px; cursor: nesw-resize; }
+.crop-handle[data-h="se"] { bottom: -6px; right: -6px; cursor: nwse-resize; }
+
+/* Pop the path preview out into its own window. Sits bottom-left next to the
+   Path/Order toggle — the right side belongs to the Detect Grooves overlay
+   (z-index 60, near full height), which would cover anything placed there. */
+#btn-popout {
+  position: absolute;
+  bottom: 8px; left: 132px;
+  z-index: 10;
+  padding: 3px 9px;
+  font-size: 11px;
+  background: #161616cc;
+  border: 1px solid #3a3a3a;
+  color: #bbb;
+  border-radius: 4px;
+  cursor: pointer;
+}
+#btn-popout:hover { background: #2a2a2a; color: #fff; }
+
+/* Path/Order sits bottom-left so the Detect Grooves panel (top-right overlay)
+   never covers it. */
+#path-toggle {
+  position: absolute;
+  bottom: 8px; left: 8px;
+  z-index: 10;
+  display: flex;
+  gap: 0;
+}
+#path-toggle.hidden { display: none; }
+
+/* Execution settings bar (always visible) + path-order legend above it, as one
+   bottom-left stack. */
+#preview-controls {
+  position: absolute;
+  left: 8px; right: 8px; bottom: 38px;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+/* While the Detection Parameters overlay is open it covers the right 270px of
+   the preview at a higher z-index, so the stack pulls in to stay clear —
+   otherwise its lower half swallows the bar's right-hand controls. The rows
+   wrap instead of disappearing. #edit-panel precedes #panel-3d in <main>, and
+   a popped-out preview is in another document, where this cannot match — which
+   is exactly right, since the overlay stays behind in the main window. */
+#edit-panel:not(.hidden) ~ #panel-3d #preview-controls { right: 290px; }
+#exec-bar,
+#path-legend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  row-gap: 5px;
+  max-width: 100%;
+  padding: 4px 8px;
+  background: #161616dd;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  font-size: 10px;
+  color: #bbb;
+}
+#path-legend.hidden { display: none; }
+
+/* One control = label + input (+ unit), kept together when a row wraps. */
+.exec-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+#exec-bar { gap: 7px; padding: 4px 6px; }
+/* Forces the break between the two rows regardless of window width. */
+.exec-break { flex-basis: 100%; height: 0; margin: 0; }
+.exec-row-label {
+  color: #666;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  min-width: 26px;
+}
+
+#exec-spacing, #exec-blend { width: 72px; }
+#exec-speed { width: 72px; }
+#exec-speed-val { min-width: 30px; color: #ddd; }
+/* Drawn length readout beside the Max Total Length box. Turns red when the
+   path is over the limit — the same answer Run and Save will give. */
+#exec-length-val { min-width: 48px; color: #ddd; font-variant-numeric: tabular-nums; }
+#exec-length-val.over { color: #ff6b5e; font-weight: 600; }
+#exec-max-length { width: 62px; }
+#exec-bar input[type="number"] {
+  width: 52px;
+  background: #222;
+  border: 1px solid #333;
+  color: #d0d0d0;
+  padding: 2px 4px;
+  font-family: inherit;
+  font-size: 10px;
+  border-radius: 3px;
+  outline: none;
+}
+#btn-save-path {
+  padding: 2px 8px;
+  font-size: 11px;
+  background: #1a2a1e;
+  border: 1px solid #3dcc6e55;
+  color: #7ddca0;
+  border-radius: 3px;
+  cursor: pointer;
+}
+#btn-save-path:hover { background: #24402d; color: #aef0c4; }
+.legend-dot {
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.legend-dot.start { background: #00e5a0; }
+.legend-dot.end   { background: #ff4444; }
+.legend-sep { width: 1px; height: 14px; background: #333; margin: 0 2px; }
+#order-size { width: 78px; }
+.seg {
+  padding: 3px 9px;
+  font-size: 10px;
+  border-radius: 0;
+  border-color: #444;
+}
+.seg:first-child { border-radius: 4px 0 0 4px; }
+.seg:last-child  { border-radius: 0 4px 4px 0; border-left: none; }
+.seg.active { background: #1a2a3a; color: #5599ff; border-color: #5599ff66; }
+
+/* ── Image adjustment panel ──────────────────────────────────── */
+#edit-panel {
+  position: absolute;
+  top: 12px; right: 12px;
+  width: 270px;
+  max-height: calc(100% - 24px);
+  overflow-y: auto;
+  background: #161616ee;
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  padding: 12px 14px;
+  z-index: 60;
+  backdrop-filter: blur(3px);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+#edit-panel.hidden { display: none; }
+
+#edit-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;          /* title + 3 buttons can exceed 270px → wrap */
+  row-gap: 6px;
+}
+#edit-panel-header span {
+  font-size: 12px;
+  font-weight: 600;
+  color: #e8e8e8;
+  letter-spacing: 0.04em;
+}
+#edit-panel-header .hdr-btns { display: flex; gap: 4px; }
+.hdr-btn { padding: 2px 9px; font-size: 10px; }
+
+#edit-hint {
+  font-size: 10px;
+  color: #666;
+  line-height: 1.5;
+  margin-bottom: 2px;
+}
+
+.adj-note {
+  font-size: 10px;
+  color: #6f7783;
+  line-height: 1.5;
+  margin: 1px 0 4px;
+}
+.adj-note b {
+  color: #9aa4b0;
+  font-weight: 600;
+}
+
+.adj-group-title {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #5599ff;
+  margin-top: 8px;
+  border-bottom: 1px solid #222;
+  padding-bottom: 3px;
+}
+
+.adj-row {
+  display: grid;
+  grid-template-columns: 70px 1fr 34px;
+  align-items: center;
+  gap: 8px;
+}
+.adj-row > label { font-size: 11px; color: #999; }
+.adj-row input[type="range"] {
+  width: 100%;
+  accent-color: #5599ff;
+  height: 14px;
+}
+.adj-val {
+  font-size: 10px;
+  color: #aaa;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.adj-row.adj-num input[type="number"] {
+  background: #14161a;
+  color: #ddd;
+  border: 1px solid #333;
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-size: 11px;
+}
+
+/* Near-object filter box — lives on the Mask viewport, always visible. */
+#mask-ignore {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  z-index: 11;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  background: #161616cc;
+  border: 1px solid #3a3a3a;
+  border-radius: 4px;
+  padding: 3px 7px;
+}
+#mask-ignore > label {
+  font-size: 10px;
+  color: #bbb;
+  white-space: nowrap;
+  cursor: pointer;
+}
+#mask-ignore input[type="number"] { width: 62px; }
+.adj-row.adj-check {
+  display: flex;
+  margin-top: 2px;
+}
+.adj-row.adj-check label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #bbb;
+  cursor: pointer;
+}
+.adj-btn { width: 100%; font-size: 11px; padding: 4px; }
+.adj-btn.active { border-color: #00e5a0; color: #00e5a0; }
+
+#detect-mode {
+  flex: 1;
+  background: #222;
+  border: 1px solid #333;
+  color: #d0d0d0;
+  padding: 4px 6px;
+  font-family: inherit;
+  font-size: 11px;
+  border-radius: 3px;
+  outline: none;
+  cursor: pointer;
+}
+
+#btn-capture-image { border-color: #5599ff44; }
+#btn-capture-image:not(:disabled):hover { background: #1a2a3a; color: #5599ff; }
+#btn-generate { border-color: #f0a04055; }
+#btn-generate:not(:disabled):hover { background: #3a2e1a; color: #f0a040; }
+#btn-retake:hover { background: #363636; color: #fff; }
+
+/* Three.js canvas */
+#threejs-canvas {
+  width: 100% !important;
+  height: 100% !important;
+  display: block;
+}
+
+/* ── Bottom bar ──────────────────────────────────────────────── */
+footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  background: #161616;
+  border-top: 1px solid #2a2a2a;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.footer-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.footer-separator {
+  width: 1px;
+  height: 20px;
+  background: #2a2a2a;
+}
+
+label {
+  font-size: 11px;
+  color: #888;
+}
+
+#ip-input {
+  background: #222;
+  border: 1px solid #333;
+  color: #d0d0d0;
+  padding: 4px 8px;
+  font-family: inherit;
+  font-size: 12px;
+  border-radius: 3px;
+  width: 148px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+#ip-input:focus { border-color: #555; }
+
+button {
+  background: #2a2a2a;
+  border: 1px solid #3a3a3a;
+  color: #c8c8c8;
+  padding: 4px 12px;
+  font-family: inherit;
+  font-size: 12px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  white-space: nowrap;
+}
+button:hover  { background: #363636; color: #fff; }
+button:active { background: #444; }
+button:disabled { opacity: 0.3; cursor: not-allowed; }
+
+#btn-connect    { border-color: #3dcc6e44; }
+#btn-connect:hover { background: #1e3a2a; color: #3dcc6e; }
+#btn-disconnect { border-color: #e0525244; }
+#btn-disconnect:hover { background: #3a1e1e; color: #e05252; }
+
+#btn-run { border-color: #3dcc6e44; }
+#btn-run:not(:disabled):hover { background: #1e3a2a; color: #3dcc6e; }
+
+.btn-cancel { border-color: #e0525244; }
+.btn-cancel:hover { background: #3a1e1e; color: #e05252; }
+
+/* ── Progress bar ────────────────────────────────────────────── */
+#progress-bar-wrap {
+  width: 120px;
+  height: 6px;
+  background: #2a2a2a;
+  border-radius: 3px;
+  overflow: hidden;
+}
+#progress-bar-wrap.hidden { display: none; }
+
+#progress-bar {
+  height: 100%;
+  width: 0%;
+  background: #3dcc6e;
+  border-radius: 3px;
+  transition: width 0.2s ease;
+}
+
+/* ── Stats ───────────────────────────────────────────────────── */
+.stat {
+  font-size: 11px;
+  color: #666;
+  white-space: nowrap;
+}
+.stat span { color: #aaa; }
+
+#connection-msg {
+  font-size: 11px;
+  color: #777;
+  font-style: italic;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Workspace setup overlay ─────────────────────────────────── */
+#ws-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(10, 10, 10, 0.82);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+#ws-overlay.hidden { display: none; }
+
+/* ── Load-preset + Corner-registration popups (shared styling) ── */
+#preset-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(10, 10, 10, 0.82);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 110;
+}
+/* The register dialog must NOT hide the Path Preview: the corner markers live
+   there. No backdrop, docked over the camera column (left), and the rest of
+   the page stays fully interactive (orbit the preview, click markers). */
+#register-overlay {
+  position: absolute;
+  inset: 0;
+  background: transparent;
+  pointer-events: none;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: 12px 0 0 12px;
+  z-index: 110;
+}
+#register-panel {
+  pointer-events: auto;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.75);
+  border-color: #3a3a3a;
+}
+#preset-overlay.hidden, #register-overlay.hidden { display: none; }
+
+#preset-panel,
+#register-panel {
+  background: #181818;
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  width: 420px;
+  max-width: calc(100vw - 48px);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+}
+#preset-panel-header,
+#register-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+#preset-panel-header span,
+#register-panel-header span {
+  font-size: 13px;
+  font-weight: 600;
+  color: #e8e8e8;
+  letter-spacing: 0.04em;
+}
+
+#preset-list, #register-list, #surface-list { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+/* Loaded-surface list: one row per part, ✕ removes just that one. */
+#surface-list { margin: 6px 0 0; padding: 0; }
+#surface-list:empty { display: none; }
+#surface-list .preset-item { cursor: default; }
+.surface-del {
+  background: none;
+  border: none;
+  color: #888;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+.surface-del:hover { color: #ff6b6b; }
+.preset-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 10px;
+  background: #202020;
+  border: 1px solid #2f2f2f;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.preset-item:hover { background: #2a2a2a; border-color: #5599ff88; }
+.preset-item.sel { border-color: #00e5a0; background: #12281f; }
+.preset-item.sel .preset-name { color: #00e5a0; }
+/* Corner hovered in the 3D preview → its row lights up in the register list. */
+.preset-item.hov { border-color: #66d9ff; background: #14242e; }
+.preset-name { font-size: 11px; color: #d0d0d0; }
+.preset-time { font-size: 10px; color: #777; font-variant-numeric: tabular-nums; }
+.preset-empty { font-size: 11px; color: #777; padding: 6px 2px; }
+
+#register-actions { display: flex; gap: 6px; }
+#btn-register-freedrive.active { border-color: #ffb020; color: #ffb020; }
+#register-status { margin: 0; }
+
+#ws-panel {
+  background: #181818;
+  border: 1px solid #2a2a2a;
+  border-radius: 6px;
+  width: 520px;
+  max-width: calc(100vw - 48px);
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
+}
+
+#ws-panel-header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+#ws-panel-header span:first-child {
+  font-size: 13px;
+  font-weight: 600;
+  color: #e8e8e8;
+  letter-spacing: 0.04em;
+}
+#ws-instructions {
+  font-size: 11px;
+  color: #666;
+}
+
+#ws-loaded-banner {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  background: #1a2a1e;
+  border: 1px solid #3dcc6e33;
+  border-radius: 4px;
+  padding: 10px 14px;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.ws-loaded-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+#ws-loaded-banner.hidden { display: none; }
+
+#btn-use-workspace { border-color: #3dcc6e44; }
+#btn-use-workspace:hover { background: #1e3a2a; color: #3dcc6e; }
+
+/* Skip-calibration footer: load a 3D target surface instead of P0/Px/Py. */
+#ws-surface-skip {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid #2a2a2a;
+  font-size: 11px;
+  color: #888;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+#btn-ws-load-surface { border-color: #f0a04055; }
+#btn-ws-load-surface:hover { background: #3a2e1a; color: #f0a040; }
+
+#ws-loaded-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+#ws-loaded-size {
+  font-size: 13px;
+  color: #3dcc6e;
+  font-weight: 600;
+}
+#ws-loaded-origin {
+  font-size: 11px;
+  color: #666;
+}
+
+#ws-steps.hidden { display: none; }
+
+.ws-step {
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: opacity 0.2s;
+}
+.ws-step.disabled {
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+.ws-step-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.ws-step-num {
+  width: 22px; height: 22px;
+  border-radius: 50%;
+  background: #2a2a2a;
+  color: #888;
+  font-size: 11px;
+  font-weight: 600;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.ws-step-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #ccc;
+}
+.ws-step-desc {
+  font-size: 11px;
+  color: #666;
+  line-height: 1.5;
+}
+.ws-step-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+#tcp-live {
+  font-size: 11px;
+  color: #555;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.tcp-axis {
+  color: #888;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+#tcp-x, #tcp-y, #tcp-z { color: #aaa; min-width: 54px; }
+
+.ws-point-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.ws-point-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  color: #888;
+  min-width: 190px;
+}
+.dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.dot-p0 { background: #ff3333; }
+.dot-px { background: #3dcc6e; }
+.dot-py { background: #4499ff; }
+
+.ws-point-coords {
+  font-size: 11px;
+  color: #555;
+  flex: 1;
+  font-style: italic;
+}
+.ws-point-coords.recorded {
+  color: #aaa;
+  font-style: normal;
+}
+
+.btn-record {
+  padding: 3px 10px;
+  font-size: 11px;
+  border-color: #5599ff44;
+}
+.btn-record:hover { background: #1a2a3a; color: #5599ff; }
+
+.status-badge {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: #f0a040;
+  border: 1px solid #f0a04044;
+  border-radius: 3px;
+  padding: 2px 7px;
+  animation: pulse-badge 1.5s ease-in-out infinite;
+}
+.status-badge.hidden { display: none; }
+
+@keyframes pulse-badge {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.45; }
+}
+
+#ws-preview-size {
+  font-size: 12px;
+  color: #888;
+  min-height: 16px;
+}
+
+#btn-confirm-ws {
+  border-color: #3dcc6e44;
+  padding: 6px 20px;
+}
+#btn-confirm-ws:not(:disabled):hover { background: #1e3a2a; color: #3dcc6e; }
+#btn-confirm-ws:disabled { opacity: 0.3; cursor: not-allowed; }

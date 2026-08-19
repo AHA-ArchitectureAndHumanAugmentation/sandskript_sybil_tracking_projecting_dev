@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+workspace.json
+settings.json
+paths/
+presets/
+
+# Tile meshes are rig geometry, not source -- still ignored. The README is
+# kept, though, so a fresh clone arrives with the folder present and an
+# explanation of which files have to be put back into it (a clone used to
+# get no folder at all, and tile switching then failed silently).
+surfaces/*
+!surfaces/README.md
+.DS_Store
+.coverage
+htmlcov/
+
+# Local virtualenv backup and stray debug logs
+.venv-py313-bak/
+*.log
+
+# Claude Code PreCompact hook transcript backups
+.claude/transcript-backups/
+.claude/settings.local.json
+stitch_calibration.json

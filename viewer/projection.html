@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Sand Projection</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #000; overflow: hidden;
+               font-family: "SF Mono", "Fira Code", monospace; cursor: none; }
+  body.editing { cursor: default; }
+
+  /* The warped mask. transform (matrix3d) is set from the 4 corners. */
+  #warp {
+    position: absolute; top: 0; left: 0;
+    transform-origin: 0 0;
+    will-change: transform;
+  }
+  #warp img { display: block; width: 100%; height: 100%;
+              image-rendering: auto; user-select: none; -webkit-user-drag: none; }
+
+  /* Corner handles (calibration mode) — high contrast: white ring + green core */
+  .handle {
+    position: absolute; width: 34px; height: 34px; margin: -17px 0 0 -17px;
+    border: 3px solid #00e5a0; border-radius: 50%;
+    outline: 2px solid #ffffff;
+    background: rgba(0, 229, 160, 0.25); color: #ffffff;
+    font-size: 14px; font-weight: bold; line-height: 28px; text-align: center;
+    cursor: grab; z-index: 10; user-select: none;
+    touch-action: none;   /* required for pointer-capture drags (touch/pen too) */
+    box-shadow: 0 0 10px rgba(0, 229, 160, 0.8);
+  }
+  .handle.sel { border-color: #ffcc00; background: rgba(255,204,0,0.3);
+                box-shadow: 0 0 12px rgba(255,204,0,0.9); }
+  body:not(.editing) .handle { display: none; }
+
+  #cal-badge {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    color: #ffcc00; background: rgba(20,16,4,0.9); border: 1px solid #ffcc0055;
+    padding: 5px 12px; border-radius: 6px; font-size: 12px; z-index: 20;
+    display: none;
+  }
+  body.cal #cal-badge { display: block; }
+
+  /* The projector's physical frame (0..1 area), visible while zoomed/panned. */
+  #proj-bounds {
+    position: absolute;
+    border: 2px dashed #3399ff;
+    color: #3399ff; font-size: 11px;
+    pointer-events: none; z-index: 5;
+    display: none;
+  }
+  #proj-bounds::after { content: "projector frame"; position: absolute; top: 2px; left: 6px; }
+  body.cal #proj-bounds { display: block; }
+
+  #zoom-hud {
+    position: absolute; right: 12px; bottom: 12px;
+    color: #9ad; background: rgba(10,14,20,0.85); border: 1px solid #345;
+    padding: 4px 10px; border-radius: 6px; font-size: 11px; z-index: 20;
+    display: none;
+  }
+  body.cal #zoom-hud { display: block; }
+
+  #hint {
+    position: absolute; left: 50%; bottom: 24px; transform: translateX(-50%);
+    color: #9ad; background: rgba(10,14,20,0.85); border: 1px solid #345;
+    padding: 8px 14px; border-radius: 6px; font-size: 12px; z-index: 20;
+    white-space: nowrap;
+  }
+  body:not(.editing) #hint { display: none; }
+
+  #blank { position: absolute; inset: 0; background: #000; z-index: 50; display: none; }
+  #blank.on { display: block; }
+
+  /* Sound status. Above #blank on purpose: the projector blanks during
+     Capture, and the audio still has to be unlockable while it does. */
+  #sound-badge {
+    position: absolute; top: 12px; right: 12px; z-index: 60;
+    color: #ffcc00; background: rgba(20,16,4,0.9); border: 1px solid #ffcc0055;
+    padding: 8px 14px; border-radius: 6px; font-size: 14px;
+    display: none; pointer-events: none;
+  }
+  #sound-badge.show { display: block; }
+</style>
+</head>
+<body class="editing">
+
+  <div id="warp"><img id="mask" src="/depth/mask/full" alt="" /></div>
+
+  <div class="handle" data-i="0">1</div>
+  <div class="handle" data-i="1">2</div>
+  <div class="handle" data-i="2">3</div>
+  <div class="handle" data-i="3">4</div>
+
+  <div id="proj-bounds"></div>
+  <div id="cal-badge">CALIBRATION — the projector window mirrors these handles live</div>
+  <div id="zoom-hud">zoom 100%</div>
+
+  <div id="hint">
+    Drag corners 1–4 while watching the sand ·
+    arrow keys = 1&nbsp;px (Shift = 10) ·
+    <b>wheel</b> zoom · <b>drag background</b> pan · <b>0</b> reset view ·
+    <b>C</b> handles · <b>B</b> blank · <b>M</b> mute
+  </div>
+
+  <div id="blank"></div>
+  <div id="sound-badge"></div>
+
+<script>
+/* ── Corner-pin homography → CSS matrix3d ─────────────────────────────────
+   Maps the mask image's own rect (0,0)-(w,h) onto 4 arbitrary screen points.
+   Corner order: 0=TL, 1=TR, 2=BL, 3=BR (of the SOURCE image).              */
+function adj(m) {
+  return [m[4]*m[8]-m[5]*m[7], m[2]*m[7]-m[1]*m[8], m[1]*m[5]-m[2]*m[4],
+          m[5]*m[6]-m[3]*m[8], m[0]*m[8]-m[2]*m[6], m[2]*m[3]-m[0]*m[5],
+          m[3]*m[7]-m[4]*m[6], m[1]*m[6]-m[0]*m[7], m[0]*m[4]-m[1]*m[3]];
+}
+function mulMM(a, b) {
+  const c = [];
+  for (let i = 0; i < 3; i++)
+    for (let j = 0; j < 3; j++) {
+      let s = 0;
+      for (let k = 0; k < 3; k++) s += a[3*i+k] * b[3*k+j];
+      c[3*i+j] = s;
+    }
+  return c;
+}
+function mulMV(m, v) {
+  return [m[0]*v[0]+m[1]*v[1]+m[2]*v[2],
+          m[3]*v[0]+m[4]*v[1]+m[5]*v[2],
+          m[6]*v[0]+m[7]*v[1]+m[8]*v[2]];
+}
+function basisToPoints(p1, p2, p3, p4) {
+  const m = [p1[0], p2[0], p3[0],  p1[1], p2[1], p3[1],  1, 1, 1];
+  const v = mulMV(adj(m), [p4[0], p4[1], 1]);
+  return mulMM(m, [v[0],0,0, 0,v[1],0, 0,0,v[2]]);
+}
+function proj2d(srcPts, dstPts) {
+  const s = basisToPoints(...srcPts);
+  const d = basisToPoints(...dstPts);
+  return mulMM(d, adj(s));
+}
+
+/* ── State ────────────────────────────────────────────────────────────── */
+/* Two roles share this page:
+     /projection      → OUTPUT (on the projector): handles hidden by default,
+                        obeys blank commands, mirrors corner changes live.
+     /projection?cal  → CALIBRATION (on the laptop): handles always shown,
+                        drags/nudges are broadcast so the output follows.   */
+const IS_CAL = new URLSearchParams(location.search).has("cal");
+const SRC_W = 640, SRC_H = 480;          // full-frame mask resolution
+const warp = document.getElementById("warp");
+const maskImg = document.getElementById("mask");
+const handles = [...document.querySelectorAll(".handle")];
+function defaultCorners() {
+  return [[0.2, 0.2], [0.8, 0.2], [0.2, 0.8], [0.8, 0.8]];  // TL TR BL BR
+}
+// NEVER null — dragging must work even if the saved-corners fetch stalls
+// (e.g. the browser's per-host connection pool is exhausted by MJPEG streams).
+let corners = defaultCorners();
+let selected = -1;
+let dragging = false;                     // suppress applying our own WS echo
+
+/* Calibration-window VIEW transform (display only). Zooming out lets handles
+   be placed BEYOND the projector frame — corners stay in projector-normalized
+   coordinates, so the output window is completely unaffected by the view. */
+let view = { scale: 1, ox: 0, oy: 0 };
+function normToScreen(nx, ny) {
+  return [nx * window.innerWidth * view.scale + view.ox,
+          ny * window.innerHeight * view.scale + view.oy];
+}
+function screenToNorm(px, py) {
+  return [(px - view.ox) / (window.innerWidth * view.scale),
+          (py - view.oy) / (window.innerHeight * view.scale)];
+}
+
+document.title = IS_CAL ? "Projection Calibration" : "Sand Projection";
+document.body.classList.toggle("editing", IS_CAL);   // output starts clean
+document.body.classList.toggle("cal", IS_CAL);
+
+function applyWarp() {
+  warp.style.width = SRC_W + "px";
+  warp.style.height = SRC_H + "px";
+  const dst = corners.map(c => normToScreen(c[0], c[1]));
+  // src corners in the same order: TL TR BL BR
+  const t = proj2d([[0,0], [SRC_W,0], [0,SRC_H], [SRC_W,SRC_H]], dst);
+  for (let i = 0; i < 9; i++) t[i] /= t[8];
+  warp.style.transform = "matrix3d(" +
+    [t[0],t[3],0,t[6], t[1],t[4],0,t[7], 0,0,1,0, t[2],t[5],0,t[8]].join(",") + ")";
+  handles.forEach((h, i) => {
+    h.style.left = dst[i][0] + "px";
+    h.style.top  = dst[i][1] + "px";
+  });
+
+  // Projector frame outline + zoom readout (calibration view only).
+  const pb = document.getElementById("proj-bounds");
+  const [bx, by] = normToScreen(0, 0);
+  pb.style.left = bx + "px";
+  pb.style.top = by + "px";
+  pb.style.width = (window.innerWidth * view.scale) + "px";
+  pb.style.height = (window.innerHeight * view.scale) + "px";
+  document.getElementById("zoom-hud").textContent =
+    "zoom " + Math.round(view.scale * 100) + "%  ·  0 = reset";
+}
+
+let saveTimer = null;
+function saveCorners() {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    fetch("/projection/corners", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ corners }),
+    }).catch(() => {});
+  }, 300);
+}
+
+/* Live-mirror corner changes to the other projection windows (throttled). */
+let sendTimer = null;
+function broadcastCorners() {
+  if (sendTimer) return;
+  sendTimer = setTimeout(() => {
+    sendTimer = null;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "projection_corners", corners }));
+    }
+  }, 50);
+}
+
+/* ── Handle dragging ──────────────────────────────────────────────────── */
+/* Pointer events + capture: the handle keeps receiving moves even when the
+   cursor leaves the (small) window, and touch/pen input works too. */
+handles.forEach((h, i) => {
+  h.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    selected = i;
+    handles.forEach((x, j) => x.classList.toggle("sel", j === i));
+    dragging = true;
+    h.setPointerCapture(e.pointerId);
+    const move = (ev) => {
+      corners[i] = screenToNorm(ev.clientX, ev.clientY);
+      applyWarp();
+      broadcastCorners();
+    };
+    const up = () => {
+      h.removeEventListener("pointermove", move);
+      h.removeEventListener("pointerup", up);
+      h.removeEventListener("pointercancel", up);
+      dragging = false;
+      broadcastCorners();
+      saveCorners();
+    };
+    h.addEventListener("pointermove", move);
+    h.addEventListener("pointerup", up);
+    h.addEventListener("pointercancel", up);
+  });
+});
+
+window.addEventListener("keydown", (e) => {
+  if (e.key === "c" || e.key === "C") {
+    document.body.classList.toggle("editing");
+    return;
+  }
+  if (e.key === "b" || e.key === "B") {
+    document.getElementById("blank").classList.toggle("on");
+    return;
+  }
+  if (e.key === "m" || e.key === "M") {
+    muted = !muted;
+    if (audioGain) audioGain.gain.value = muted ? 0 : 1;
+    updateSoundBadge();
+    return;
+  }
+  if (e.key === "0" && IS_CAL) {                 // reset the calibration view
+    view = { scale: 1, ox: 0, oy: 0 };
+    applyWarp();
+    return;
+  }
+  if (selected < 0 || !document.body.classList.contains("editing")) return;
+  const step = (e.shiftKey ? 10 : 1);
+  const dx = step / (window.innerWidth * view.scale);
+  const dy = step / (window.innerHeight * view.scale);
+  if (e.key === "ArrowLeft")  corners[selected][0] -= dx;
+  else if (e.key === "ArrowRight") corners[selected][0] += dx;
+  else if (e.key === "ArrowUp")    corners[selected][1] -= dy;
+  else if (e.key === "ArrowDown")  corners[selected][1] += dy;
+  else return;
+  e.preventDefault();
+  applyWarp();
+  broadcastCorners();
+  saveCorners();
+});
+
+window.addEventListener("resize", applyWarp);
+
+/* ── Calibration view: wheel zoom (about the cursor) + background pan ──── */
+if (IS_CAL) {
+  window.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const f = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+    const ns = Math.min(5, Math.max(0.15, view.scale * f));
+    const k = ns / view.scale;
+    // Keep the point under the cursor fixed while zooming.
+    view.ox = e.clientX - k * (e.clientX - view.ox);
+    view.oy = e.clientY - k * (e.clientY - view.oy);
+    view.scale = ns;
+    applyWarp();
+  }, { passive: false });
+
+  window.addEventListener("pointerdown", (e) => {
+    // Pan on background drags only — handles and UI chrome keep their jobs.
+    if (e.target.closest(".handle") || e.target.closest("#hint")
+        || e.target.closest("#cal-badge") || e.target.closest("#zoom-hud")) return;
+    e.preventDefault();
+    const sx = e.clientX - view.ox, sy = e.clientY - view.oy;
+    const move = (ev) => {
+      view.ox = ev.clientX - sx;
+      view.oy = ev.clientY - sy;
+      applyWarp();
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  });
+}
+
+/* ── Participant-Mode sound cues ───────────────────────────────────────────
+   The projection window is the experience's speaker: whatever audio device
+   Windows is sending to the projector is where these come out, so no
+   projection window open means no sound — deliberately.
+
+   ONLY the output window plays. The ?cal window is a setup tool on the
+   laptop, and two windows playing the same buffer a few ms apart sounds
+   like a broken echo.
+
+   The cue list is not written down here: the server ships config.SOUND_CUES
+   in `init` as { path, cues: { <participant status>: <file stem> } }, and a
+   cue fires when its status is ENTERED (once — statuses are sticky enough
+   that a 20 Hz state stream never retriggers one).                         */
+const SOUND_ON = !IS_CAL;
+const soundBadge = document.getElementById("sound-badge");
+let audioCtx = null, audioGain = null;
+let cueMap = {}, cueUrl = "/sounds", cueBuffers = {};
+let muted = false, lastStatus = null;
+
+function initAudio(cfg) {
+  if (!SOUND_ON || audioCtx || !cfg || !cfg.cues) return;
+  cueMap = cfg.cues;
+  cueUrl = cfg.path || "/sounds";
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  audioCtx = new Ctx();
+  audioGain = audioCtx.createGain();
+  audioGain.connect(audioCtx.destination);
+  // Decode every cue up front — a fetch+decode at trigger time would land the
+  // sound noticeably after the thing it is announcing.
+  [...new Set(Object.values(cueMap))].forEach((name) => {
+    fetch(`${cueUrl}/${name}.wav`)
+      .then((r) => r.arrayBuffer())
+      .then((buf) => audioCtx.decodeAudioData(buf))
+      .then((decoded) => { cueBuffers[name] = decoded; })
+      .catch(() => {});                    // a missing cue is silent, not fatal
+  });
+  updateSoundBadge();
+}
+
+function playCue(name) {
+  const buf = cueBuffers[name];
+  if (!buf || !audioCtx || muted || audioCtx.state !== "running") return;
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioGain);
+  src.start();
+}
+
+/* Browsers refuse to make noise until the page has been interacted with, so
+   the output window asks for one click and then never mentions it again. */
+function updateSoundBadge() {
+  if (!SOUND_ON || !audioCtx) return;
+  if (muted) {
+    soundBadge.textContent = "🔇 sound muted — M";
+  } else if (audioCtx.state !== "running") {
+    soundBadge.textContent = "🔊 click anywhere to enable sound";
+  }
+  soundBadge.classList.toggle("show", muted || audioCtx.state !== "running");
+}
+
+function unlockAudio() {
+  if (!audioCtx) return;
+  if (audioCtx.state === "suspended") {
+    audioCtx.resume().then(updateSoundBadge).catch(() => {});
+  }
+  updateSoundBadge();
+}
+window.addEventListener("pointerdown", unlockAudio);
+window.addEventListener("keydown", unlockAudio);
+
+function onParticipant(p) {
+  if (!p || p.status === lastStatus) return;
+  // Skip the very first block: that status is where the machine already was,
+  // not a transition this window watched happen.
+  if (lastStatus !== null) {
+    const cue = cueMap[p.status];
+    if (cue) playCue(cue);
+  }
+  lastStatus = p.status;
+}
+
+/* ── WebSocket: register as a projection client; obey blank commands ──── */
+let ws = null;
+function connectWS() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.onopen = () => ws.send(JSON.stringify({ type: "projection_hello" }));
+  ws.onclose = () => setTimeout(connectWS, 2000);
+  ws.onmessage = (ev) => {
+    const data = JSON.parse(ev.data);
+    if (data.type === "init") {
+      initAudio(data.sounds);
+      // Adopt the current status silently — see onParticipant.
+      if (data.participant) lastStatus = data.participant.status;
+    } else if (data.type === "state") {
+      onParticipant(data.participant);
+    } else if (data.type === "projection_blank" && !IS_CAL) {
+      // Only the projector output blanks (during Capture); the calibration
+      // window on the laptop stays visible.
+      document.getElementById("blank").classList.toggle("on", !!data.on);
+    } else if (data.type === "projection_corners") {
+      // Mirror corner changes from the other window — skip while we're the
+      // one dragging (our own echo would fight the drag).
+      if (!dragging && data.corners && data.corners.length === 4) {
+        corners = data.corners;
+        applyWarp();
+      }
+    }
+  };
+}
+connectWS();
+
+/* ── Init: load saved corners ─────────────────────────────────────────── */
+/* Saved corners are restored on open. The ?cal window opens with handles
+   visible; the output window opens clean (C toggles handles either way). */
+fetch("/projection/corners")
+  .then(r => r.json())
+  .then(d => {
+    corners = (d.corners && d.corners.length === 4) ? d.corners : defaultCorners();
+    applyWarp();
+  })
+  .catch(() => { corners = defaultCorners(); applyWarp(); });
+</script>
+</body>
+</html>

@@ -1,0 +1,42 @@
+# German profanity seed list for text_guard.py
+#
+# Same format and same caveats as en.txt — see that file's header.
+#
+# Umlauts and ß are folded before matching (ä→ae, ö→oe, ü→ue, ß→ss), so an
+# entry may be written either way: "scheisse" and "scheiße" both match text
+# read as either. Writing them folded (as below) is clearest.
+#
+# For fuller coverage add the LDNOOBW `de` list as another .txt in this folder.
+
+arsch
+arschloch
+bastard
+fick
+ficken
+ficker
+fotze
+fresse
+hure
+hurensohn
+idiot
+kacke
+kanake
+missgeburt
+moese
+muschi
+nutte
+penner
+pimmel
+pisse
+scheiss
+scheisse
+schlampe
+schwanz
+schwuchtel
+spast
+spasti
+titten
+trottel
+verpiss
+wichser
+wixer

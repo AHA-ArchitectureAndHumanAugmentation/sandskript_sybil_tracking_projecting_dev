@@ -1,0 +1,51 @@
+# English profanity seed list for text_guard.py
+#
+# One entry per line. Blank lines and #-comments are ignored. Entries are
+# normalized the same way OCR output is (lowercased, umlauts and leetspeak
+# folded, non-letters dropped), so write them in plain lowercase letters.
+#
+# This is a SEED list of common swearing — deliberately short. For real
+# coverage drop in the LDNOOBW list ("List of Dirty, Naughty, Obscene and
+# Otherwise Bad Words", github.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-
+# Otherwise-Bad-Words) — the `en` file, renamed to anything ending .txt. Every
+# .txt in this folder is loaded and merged, so no code change is needed.
+#
+# Entries shorter than PROFANITY_MIN_SUBSTRING_LEN (config.py, default 4) only
+# match as standalone words, never as substrings — that is what stops "assist"
+# and "classic" from being flagged.
+
+arse
+arsehole
+ass
+asshole
+bastard
+bitch
+bollocks
+bullshit
+cock
+crap
+cunt
+dick
+dickhead
+dildo
+dumbass
+fag
+faggot
+fuck
+fucker
+fucking
+jerkoff
+motherfucker
+nigga
+nigger
+piss
+prick
+pussy
+retard
+shit
+shithead
+slut
+twat
+wank
+wanker
+whore
