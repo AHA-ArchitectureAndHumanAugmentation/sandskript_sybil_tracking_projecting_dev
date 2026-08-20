@@ -5,9 +5,8 @@ __pycache__/
 .venv/
 workspace.json
 settings.json
-paths/
-surfaces/
 presets/
+paths/
 .DS_Store
 .coverage
 htmlcov/
