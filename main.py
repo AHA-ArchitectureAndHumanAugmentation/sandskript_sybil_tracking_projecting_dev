@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import threading
+import time
 import webbrowser
 
 # Force UTF-8 console output so Unicode in log messages (→, ×, …) never crashes
@@ -18,7 +19,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 from config import (
     HTTP_HOST, HTTP_PORT, CONTOUR_MIN_PIXELS,
-    DEPTH_LABELS_INTERVAL_MM,
+    DEPTH_LABELS_INTERVAL_MM, DEPTH_WIDTH, DEPTH_HEIGHT,
     DEPTH_FPS, DEPTH_AVERAGE_FRAMES, SURFACE_DIR,
     DRAW_Z, DRAW_SPEED, TRAVEL_Z, MAX_TCP_SPEED,
     RESAMPLE_SPACING_MM, RESAMPLE_SPACING_MIN_MM, RESAMPLE_SPACING_MAX_MM,
@@ -120,7 +121,7 @@ shared_state: dict = {
 }
 state_lock = threading.Lock()
 
-EMULATE_CAPTURE = True  # True = no camera -- auto-generate + save + send after every tile switch. Set False once the camera's reconnected.
+EMULATE_CAPTURE = True  # True = pretend a drawing was captured (fake stroke), False = use the real RealSense camera. Manual choice — independent of whether a camera is physically attached.
 
 # ── Singletons ──────────────────────────────────────────────────────────────
 camera_thread = DepthCameraThread(shared_state, state_lock)
@@ -1263,7 +1264,6 @@ async def _open_browser() -> None:
 async def _main() -> None:
     # Printed after every module has been imported, so the ✓/· marks are real.
     module_trace.print_banner()
-    asyncio.create_task(_open_browser())
     asyncio.create_task(_participant_loop())
     asyncio.create_task(_tile_switch_watcher())
     await server.start()
