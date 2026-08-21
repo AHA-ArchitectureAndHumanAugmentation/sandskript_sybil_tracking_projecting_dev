@@ -1,19 +1,14 @@
 """
 Unit tests for the 2026-08 live-view improvements:
 
-  1. `surface_open_px` — a grayscale opening removes the grooves from what the
-     detrend blur sees, so the bare-sand surface estimate no longer sinks into
-     densely raked areas. Before it, parts of a groove at the SAME physical
-     depth as detected grooves elsewhere fell under threshold whenever the
-     raking around them was dense — the exact complaint from the sandbox.
-  2. `DepthCameraThread._latch_mask` — third steadiness damper: a pixel
+  1. `DepthCameraThread._latch_mask` — third steadiness damper: a pixel
      detected for LATCH_ON consecutive canvases is held lit until undetected
      for LATCH_OFF consecutive ones. Raked grooves cannot un-rake themselves,
      so settled regions hold perfectly still on the projector.
-  3. `DepthCameraThread._smoothed_range` — the auto colormap range is smoothed
+  2. `DepthCameraThread._smoothed_range` — the auto colormap range is smoothed
      across canvases instead of recomputed per frame, so the depth view stops
      breathing with sensor noise.
-  4. `stitch(want_rgb=False)` — the colour warp (the most expensive step of
+  3. `stitch(want_rgb=False)` — the colour warp (the most expensive step of
      the live loop) is skipped when nothing is watching the colour view.
 
 No hardware — synthetic sand throughout.
@@ -28,92 +23,6 @@ from depth_extractor import (
     DepthGrooveParams, grooves_and_mask, near_object_mask,
 )
 from stitcher import CameraFrame, CameraPlacement, Intrinsics, StitchCalib, stitch
-
-SIZE = 240
-GROOVE_MM = 3.0     # well above the 1.5 mm entry threshold — same depth everywhere
-WIDTH = 10          # groove width, px
-GAP = 8             # sand left between grooves in the dense field, px
-
-
-def _field(n_grooves: int, size: int = SIZE) -> np.ndarray:
-    """Flat sand at 1 m with `n_grooves` parallel grooves, all GROOVE_MM deep."""
-    d = np.full((size, size), 1.0, np.float32)
-    pitch = WIDTH + GAP
-    span = n_grooves * pitch - GAP
-    top = size // 2 - span // 2
-    for i in range(n_grooves):
-        lo = top + i * pitch
-        d[lo:lo + WIDTH, 30:size - 30] += GROOVE_MM / 1000.0
-    return d
-
-
-def _groove_rows(n_grooves: int, size: int = SIZE) -> list[int]:
-    """The centre row of each groove in `_field(n_grooves)`."""
-    pitch = WIDTH + GAP
-    span = n_grooves * pitch - GAP
-    top = size // 2 - span // 2
-    return [top + i * pitch + WIDTH // 2 for i in range(n_grooves)]
-
-
-class TestSurfaceOpening:
-    """The detrend must measure relief against BARE sand, not raked sand."""
-
-    def test_dense_raking_no_longer_swallows_grooves(self):
-        """
-        The regression this exists for: five same-depth grooves packed
-        together. The plain-Gaussian surface estimate sinks toward their
-        bottoms, so the middle ones lose relief; the opening removes the
-        grooves from the estimate first, so every one keeps its full depth.
-        """
-        field = _field(5)
-        with_open = grooves_and_mask(field, params=DepthGrooveParams())[0]
-        for row in _groove_rows(5):
-            assert (with_open[row, 60:SIZE - 60] > 0).mean() > 0.9, \
-                f"groove at row {row} should be detected end to end"
-
-    def test_detection_matches_an_isolated_groove(self):
-        """
-        The user-visible property: a groove detects the SAME whether it is
-        alone in clean sand or surrounded by other grooves at the same depth.
-        """
-        p = DepthGrooveParams()
-        alone = grooves_and_mask(_field(1), params=p)[0]
-        dense = grooves_and_mask(_field(5), params=p)[0]
-        row_alone = _groove_rows(1)[0]
-        row_mid = _groove_rows(5)[2]                      # middle of the pack
-        cov_alone = (alone[row_alone, 60:SIZE - 60] > 0).mean()
-        cov_mid = (dense[row_mid, 60:SIZE - 60] > 0).mean()
-        assert cov_mid == pytest.approx(cov_alone, abs=0.05)
-
-    def test_zero_disables_it(self):
-        """surface_open_px=0 must reproduce the old plain-Gaussian behaviour,
-        so the two can still be A/B compared from the browser."""
-        field = _field(5)
-        old = grooves_and_mask(field, params=DepthGrooveParams(surface_open_px=0))[0]
-        new = grooves_and_mask(field, params=DepthGrooveParams())[0]
-        # The old estimate loses coverage in the dense field; the new one must
-        # strictly improve on it (this doubles as proof the flag does something).
-        assert (new > 0).sum() > (old > 0).sum()
-
-    def test_flat_sand_stays_empty(self):
-        """The opening's bias on untouched sand must stay under threshold."""
-        flat = np.full((SIZE, SIZE), 1.0, np.float32)
-        assert (grooves_and_mask(flat, params=DepthGrooveParams())[0] > 0).sum() == 0
-
-    def test_ridge_mode_mirrors_it(self):
-        """Ridges are near-side excursions, removed by a CLOSING instead."""
-        d = np.full((SIZE, SIZE), 1.0, np.float32)
-        for row in _groove_rows(5):
-            d[row - WIDTH // 2:row + WIDTH // 2, 30:SIZE - 30] -= GROOVE_MM / 1000.0
-        mask = grooves_and_mask(d, params=DepthGrooveParams(detect="ridge"))[0]
-        for row in _groove_rows(5):
-            assert (mask[row, 60:SIZE - 60] > 0).mean() > 0.9
-
-    def test_from_dict_round_trip(self):
-        assert DepthGrooveParams.from_dict({"surface_open_px": 21}).surface_open_px == 21
-        assert DepthGrooveParams.from_dict({}).surface_open_px == \
-            DepthGrooveParams().surface_open_px
-
 
 class TestMaskLatch:
     """Settled grooves must hold perfectly still; smoothed sand must clear."""

@@ -255,12 +255,12 @@ async def on_set_reference(ws) -> None:
     """
     Capture the current (undrawn) sand as a baseline.
 
-    The reference does two jobs. It cancels pre-existing natural grooves for
-    detection (`ref_strength`), and — because a picture of the empty sand
-    CONTAINS the camera's tilt — it is the baseline that gives "height above
-    the sand" its meaning for the Participant trigger and the near-object
-    cutoff. Both are inert until one is captured, so say so, and warn when the
-    existing trigger value was plainly typed as a camera distance.
+    Detection subtracts this reference frame from the current depth frame, so
+    grooves read as depth change rather than absolute distance. Because a picture
+    of the empty sand CONTAINS the camera's tilt, it is also the baseline that
+    gives "height above the sand" its meaning for the Participant trigger and
+    the near-object cutoff. Both are inert until one is captured, so say so, and
+    warn when the existing trigger value was plainly typed as a camera distance.
     """
     captured = camera_thread.capture_frame()
     if captured is None:
@@ -1173,13 +1173,6 @@ async def on_set_automation(params: dict) -> None:
     on = bool((params or {}).get("on"))
     with state_lock:
         shared_state["auto_on"] = on
-        if on:
-            # Participant Mode uses the simpler relative-depth detection by default.
-            gen_params = dict(shared_state.get("participant_gen_params") or {})
-            adjustments = dict(gen_params.get("adjustments") or {})
-            adjustments["detect"] = "relative"
-            gen_params["adjustments"] = adjustments
-            shared_state["participant_gen_params"] = gen_params
     automation.set_enabled(on)
     _update_trigger_hint()
     _sync_participant_state()

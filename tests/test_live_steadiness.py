@@ -43,6 +43,11 @@ def _sand(depth_mm: float, size: int = 200, width: int = 14) -> np.ndarray:
     return d
 
 
+def _ref(size: int = 200) -> np.ndarray:
+    """Flat empty sand at 1 m — the reference frame for relative detection."""
+    return np.full((size, size), 1.0, np.float32)
+
+
 def _lit(mask: np.ndarray) -> int:
     return int((mask > 0).sum())
 
@@ -50,23 +55,11 @@ def _lit(mask: np.ndarray) -> int:
 class TestThresholdStrictness:
     """The one primitive hysteresis is built on: the same relief, judged twice."""
 
-    def test_a_lenient_valley_test_accepts_a_shallower_groove(self):
+    def test_a_lenient_test_accepts_a_shallower_groove(self):
         relief = np.array([[GROOVE_DEPTH_MM * 0.8]], np.float32)
         p = DepthGrooveParams()
         assert not _threshold_relief(relief, p).any()          # entry: too shallow
         assert _threshold_relief(relief, p, HYST).any()        # release: still counts
-
-    def test_ridge_leniency_goes_the_other_way(self):
-        relief = np.array([[-GROOVE_DEPTH_MM * 0.8]], np.float32)
-        p = DepthGrooveParams(detect="ridge")
-        assert not _threshold_relief(relief, p).any()
-        assert _threshold_relief(relief, p, HYST).any()
-
-    def test_a_lenient_band_is_a_wider_band(self):
-        p = DepthGrooveParams(detect="band", band_center_mm=0.0, band_width_mm=1.0)
-        relief = np.array([[1.2]], np.float32)                 # just outside the band
-        assert not _threshold_relief(relief, p).any()
-        assert _threshold_relief(relief, p, HYST).any()
 
     def test_strictness_one_is_the_plain_threshold(self):
         relief = np.linspace(-5, 5, 64, dtype=np.float32).reshape(8, 8)
@@ -82,12 +75,13 @@ class TestHysteresisHolds:
         The flicker itself: a groove whose measured relief wobbles across the
         threshold. Alone it drops out; remembered, it stays lit.
         """
-        deep = grooves_and_mask(_sand(DEEP_MM))[0]
+        deep = grooves_and_mask(_sand(DEEP_MM), reference=_ref())[0]
         assert _lit(deep) > 0, "the deep groove must be detected in the first place"
 
         faint = _sand(FAINT_MM)
-        alone = grooves_and_mask(faint)[0]
-        held = grooves_and_mask(faint, prev_mask=deep, hysteresis=HYST)[0]
+        alone = grooves_and_mask(faint, reference=_ref())[0]
+        held = grooves_and_mask(faint, prev_mask=deep, hysteresis=HYST,
+                                reference=_ref())[0]
 
         assert _lit(alone) == 0, "a faint groove should not clear entry on its own"
         assert _lit(held) > 0, "memory should hold what entry rejects"
@@ -99,21 +93,24 @@ class TestHysteresisHolds:
         """
         everything = np.full((200, 200), 255, np.uint8)
         flat = np.full((200, 200), 1.0, np.float32)
-        held = grooves_and_mask(flat, prev_mask=everything, hysteresis=HYST)[0]
+        held = grooves_and_mask(flat, prev_mask=everything, hysteresis=HYST,
+                                reference=_ref())[0]
         assert _lit(held) == 0
 
     def test_it_is_off_unless_asked_for(self):
         """Both arguments default to off, so every existing caller is unchanged."""
-        deep = grooves_and_mask(_sand(DEEP_MM))[0]
+        deep = grooves_and_mask(_sand(DEEP_MM), reference=_ref())[0]
         faint = _sand(FAINT_MM)
-        assert np.array_equal(grooves_and_mask(faint)[0],
-                              grooves_and_mask(faint, prev_mask=deep)[0])
+        assert np.array_equal(grooves_and_mask(faint, reference=_ref())[0],
+                              grooves_and_mask(faint, prev_mask=deep,
+                                               reference=_ref())[0])
 
     def test_a_stale_mask_of_the_wrong_shape_is_ignored(self):
         """A crop resize must not crash the live view."""
         faint = _sand(FAINT_MM)
         wrong = np.full((50, 50), 255, np.uint8)
-        out = grooves_and_mask(faint, prev_mask=wrong, hysteresis=HYST)[0]
+        out = grooves_and_mask(faint, prev_mask=wrong, hysteresis=HYST,
+                               reference=_ref())[0]
         assert out.shape == faint.shape
 
 
@@ -336,6 +333,8 @@ class TestTheProjectorStreamBehaves:
         cam = DepthCameraThread(state, threading.Lock())
         rng = np.random.default_rng(4)
         truth = self._sand()
+        ref = np.full(truth.shape, 1.0, np.float32)
+        cam.set_reference(ref)
         keep = ct.PROJECTION_KEEPALIVE_S
         ct.PROJECTION_KEEPALIVE_S = 1e9      # isolate from the keepalive
         try:
@@ -351,6 +350,8 @@ class TestTheProjectorStreamBehaves:
         cam = DepthCameraThread(state, threading.Lock())
         rng = np.random.default_rng(4)
         truth = self._sand()
+        ref = np.full(truth.shape, 1.0, np.float32)
+        cam.set_reference(ref)
         self._frames(cam, state, 80, truth, rng)
         truth[80:90, 20:180] += 0.006                          # a groove is raked
         assert self._frames(cam, state, 10, truth, rng, start=80) > 0
@@ -364,6 +365,8 @@ class TestTheProjectorStreamBehaves:
         cam = DepthCameraThread(state, threading.Lock())
         rng = np.random.default_rng(4)
         truth = self._sand()
+        ref = np.full(truth.shape, 1.0, np.float32)
+        cam.set_reference(ref)
         self._frames(cam, state, 60, truth, rng)
 
         state["projection_clients"] = 0

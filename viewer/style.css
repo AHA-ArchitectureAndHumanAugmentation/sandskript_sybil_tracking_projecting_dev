@@ -446,19 +446,6 @@ main {
 .adj-btn { width: 100%; font-size: 11px; padding: 4px; }
 .adj-btn.active { border-color: #00e5a0; color: #00e5a0; }
 
-#detect-mode {
-  flex: 1;
-  background: #222;
-  border: 1px solid #333;
-  color: #d0d0d0;
-  padding: 4px 6px;
-  font-family: inherit;
-  font-size: 11px;
-  border-radius: 3px;
-  outline: none;
-  cursor: pointer;
-}
-
 #btn-capture-image { border-color: #5599ff44; }
 #btn-capture-image:not(:disabled):hover { background: #1a2a3a; color: #5599ff; }
 #btn-generate { border-color: #f0a04055; }

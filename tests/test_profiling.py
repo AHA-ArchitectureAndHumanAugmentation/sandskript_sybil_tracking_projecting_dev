@@ -331,8 +331,9 @@ class TestTheHotStagesReportTheirParts:
 
         depth = np.full((120, 160), 1.0, np.float32)
         depth[60:64, 20:140] += 0.003
+        sand = np.full((120, 160), 1.0, np.float32)
         t = self._timer()
-        grooves_and_mask(depth, None, DepthGrooveParams(), timer=t)
+        grooves_and_mask(depth, None, DepthGrooveParams(), reference=sand, timer=t)
         report = t.report()
         for part in ("prep", "blur", "threshold", "morph", "skeleton"):
             assert _row(report, part), part
@@ -352,8 +353,9 @@ class TestTheHotStagesReportTheirParts:
         with t.stage("stitch"):
             stitch(frames, calib, timer=t)
         with t.stage("detect"):
-            grooves_and_mask(np.full((80, 80), 1.0, np.float32),
-                             None, DepthGrooveParams(), timer=t)
+            sand = np.full((80, 80), 1.0, np.float32)
+            grooves_and_mask(sand, None, DepthGrooveParams(),
+                             reference=sand, timer=t)
         tops = [r.split()[0] for r in _stage_rows(t.report())
                 if not r.startswith("      ")]
         assert sorted(tops) == ["detect", "stitch"]

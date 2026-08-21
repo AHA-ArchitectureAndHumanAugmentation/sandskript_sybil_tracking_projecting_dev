@@ -532,7 +532,6 @@ function restoreSessionSettings(data) {
       updateAdjVal(row);
     }
   });
-  if (adj.detect) document.getElementById("detect-mode").value = adj.detect;
   const c = d.crop;
   if (c && [c.x, c.y, c.w, c.h].every(Number.isFinite)) {
     crop = { x: c.x, y: c.y, w: c.w, h: c.h };
@@ -545,7 +544,6 @@ function restoreSessionSettings(data) {
   // The canvas turn is a rig property restored from settings.json, not a
   // per-window one — show the angle the pipeline is actually using.
   showViewRotation(data.view_rotation);
-  applyDetectModeVisibility();
 }
 
 function applyWorkspace(ws) {
@@ -1113,11 +1111,6 @@ function initAdjustControls() {
     updateAdjVal(row);
     input.addEventListener("input", () => { updateAdjVal(row); requestAdjust(); });
   });
-  document.getElementById("detect-mode").addEventListener("change", () => {
-    applyDetectModeVisibility();
-    requestAdjust(true);
-  });
-  applyDetectModeVisibility();
 }
 
 function updateAdjVal(row) {
@@ -1128,25 +1121,12 @@ function updateAdjVal(row) {
   span.textContent = step < 1 ? parseFloat(input.value).toFixed(2) : input.value;
 }
 
-/* Show/hide detection-parameter rows, notes and group titles based on the
-   selected detection mode. Rows without a data-modes attribute (Mode itself,
-   Set/Clear Reference buttons, Depth view range, Crop, Surface) stay visible
-   for every mode. */
-function applyDetectModeVisibility() {
-  const mode = document.getElementById("detect-mode").value;
-  document.querySelectorAll(".adj-row[data-modes], .adj-note[data-modes], .adj-group-title[data-modes]").forEach(el => {
-    const modes = el.dataset.modes.split(/\s+/);
-    el.style.display = (modes.includes("all") || modes.includes(mode)) ? "" : "none";
-  });
-}
-
 function readAdjustments() {
   const adj = {};
   adjRows().forEach(row => {
     const v = parseFloat(row.querySelector("input").value);
     adj[row.dataset.key] = Number.isFinite(v) ? v : 0;   // empty box = off
   });
-  adj.detect = document.getElementById("detect-mode").value;
   return adj;
 }
 
@@ -1179,8 +1159,6 @@ document.getElementById("btn-reset-adjust").addEventListener("click", () => {
     input.value = row.dataset.default;
     updateAdjVal(row);
   });
-  document.getElementById("detect-mode").value = "valley";
-  applyDetectModeVisibility();
   requestAdjust(true);
 });
 
@@ -1266,8 +1244,6 @@ async function applyPreset(name) {
         updateAdjVal(row);
       }
     });
-    if (p.detect) document.getElementById("detect-mode").value = p.detect;
-    applyDetectModeVisibility();
     applyExecSettings(p.exec);
     requestAdjust(true);
     // The bar is now this window's, but the server holds the copy Participant

@@ -174,25 +174,14 @@ DEPTH_COLOR_RANGE_ALPHA = 0.1
 REALSENSE_DEPTH_FILTERS = True
 
 # ── Groove detection (depth → groove centrelines) ─────────────────────────────
-# See depth_extractor.grooves_from_depth for the algorithm. These are the live-feed
-# defaults and the initial values of the browser's Adjust controls.
-GROOVE_SMOOTH_SIGMA_PX  = 1.5    # denoise the depth map first
-GROOVE_DETREND_SIGMA_PX = 25.0   # blur radius estimating the bare-sand surface
-GROOVE_DEPTH_MM         = 1.5    # how much deeper than the surface counts as a groove
+# Detection now uses relative depth only: the current frame is subtracted from a
+# captured reference frame of empty sand, and pixels that are deep enough count
+# as grooves. These constants are the live-feed defaults and the initial values
+# of the browser's Adjust controls.
+GROOVE_SMOOTH_SIGMA_PX  = 1.5    # denoise the depth difference map first
+GROOVE_DEPTH_MM         = 1.5    # how much deeper than the reference counts as a groove
 GROOVE_MIN_BLOB_PX      = 40     # discard connected specks smaller than this
-GROOVE_DETECT           = "valley"  # "valley"=grooves, "ridge"=raised lines, "band"=iso-depth
 GROOVE_NEAR_MARGIN_PX   = 12     # dilation around a too-near object when rejecting its mask blobs
-# Before the detrend blur estimates the bare-sand surface, a grayscale opening
-# (min-then-max filter) this many pixels wide REMOVES THE GROOVES from what the
-# blur sees. Without it the Gaussian surface estimate includes the grooves
-# themselves, so in a densely raked area it sinks toward the groove bottoms and
-# grooves there lose relief — the reason parts of a groove at the SAME physical
-# depth as detected ones elsewhere came out under threshold no matter how the
-# sliders were set. Must be wider than the widest groove (a ~20 mm groove at
-# 3 mm/px is ~7 px). Costs a small positive relief bias (~the residual noise
-# after smoothing) on untouched sand. 0 = off (the old behaviour). Ridge mode
-# uses a closing instead, for the same reason mirrored.
-GROOVE_SURFACE_OPEN_PX  = 15
 
 # ── Path extraction ───────────────────────────────────────────────────────────
 CONTOUR_MIN_PIXELS  = 20    # discard contours shorter than this many pixels
