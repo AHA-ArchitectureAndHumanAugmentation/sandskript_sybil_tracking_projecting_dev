@@ -12,6 +12,27 @@ import pytest
 from workspace import WorkspaceConfig
 
 
+def _realsense_present() -> bool:
+    """True only when pyrealsense2 is importable AND a device is plugged in."""
+    try:
+        import pyrealsense2 as rs
+        return len(rs.context().query_devices()) > 0
+    except Exception:
+        return False
+
+
+def pytest_collection_modifyitems(config, items):
+    # Integration tests need a physical RealSense; without one they can only
+    # fail. Skip them automatically so a plain `pytest` run is meaningful on
+    # any machine — with the camera plugged in they run as normal.
+    if _realsense_present():
+        return
+    skip = pytest.mark.skip(reason="needs a RealSense camera (pyrealsense2 + device)")
+    for item in items:
+        if "integration" in item.keywords:
+            item.add_marker(skip)
+
+
 # ── Synthetic groove masks (binary, white-on-black) ───────────────────────────
 # These stand in for the output of depth_extractor.grooves_from_depth — the
 # 1-px-wide groove centrelines that path_extractor.extract_from_edges consumes.

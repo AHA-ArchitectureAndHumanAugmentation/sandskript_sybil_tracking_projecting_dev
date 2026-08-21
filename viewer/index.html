@@ -65,13 +65,13 @@
           <button id="btn-project-cal" title="Open the calibration window on this screen — drag its handles and the projector output follows live">⧉ Calibrate</button>
           <img class="cam-live" id="feed-mask" src="/depth/mask" alt="mask feed" />
           <img class="cam-still hidden" id="prev-mask" alt="mask preview" />
-          <!-- Label + title are rewritten by viewer.js: with a reference frame
-               set this cutoff is a height ABOVE THE SAND (tilt-proof), without
-               one it is an absolute distance from the camera. Same switch the
-               Participant trigger uses. -->
+          <!-- The cutoff is a height ABOVE THE SAND (tilt-proof) measured
+               against the reference frame; viewer.js rewrites the title to a
+               set-reference hint while no reference is captured. Same baseline
+               the Participant trigger uses. -->
           <div class="adj-row adj-num" id="mask-ignore" data-key="ignore_closer_mm" data-min="0" data-max="5000" data-step="1" data-default="0"
-               title="Near-object filter: anything closer to the depth camera than this absolute distance (a hand raking, a person leaning over the sand) — and every mask blob touching it — is left out of the mask and the live projection. 0 or empty = off.">
-            <label for="ignore-closer-input" id="ignore-closer-label">Ignore closer than</label>
+               title="Near-object filter: anything standing more than this many mm ABOVE the sand surface (a hand raking, a person leaning over) — and every mask blob touching it — is left out of the mask and the live projection. Needs a reference frame (Set Reference). 0 or empty = off.">
+            <label for="ignore-closer-input" id="ignore-closer-label">Ignore above sand</label>
             <input type="number" id="ignore-closer-input" placeholder="off" />
             <label for="ignore-closer-input">mm</label>
           </div>
@@ -102,34 +102,37 @@
           <option value="valley" selected>Valley (grooves, deeper)</option>
           <option value="ridge">Ridge (raised lines)</option>
           <option value="band">Band (absolute iso-depth)</option>
+          <option value="relative">Relative (subtract reference)</option>
         </select>
       </div>
       <p class="adj-note">
         <b>Valley</b> finds anything a few mm <i>deeper</i> than the surrounding sand —
         the hand-drawn grooves. <b>Ridge</b> finds raised lines instead. <b>Band</b>
-        keeps a fixed depth interval (use the Band sliders below).
+        keeps a fixed depth interval (use the Band sliders below). <b>Relative</b>
+        subtracts the captured reference frame and thresholds the depth change;
+        it cancels a tilted camera and is used by Participant Mode.
       </p>
 
-      <div class="adj-row" data-key="groove_depth_mm" data-min="0.1" data-max="10" data-step="0.1" data-default="1.5">
+      <div class="adj-row" data-modes="all" data-key="groove_depth_mm" data-min="0.1" data-max="10" data-step="0.1" data-default="1.5">
         <label>Groove depth (mm)</label><input type="range" /><span class="adj-val"></span></div>
-      <p class="adj-note">How much deeper than the surrounding surface a pixel must be to
+      <p class="adj-note" data-modes="all">How much deeper than the surrounding surface a pixel must be to
         count as a groove. Lower it to catch fainter rake marks; raise it if noise/grain
         gets picked up.</p>
 
-      <div class="adj-row" data-key="detrend_sigma_px" data-min="2" data-max="100" data-step="1" data-default="25">
+      <div class="adj-row" data-modes="valley ridge" data-key="detrend_sigma_px" data-min="2" data-max="100" data-step="1" data-default="25">
         <label>Surface scale (px)</label><input type="range" /><span class="adj-val"></span></div>
-      <p class="adj-note">Blur radius used to estimate the smooth bare-sand surface that
+      <p class="adj-note" data-modes="valley ridge">Blur radius used to estimate the smooth bare-sand surface that
         gets subtracted off. Should be larger than your groove width but smaller than the
         slow sag/tilt of the sandbox. Larger = flattens broader undulations.</p>
 
-      <div class="adj-row" data-key="smooth_sigma_px" data-min="0" data-max="6" data-step="0.1" data-default="1.5">
+      <div class="adj-row" data-modes="all" data-key="smooth_sigma_px" data-min="0" data-max="6" data-step="0.1" data-default="1.5">
         <label>Denoise (px)</label><input type="range" /><span class="adj-val"></span></div>
-      <p class="adj-note">Smooths per-pixel depth noise before detection. Raise it if the
+      <p class="adj-note" data-modes="all">Smooths per-pixel depth noise before detection. Raise it if the
         grooves come out speckly; lower it to keep the thinnest marks.</p>
 
-      <div class="adj-row" data-key="min_blob_px" data-min="0" data-max="500" data-step="5" data-default="40">
+      <div class="adj-row" data-modes="all" data-key="min_blob_px" data-min="0" data-max="500" data-step="5" data-default="40">
         <label>Min blob (px)</label><input type="range" /><span class="adj-val"></span></div>
-      <p class="adj-note">Discards detected specks smaller than this many pixels before
+      <p class="adj-note" data-modes="all">Discards detected specks smaller than this many pixels before
         thinning — clears isolated noise that isn't part of a real groove.</p>
 
 
@@ -144,38 +147,38 @@
       <div class="adj-row">
         <button id="btn-clear-reference" class="adj-btn">Clear Reference</button>
       </div>
-      <div class="adj-row" data-key="ref_strength" data-min="0" data-max="1" data-step="0.05" data-default="0">
+      <div class="adj-row" data-modes="valley ridge" data-key="ref_strength" data-min="0" data-max="1" data-step="0.05" data-default="0">
         <label>Reference subtract</label><input type="range" /><span class="adj-val"></span></div>
-      <p class="adj-note"><b>Background subtraction.</b> Capture the undrawn sand with
+      <p class="adj-note" data-modes="valley ridge"><b>Background subtraction.</b> Capture the undrawn sand with
         <i>Set Reference</i>, then raise this to subtract that baseline — pre-existing natural
         grooves appear in both frames and cancel, leaving only what you drew. 0 = off, 1 = full.
         (Camera and sandbox must stay still between reference and capture.)</p>
 
-      <div class="adj-row" data-key="min_mean_depth_mm" data-min="0" data-max="10" data-step="0.1" data-default="0">
+      <div class="adj-row" data-modes="all" data-key="min_mean_depth_mm" data-min="0" data-max="10" data-step="0.1" data-default="0">
         <label>Min mean depth (mm)</label><input type="range" /><span class="adj-val"></span></div>
-      <p class="adj-note">Drops whole grooves whose <i>average</i> depth is shallower than this.
+      <p class="adj-note" data-modes="all">Drops whole grooves whose <i>average</i> depth is shallower than this.
         Hand-raked grooves are consistently a few mm deep; faint natural ripples that only
         graze the threshold get rejected. 0 = off.</p>
 
-      <div class="adj-row" data-key="min_width_mm" data-min="0" data-max="30" data-step="0.5" data-default="0">
+      <div class="adj-row" data-modes="all" data-key="min_width_mm" data-min="0" data-max="30" data-step="0.5" data-default="0">
         <label>Min width (mm)</label><input type="range" /><span class="adj-val"></span></div>
-      <div class="adj-row" data-key="max_width_mm" data-min="0" data-max="30" data-step="0.5" data-default="0">
+      <div class="adj-row" data-modes="all" data-key="max_width_mm" data-min="0" data-max="30" data-step="0.5" data-default="0">
         <label>Max width (mm)</label><input type="range" /><span class="adj-val"></span></div>
-      <p class="adj-note">Keep only grooves whose width matches the raking tool. A hand rake
+      <p class="adj-note" data-modes="all">Keep only grooves whose width matches the raking tool. A hand rake
         makes a consistent width; thin natural scratches or broad dishes fall outside the band.
         0 = off (max 0 = no upper limit). Needs a workspace for the mm scale.</p>
 
-      <div class="adj-row" data-key="min_length_mm" data-min="0" data-max="200" data-step="1" data-default="0">
+      <div class="adj-row" data-modes="all" data-key="min_length_mm" data-min="0" data-max="200" data-step="1" data-default="0">
         <label>Min length (mm)</label><input type="range" /><span class="adj-val"></span></div>
-      <p class="adj-note">Drops grooves shorter than this along their centreline — natural texture
+      <p class="adj-note" data-modes="all">Drops grooves shorter than this along their centreline — natural texture
         tends to break into short fragments. 0 = off. Needs a workspace for the mm scale.</p>
 
-      <div class="adj-group-title">Band mode</div>
-      <div class="adj-row" data-key="band_center_mm" data-min="-20" data-max="20" data-step="0.5" data-default="0">
+      <div class="adj-group-title" data-modes="band">Band mode</div>
+      <div class="adj-row" data-modes="band" data-key="band_center_mm" data-min="-20" data-max="20" data-step="0.5" data-default="0">
         <label>Band center (mm)</label><input type="range" /><span class="adj-val"></span></div>
-      <div class="adj-row" data-key="band_width_mm" data-min="0.1" data-max="20" data-step="0.1" data-default="1">
+      <div class="adj-row" data-modes="band" data-key="band_width_mm" data-min="0.1" data-max="20" data-step="0.1" data-default="1">
         <label>Band ± (mm)</label><input type="range" /><span class="adj-val"></span></div>
-      <p class="adj-note">Only used in Band mode: keep pixels whose depth (relative to the
+      <p class="adj-note" data-modes="band">Only used in Band mode: keep pixels whose depth (relative to the
         estimated surface) falls within ±width of the center.</p>
 
       <div class="adj-group-title">Depth view range</div>

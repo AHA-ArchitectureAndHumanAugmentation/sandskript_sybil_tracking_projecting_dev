@@ -556,6 +556,7 @@ def _empty_result(n_cams: int, mm_per_px: float) -> StitchResult:
 def stitch(frames: list[CameraFrame], calib: StitchCalib,
            mm_per_px: Optional[float] = None,
            grid: Optional[CanvasGrid] = None,
+           want_rgb: bool = True,
            timer: StageTimer = NULL_TIMER) -> StitchResult:
     """
     Lay every camera's frame onto the shared canvas through its corner-pin.
@@ -566,6 +567,12 @@ def stitch(frames: list[CameraFrame], calib: StitchCalib,
     this cycle's cameras — see CanvasGrid. With a grid, a cycle where no camera
     had data returns a correctly-sized EMPTY canvas rather than a stub, so the
     pipeline downstream keeps its frame size.
+
+    ``want_rgb=False`` skips placing the colour images entirely (the result's
+    ``rgb`` comes back empty). Profiling showed the colour warp to be the single
+    most expensive step of the whole live loop — a third of the cycle — while
+    grooves are detected from depth alone; the live loop passes False whenever
+    nothing is actually watching the colour view. Capture always passes True.
 
     ``timer`` is diagnostic only (see profiling.py). This is the most expensive
     stage of the live loop, and its parts scale differently: prepare and the
@@ -629,11 +636,16 @@ def stitch(frames: list[CameraFrame], calib: StitchCalib,
             # surface that is not there, and the mask must stay strictly binary.
             src_depth = np.where(q.valid, q.frame.depth_m, 0.0).astype(np.float32)
             warped = cv2.warpPerspective(src_depth, h, (gw, gh), flags=cv2.INTER_NEAREST)
-            hit = cv2.warpPerspective(q.valid.astype(np.uint8), h, (gw, gh),
-                                      flags=cv2.INTER_NEAREST) > 0
+            # `warped > 0` as well: the float and uint8 NEAREST warps can round
+            # a boundary coordinate to different source pixels (OpenCV picks the
+            # code path per dtype), which would mark border pixels valid while
+            # their depth sampled the zero outside — invalid pixels were zeroed
+            # above and 0 m is never a real measurement, so zeros are never sand.
+            hit = (cv2.warpPerspective(q.valid.astype(np.uint8), h, (gw, gh),
+                                       flags=cv2.INTER_NEAREST) > 0) & (warped > 0)
             depth_sum[hit] += warped[hit] + q.height_m
             coverage += hit.astype(np.uint8)
-        if q.frame.rgb is not None:
+        if want_rgb and q.frame.rgb is not None:
             with timer.stage("stitch.warp_rgb"):
                 colour = np.where(q.valid[..., None], q.frame.rgb, 0)
                 cw = cv2.warpPerspective(colour, h, (gw, gh), flags=cv2.INTER_NEAREST)
@@ -758,8 +770,11 @@ def seam_report(frames: list[CameraFrame], calib: StitchCalib,
         h = cv2.getPerspectiveTransform(q.src, dst.astype(np.float32))
         src_depth = np.where(q.valid, q.frame.depth_m, 0.0).astype(np.float32)
         warped = cv2.warpPerspective(src_depth, h, (gw, gh), flags=cv2.INTER_NEAREST)
-        hit = cv2.warpPerspective(q.valid.astype(np.uint8), h, (gw, gh),
-                                  flags=cv2.INTER_NEAREST) > 0
+        # `warped > 0` for the same reason as in `stitch`: the float and uint8
+        # NEAREST warps can round boundary coordinates differently, and a
+        # border pixel whose depth sampled the zero outside must not count.
+        hit = (cv2.warpPerspective(q.valid.astype(np.uint8), h, (gw, gh),
+                                   flags=cv2.INTER_NEAREST) > 0) & (warped > 0)
         # Include height_mm: it is part of what this camera claims the depth is,
         # so a seam already levelled with the Height buttons must read as flat.
         planes.append((i, warped + q.height_m, hit))

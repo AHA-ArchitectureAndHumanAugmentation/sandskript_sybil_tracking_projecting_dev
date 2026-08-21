@@ -58,8 +58,9 @@ SURFACE_MAX_FACES  = 80000   # warn above this — browser preview gets heavy
 PATHS_DIR = Path("paths")
 
 # ── Depth-number overlay (reference popup on the Depth viewport) ─────────────
-# The /depths popup shows the live depth feed with the absolute distance (mm
-# from the camera) written at the centre of each iso-depth region. Regions are
+# The /depths popup shows the live depth feed with a number (mm above the sand
+# with a reference set, else raw mm from the camera as a setup aid) written at
+# the centre of each iso-depth region. Regions are
 # depth bands `interval_mm` wide (popup slider); labels are computed at half
 # resolution, only while the popup is open, throttled like the groove preview.
 DEPTH_LABELS_EVERY       = 4      # compute every Nth combined canvas (~1.2 Hz)
@@ -75,14 +76,24 @@ DEPTH_LABELS_MAX         = 150    # cap on labels per frame (declutter + cost)
 # PARTICIPANT_CLEAR_S, the pipeline starts. The area minimum keeps single-pixel
 # sensor noise from firing.
 #
-# What the threshold MEASURES depends on whether a reference frame is set:
-# with one it is a height ABOVE THE SAND (tilt-proof, tens of mm); without one
-# it is a raw distance from the camera (hundreds of mm). One range covers both,
-# so the floor is low enough for the relative mode and the ceiling high enough
-# for the absolute one.
+# The threshold is a height ABOVE THE SAND (tilt-proof, typically tens of mm),
+# measured against the reference frame — without one the trigger is inert.
+# The wide ceiling tolerates values typed in the old absolute-distance habit.
+# The reference frame (a picture of the EMPTY sand) is what gives "height above
+# the sand" its meaning: without one the depth-number overlay falls back to raw
+# distance from the camera — so the sand reads ~1200 mm instead of 0 — and both
+# the Participant trigger and the near-object filter are inert. That used to
+# require someone to press Set Reference in Developer Mode before Participant
+# Mode meant anything, and nothing said so on the participant's own screen.
+# So capture one automatically at start-up, which is exactly when the sand is
+# empty. Set Reference still overrides it at any time, and an operator who
+# starts the app with a drawing already in the sand should press it.
+AUTO_REFERENCE_ON_START = True
+AUTO_REFERENCE_TIMEOUT_S = 30.0   # give up waiting for a canvas after this long
+
 TRIGGER_MIN_AREA_PX = 150    # valid pixels past the threshold that count as "something in frame"
 TRIGGER_MIN_MM      = 5.0    # smallest accepted threshold (a low hover above the sand)
-TRIGGER_MAX_MM      = 5000.0 # largest (a camera metres away, absolute mode)
+TRIGGER_MAX_MM      = 5000.0 # largest accepted threshold
 PARTICIPANT_TICK_S  = 0.1    # automation poll interval (s)
 PARTICIPANT_CLEAR_S = 1.0    # frame must stay clear this long before triggering
 # Max Drawing Time: how long ONE participant may keep the sand occupied —
@@ -145,6 +156,22 @@ CAPTURE_REFILL_MAX_S = 5.0
 # Colormap range (metres) for the live depth view. 0 = auto (per-frame percentile).
 DEPTH_COLOR_NEAR_M = 0.0
 DEPTH_COLOR_FAR_M  = 0.0
+# In auto mode the percentile range used to be recomputed per frame, so the
+# whole colormap breathed with sensor noise and jumped when a hand entered.
+# The live view now smooths the auto range with this EMA (fraction of the new
+# frame's percentiles kept per canvas); the range still tracks a real scene
+# change within a couple of seconds. 1.0 = the old per-frame behaviour.
+DEPTH_COLOR_RANGE_ALPHA = 0.1
+
+# On-device style post-processing for every RealSense depth frame, applied in
+# realsense_source right after unpacking: a spatial edge-preserving filter and
+# a temporal filter (SDK defaults). Cuts per-pixel depth noise BEFORE anything
+# downstream sees it — the ~1-2 mm noise floor is the same size as the ~1.5 mm
+# relief detection looks for, so this raises the usable signal-to-noise of
+# every consumer at once (live mask, trigger, Capture). The temporal filter is
+# per-camera state kept by the SDK; a fast-moving hand can trail slightly, but
+# the presence trigger's threshold is tens of mm, far above the trail.
+REALSENSE_DEPTH_FILTERS = True
 
 # ── Groove detection (depth → groove centrelines) ─────────────────────────────
 # See depth_extractor.grooves_from_depth for the algorithm. These are the live-feed
@@ -155,6 +182,17 @@ GROOVE_DEPTH_MM         = 1.5    # how much deeper than the surface counts as a 
 GROOVE_MIN_BLOB_PX      = 40     # discard connected specks smaller than this
 GROOVE_DETECT           = "valley"  # "valley"=grooves, "ridge"=raised lines, "band"=iso-depth
 GROOVE_NEAR_MARGIN_PX   = 12     # dilation around a too-near object when rejecting its mask blobs
+# Before the detrend blur estimates the bare-sand surface, a grayscale opening
+# (min-then-max filter) this many pixels wide REMOVES THE GROOVES from what the
+# blur sees. Without it the Gaussian surface estimate includes the grooves
+# themselves, so in a densely raked area it sinks toward the groove bottoms and
+# grooves there lose relief — the reason parts of a groove at the SAME physical
+# depth as detected ones elsewhere came out under threshold no matter how the
+# sliders were set. Must be wider than the widest groove (a ~20 mm groove at
+# 3 mm/px is ~7 px). Costs a small positive relief bias (~the residual noise
+# after smoothing) on untouched sand. 0 = off (the old behaviour). Ridge mode
+# uses a closing instead, for the same reason mirrored.
+GROOVE_SURFACE_OPEN_PX  = 15
 
 # ── Path extraction ───────────────────────────────────────────────────────────
 CONTOUR_MIN_PIXELS  = 20    # discard contours shorter than this many pixels
@@ -253,7 +291,15 @@ STITCH_HTTP_PORT      = 5106
 STITCH_CALIB_FILE     = Path("stitch_calibration.json")  # per-camera placements, gitignored
 STITCH_AVERAGE_FRAMES = 10     # temporal averaging per camera (smaller than main: live-ish)
 STITCH_EVERY_S        = 0.25   # seconds between stitched-output recomputes (~4 Hz)
-STITCH_MM_PER_PX      = 0.0    # heightmap grid resolution; 0 = auto from median depth
+# PINNED, deliberately. 0 (auto) derived the resolution from whichever camera
+# sorted first by serial, so changing the rig silently rescaled the whole
+# canvas — profiling showed a 2-camera canvas coming out MORE pixels (and
+# slower) than a 3-camera one for exactly this reason. Canvas pixel count is
+# the master cost control of the live loop: at 3.0 mm/px a 3-camera canvas is
+# ~0.37 Mpx instead of ~0.58, and the cycle cost falls slightly faster than
+# the pixel count. A ~20 mm groove is still ~7 px wide. NOTE: changing this
+# changes the canvas dimensions — the projector corner-pin must be redone.
+STITCH_MM_PER_PX      = 3.0    # heightmap grid resolution; 0 = auto from median depth
 STITCH_MAX_GRID_W     = 1920   # cap the heightmap size (cost bound)
 STITCH_MAX_GRID_H     = 1080
 STITCH_MAX_CAMERAS    = 4      # extra devices are ignored (MJPEG/USB bandwidth)
@@ -276,9 +322,13 @@ STITCH_NOMINAL_VFOV_DEG = 58.0
 # groove preview and the Participant trigger — is rebuilt on this slower clock,
 # because warping several 640×480 frames onto a big canvas 30 times a second
 # would buy nothing on static sand.
-# This repo runs it at ~5 Hz rather than upstream's ~10 Hz default — keep this
-# value; it is a deliberate choice for this rig, not a stale copy.
-STITCH_MAIN_EVERY_S    = 0.2    # seconds between live canvas rebuilds (~5 Hz)
+# This repo ran at ~5 Hz for a while; back at ~10 Hz now that the cycle is
+# cheap enough (colour warp gated on a viewer, resolution pinned above). The
+# rebuild period is the latency floor of EVERY live view, and the mask's EMA
+# settles in CYCLES — so a faster canvas makes the mask respond faster twice
+# over. If a bigger rig can't hold this rate, raise it back before anything
+# else falls behind.
+STITCH_MAIN_EVERY_S    = 0.1    # seconds between live canvas rebuilds (~10 Hz)
 # Groove/mask preview every Nth canvas. 1 = same rate as the depth view, which
 # is what keeps the Mask viewport from lagging visibly behind Depth; 2 halves
 # its cost at the price of doubling its latency.
@@ -294,9 +344,11 @@ LIVE_GROOVE_EVERY      = 1
 # path the robot draws are produced by a separate code path and are untouched.
 #
 # 1. Exponential average of the canvas depth used for detection. Each cycle
-#    keeps ALPHA of the new frame; noise falls by ~sqrt(ALPHA/(2-ALPHA)) — 0.25
-#    is about a 2.6x reduction, settling in ~0.4 s. 1.0 = off.
-LIVE_DEPTH_EMA_ALPHA   = 0.25
+#    keeps ALPHA of the new frame; noise falls by ~sqrt(ALPHA/(2-ALPHA)).
+#    0.15 is about a 3.5x reduction; because the canvas now rebuilds at ~10 Hz
+#    instead of ~5, this settles in the same WALL-CLOCK time the old 0.25 did
+#    while smoothing harder. 1.0 = off.
+LIVE_DEPTH_EMA_ALPHA   = 0.15
 # A pixel the sensor drops keeps its last value for this many cycles rather than
 # punching a hole in the mask. Bounded on purpose: a camera that dies must still
 # blank its part of the canvas within a moment, or a dead feed looks like a live
@@ -306,7 +358,22 @@ LIVE_DEPTH_HOLD_CYCLES = 5
 #    stays lit while its relief holds above this FRACTION of GROOVE_DEPTH_MM,
 #    instead of dropping out the instant it dips a hair below. Kills the residual
 #    crawling at groove edges that averaging alone leaves. 1.0 = off.
-LIVE_MASK_HYSTERESIS   = 0.7
+#    0.5 (release at 0.75 mm for the default 1.5 mm entry) rather than 0.7:
+#    the 0.7 release sat at ~1 mm, inside the D435i's per-pixel noise, so edge
+#    pixels of settled grooves still flipped. The wider band trades a slightly
+#    stickier mask for a visibly steadier projection.
+LIVE_MASK_HYSTERESIS   = 0.5
+# 3. Latch, on top of the two dampers: a pixel detected for LATCH_ON
+#    consecutive canvases is LATCHED lit, and stays lit until it has been
+#    UNdetected for LATCH_OFF consecutive canvases. Raked grooves never
+#    un-rake themselves between robot passes, so a region that has settled is
+#    held perfectly still — which also lets the projector's change-gate hold
+#    its frame indefinitely — while genuinely smoothed-over sand still clears,
+#    just a couple of seconds late. Live-only, like the other dampers: the
+#    latch memory is dropped on every parameter/crop/reference change, and the
+#    captured still never sees it. LATCH_ON = 0 disables both.
+LIVE_MASK_LATCH_ON     = 3     # canvases lit in a row before a pixel latches
+LIVE_MASK_LATCH_OFF    = 25    # canvases dark in a row before it releases (~2.5 s)
 
 # ── Sending only what actually changed ────────────────────────────────────────
 # `_mjpeg_stream` already skips writing a frame it has written before, but it
@@ -329,8 +396,11 @@ PROJECTION_EVERY_S     = 0.0
 # Exact comparison turned out to be too sharp: one pixel flipping somewhere
 # along a groove edge forces a whole frame through, which is invisible once the
 # mask is warped and thrown across a sandbox. The dev-mode Mask/Skeleton views
-# stay EXACT — they are diagnostic, and cheap.
-PROJECTION_CHANGE_PX   = 32
+# stay EXACT — they are diagnostic, and cheap. Profiling showed the residual
+# flicker was already under 32 px against an exact compare; 64 buys extra
+# quiet at a difference that stays invisible on sand. The compare is against
+# the last frame SENT, so slow real change still accumulates and goes out.
+PROJECTION_CHANGE_PX   = 64
 
 # ── Live-view profiling (diagnostic; off by default) ──────────────────────────
 # Both live views come off ONE thread, so a slow stage delays every stage after

@@ -246,18 +246,27 @@ class TestTheReaderKeepsUpWithABusyCanvas:
 
 class TestThePipelineUsesTheMeasuredWait:
 
-    def test_both_refill_waits_come_from_the_camera_thread(self):
+    def test_every_refill_wait_comes_from_the_camera_thread(self):
         """
-        Participant Sensing and the projector blanking both wait for the SAME
-        buffer, so both must ask the same question. A hard-coded
-        DEPTH_AVERAGE_FRAMES / DEPTH_FPS in either is the bug returning.
+        Participant Sensing, the projector blanking and the start-up reference
+        capture all wait for the SAME buffer, so all of them must ask the same
+        question. A hard-coded DEPTH_AVERAGE_FRAMES / DEPTH_FPS anywhere in
+        main.py is the bug returning: those two agree only while every camera
+        frame is being caught, and the derived figure is silently too short the
+        moment one is missed.
         """
         from pathlib import Path
 
         src = Path(__file__).resolve().parents[1].joinpath("main.py").read_text(
             encoding="utf-8")
         assert "DEPTH_AVERAGE_FRAMES / DEPTH_FPS" not in src
-        assert src.count("camera_thread.refill_seconds()") == 2
+        # Every `await asyncio.sleep(...)` that waits on the buffer must name
+        # the measured value — counting call sites would just have to be
+        # bumped whenever another wait is added.
+        waits = [ln.strip() for ln in src.splitlines()
+                 if "asyncio.sleep(" in ln and "refill" in ln]
+        assert len(waits) >= 3
+        assert all("camera_thread.refill_seconds()" in ln for ln in waits)
 
     def test_the_ceiling_is_never_below_the_nominal_wait(self):
         """Otherwise the bound would shorten every wait, which is the wrong way."""

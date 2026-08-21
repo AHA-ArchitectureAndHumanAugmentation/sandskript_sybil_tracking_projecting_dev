@@ -192,13 +192,20 @@ class TestCaptureFrame:
 
 
 def _publish_once(thread, state, crop=None, trigger_mm=None,
-                  overlay=0, projection=0, depth=0.80, hand=None):
+                  overlay=0, projection=0, depth=0.80, hand=None,
+                  reference=False):
     """Run one canvas through the live-view derivation, as the loop does."""
     state["depth_overlay_clients"] = overlay
     state["projection_clients"] = projection
     if crop is not None:
         thread.set_live_crop(crop)
     thread.set_trigger_threshold(trigger_mm)
+    if reference:
+        # The empty sand, stitched to the same canvas — the baseline that
+        # gives the trigger's height-above-sand threshold its meaning.
+        clean = stitch([_frame(depth=depth, serial=s) for s in thread._serials],
+                       thread._calib, grid=thread._grid)
+        thread.set_reference(clean.depth_m)
     frames = [_frame(depth=depth, serial=s) for s in thread._serials]
     if hand is not None:
         # A hand over the LEFT camera only: a near patch big enough to trip
@@ -247,23 +254,29 @@ class TestLiveViews:
         _publish_once(thread, state, projection=0)
         assert state["last_mask_full_jpg"] is None
 
-    def test_trigger_fires_on_something_close_inside_the_crop(self):
+    def test_trigger_fires_on_something_above_sand_inside_the_crop(self):
         thread, state = _thread_with_rig()
-        _publish_once(thread, state, trigger_mm=700.0, hand=0.40)
+        # Sand at 0.80 m, hand at 0.40 m → 400 mm above the sand.
+        _publish_once(thread, state, trigger_mm=100.0, hand=0.40, reference=True)
         assert state["trigger_below"] is True
 
-    def test_trigger_ignores_something_close_outside_the_crop(self):
+    def test_trigger_ignores_something_above_sand_outside_the_crop(self):
         """Motion beside the sand must not arm Participant Mode — the crop is
         the visible region, and it is now a crop of the whole rig's canvas."""
         thread, state = _thread_with_rig()
         # Crop the RIGHT half; the hand is over the left camera.
         _publish_once(thread, state, crop=Crop(0.55, 0.0, 0.45, 1.0),
-                      trigger_mm=700.0, hand=0.40)
+                      trigger_mm=100.0, hand=0.40, reference=True)
+        assert state["trigger_below"] is False
+
+    def test_trigger_is_inert_without_a_reference(self):
+        thread, state = _thread_with_rig()
+        _publish_once(thread, state, trigger_mm=100.0, hand=0.40)
         assert state["trigger_below"] is False
 
     def test_no_trigger_distance_means_no_flag(self):
         thread, state = _thread_with_rig()
-        _publish_once(thread, state, trigger_mm=None, hand=0.40)
+        _publish_once(thread, state, trigger_mm=None, hand=0.40, reference=True)
         assert state["trigger_below"] is None
 
     def test_live_params_reach_the_groove_preview(self):

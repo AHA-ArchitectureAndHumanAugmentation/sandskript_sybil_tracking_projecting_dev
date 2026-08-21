@@ -372,8 +372,10 @@ class TestStitch:
         assert r.mm_per_px == pytest.approx(4.0)
 
     def test_auto_resolution_lands_near_native_detail(self):
+        # config.STITCH_MM_PER_PX is PINNED now, so auto must be asked for
+        # explicitly — the fallback math itself is unchanged.
         frames, calib = synthetic_scene(1)
-        r = stitch(frames, calib)
+        r = stitch(frames, calib, mm_per_px=0.0)
         fw = footprint_mm(frames[0])[0]
         assert r.mm_per_px == pytest.approx(fw / frames[0].intr.width, rel=0.05)
 

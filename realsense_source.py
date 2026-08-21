@@ -27,7 +27,8 @@ from typing import Optional
 
 import numpy as np
 
-from config import DEPTH_FPS, DEPTH_HEIGHT, DEPTH_WIDTH, STITCH_MAX_CAMERAS
+from config import (DEPTH_FPS, DEPTH_HEIGHT, DEPTH_WIDTH,
+                    REALSENSE_DEPTH_FILTERS, STITCH_MAX_CAMERAS)
 from stitcher import Intrinsics
 
 
@@ -39,6 +40,10 @@ class Camera:
     depth_scale: float          # metres per raw unit
     intr: Intrinsics
     serial: str
+    # SDK post-processing applied to every depth frame in _unpack, in order.
+    # The temporal filter keeps per-camera state inside the SDK, so these MUST
+    # be one set per Camera — sharing them across devices would blend rigs.
+    filters: tuple = ()
 
 
 def open_cameras(max_cameras: int = STITCH_MAX_CAMERAS
@@ -87,6 +92,15 @@ def open_cameras(max_cameras: int = STITCH_MAX_CAMERAS
             return [], f"cannot start camera {serial} ({exc})"
         ri = (profile.get_stream(rs.stream.depth)
               .as_video_stream_profile().get_intrinsics())
+        # Depth noise reduction at the source (SDK defaults): an edge-preserving
+        # spatial filter, then a temporal filter. The D435i's 1-2 mm per-pixel
+        # noise is the same size as the ~1.5 mm relief groove detection looks
+        # for, so cutting it here helps every consumer at once. Both are cheap
+        # (they run in the SDK on 640x480), and the temporal one is stateful —
+        # built per camera, never shared.
+        filters: tuple = ()
+        if REALSENSE_DEPTH_FILTERS:
+            filters = (rs.spatial_filter(), rs.temporal_filter())
         cameras.append(Camera(
             pipe=pipe,
             align=rs.align(rs.stream.depth),
@@ -94,6 +108,7 @@ def open_cameras(max_cameras: int = STITCH_MAX_CAMERAS
             intr=Intrinsics(fx=ri.fx, fy=ri.fy, cx=ri.ppx, cy=ri.ppy,
                             width=ri.width, height=ri.height),
             serial=serial,
+            filters=filters,
         ))
     return cameras, note
 
@@ -129,6 +144,14 @@ def _unpack(camera: Camera, frames):
     depth_frame = frames.get_depth_frame()
     if not depth_frame:
         return None
+    # Post-process the depth in the SDK before touching the pixels. Alignment
+    # maps colour ONTO depth (rs.align(rs.stream.depth)), so filtering after
+    # align changes nothing about the mapping — the depth grid is untouched.
+    for f in camera.filters:
+        try:
+            depth_frame = f.process(depth_frame)
+        except Exception:
+            break                     # a failing filter must not drop the frame
     z = np.asarray(depth_frame.get_data(), dtype=np.float32) * camera.depth_scale
     color_frame = frames.get_color_frame()
     # Copy the colour: np.asarray on a frame is a VIEW of SDK memory, and the

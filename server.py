@@ -202,6 +202,13 @@ class Server:
         # Poll rate stays 30 Hz so a new frame still goes out within ~33 ms.
         last = None
         short = key.removeprefix("last_").removesuffix("_jpg")   # readable columns
+        # Advertise this stream's audience: the camera thread reads the count to
+        # skip producing pictures nobody is connected to see (the colour warp
+        # and the depth colorize are the two big ones). Decremented in `finally`
+        # so a dropped connection can never leave the work switched on.
+        counter = key + "_clients"
+        with self._lock:
+            self._state[counter] = self._state.get(counter, 0) + 1
         try:
             while True:
                 with self._lock:
@@ -222,6 +229,9 @@ class Server:
                 await asyncio.sleep(1 / 30)
         except (ConnectionResetError, asyncio.CancelledError):
             pass
+        finally:
+            with self._lock:
+                self._state[counter] = max(self._state.get(counter, 1) - 1, 0)
         return response
 
     async def _handle_depth(self, request: web.Request) -> web.StreamResponse:
@@ -462,8 +472,9 @@ class Server:
                 # opens showing the angle the pipeline is actually using (it is
                 # restored from settings.json, not reset per window).
                 "view_rotation": rotation,
-                # Whether the trigger / ignore-closer cutoffs are heights above
-                # the sand (reference set) or absolute camera distances.
+                # Whether a reference is set — the trigger / near-object
+                # cutoffs (heights above the sand) are inert without one, and
+                # the UIs show a hint until it is captured.
                 "reference_set": ref_set,
                 "last_ip": last_ip,
                 "workspace": ws_cfg.to_browser_dict() if ws_cfg is not None else None,
@@ -698,9 +709,9 @@ class Server:
                 length_mm  = self._state.get("path_length_mm", 0.0)
                 max_len_mm = self._state.get("max_length_mm", 0.0)
                 rotation   = self._state.get("view_rotation", 0)
-                # A reference switches the trigger and the "Ignore closer than"
-                # cutoff from distance-from-camera to height-above-sand, so both
-                # UIs have to relabel their boxes when it appears or is cleared.
+                # The trigger and the "Ignore above sand" cutoff are inert
+                # without a reference, so both UIs show a set-reference hint
+                # when it is missing or cleared.
                 ref_set    = self._state.get("reference_depth") is not None
                 participant = self._participant_snapshot()
 

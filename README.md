@@ -376,7 +376,7 @@ The Developer-Mode workflow, step by step.
 
 1. **Connect** — enter the robot's IP (e.g. `192.168.1.100`) and click **Connect**.
 2. **Load the drawing target** — mesh your Rhino surface, export it as **STL/OBJ in millimetres**, and load it at the prompt. Load **more than one file** to build a multi-part target: each keeps the position it was authored at, and they then behave as a single surface that moves as one (see *Loading several surfaces*). There is no manual robot-calibration step: the surface's position relative to the robot is set with the Surface X/Y/Z + rotation sliders (or corner touch-off) and verified visually in the Path Preview.
-3. **Aim the RealSense** straight down so it covers the whole sandbox. The four viewports show **Depth** (near = blue → far = red), **RGB**, **Skeleton** (the 1-px centrelines that become the path) and **Mask** (the thick detected region — shows groove *width*, handy while tuning). The **⧉ Participant Mode** popup (Depth viewport) adds the live depth view with **absolute mm-from-camera** labels per iso-depth region (**Region interval** and **Text size** sliders; display-only, computed only while the popup is open) and holds the **Auto** toggle + **Trigger below** box that automate the pipeline — see *Participant Mode* below.
+3. **Aim the RealSense** straight down so it covers the whole sandbox. The four viewports show **Depth** (near = blue → far = red), **RGB**, **Skeleton** (the 1-px centrelines that become the path) and **Mask** (the thick detected region — shows groove *width*, handy while tuning). The **⧉ Participant Mode** popup (Depth viewport) adds the live depth view with **absolute mm-from-camera** labels per iso-depth region (**Region interval** and **Text size** sliders; display-only, computed only while the popup is open) and holds the **Auto** toggle + **Trigger above sand** box that automate the pipeline — see *Participant Mode* below.
 
    If the camera view comes out sideways relative to the sandbox, press **⟳** on the Depth viewport: each press turns the whole camera view 90° clockwise, and the button shows the current angle. This is one setting for the whole pipeline, not a display trick — **RGB, Skeleton, Mask, the projection and Participant Mode all turn with it**, the crop follows the sand it was framing, and any reference frame is turned to match. Because a still captured at the old angle would no longer line up, pressing ⟳ drops it and returns you to the live view: **rotate first, then Capture**. The angle is remembered in `settings.json`, so it survives a restart. Two things to know: the projector's corner-pin must be re-done after a turn (the projected mask is the whole, now-turned view), and the button is greyed out while Participant **Auto** is on — re-aiming mid-drawing would change what that drawing means. This is separate from the per-camera rotation in Multi-Cam Vision, which describes how one camera is mounted; use ⟳ when the whole picture needs turning and you don't want to stop the app.
 4. **Tune detection live** — the **Detection Parameters** panel works *before* capturing: pick a **Mode** (Valley / Ridge / Band) and adjust **Groove depth**, **Surface scale**, **Denoise**, **Min blob**; the viewports update in real time. Drag a **crop** rectangle on the Depth view to limit the region. **Save** stores the sliders to a dated file under `presets/`, **Load** restores one, **Reset** returns the sliders to defaults.
@@ -487,18 +487,15 @@ Pre-existing ripples/texture can look like grooves. Four independent filters (**
 
 ### Ignoring objects above the sand
 
-Detection is *relative* (mm below the local surface), so a hand raking or a person leaning over creates phantom relief. The box on the Mask viewport (always visible) drops any groove blob touching such an object, grown by a safety margin — from live views, projection and path generation alike. 0 or empty disables it.
+Detection is *relative* (mm below the local surface), so a hand raking or a person leaning over creates phantom relief. The **"Ignore above sand"** box on the Mask viewport (always visible) drops any groove blob touching such an object, grown by a safety margin — from live views, projection and path generation alike. 0 or empty disables it.
 
-What the box measures depends on whether a reference is set, and it relabels itself so you can see which:
-
-- **Reference set → "Ignore above sand"** — a height above the sand surface. Anything standing more than this many mm proud of the sand is an object. Try **30–60 mm**. This is the one to use, and the only one that works on a tilted camera.
-- **No reference → "Ignore closer than"** — an absolute distance from the camera. Set it a little nearer than the sand (read it off the Participant popup's labels).
+The value is a **height above the sand surface**: anything standing more than this many mm proud of the sand is an object. Try **30–60 mm**. It is measured against the reference frame, so it works at any camera angle — and it therefore **needs a reference**: until you press **Set Reference** the filter is inactive (the box's tooltip says so).
 
 ### Tilted cameras, and why "height above the sand" matters
 
-If the camera is mounted at an angle — as it often must be, to fit the installation — the sand itself is nearer at one end of the box than at the other. A 15° tilt across a 600 mm sandbox puts ~160 mm between the two ends. Since a hand only clears the sand by 50–150 mm, **the sand's own depth range swallows the hand's**, and no absolute cutoff can tell them apart: set it low and nothing ever fires, set it high and the near end of the *sand* trips it permanently. Both the Participant trigger and the near-object box hit this.
+If the camera is mounted at an angle — as it often must be, to fit the installation — the sand itself is nearer at one end of the box than at the other. A 15° tilt across a 600 mm sandbox puts ~160 mm between the two ends. Since a hand only clears the sand by 50–150 mm, **the sand's own depth range swallows the hand's**, and no absolute distance-from-camera cutoff could tell them apart: set it low and nothing ever fires, set it high and the near end of the *sand* trips it permanently.
 
-**Press Set Reference and the problem disappears.** A reference is a snapshot of the empty sand, so it contains the tilt; subtracting it, pixel by pixel, leaves height above the sand — 0 on untouched sand anywhere in the box, negative in a groove, strongly positive under a hand. One number then means the same thing at both ends, at any camera angle. The Participant popup's labels switch to the same units (`+90` for a hand, `−6` for a raked groove), so you can read a trigger value straight off the picture instead of guessing.
+That is why both the Participant trigger and the near-object box measure **height above the sand** — and why both need a reference. A reference is a snapshot of the empty sand, so it contains the tilt; subtracting it, pixel by pixel, leaves height above the sand — 0 on untouched sand anywhere in the box, negative in a groove, strongly positive under a hand. One number then means the same thing at both ends, at any camera angle. The Participant popup's labels use the same units (`+90` for a hand, `−6` for a raked groove), so you can read a trigger value straight off the picture instead of guessing.
 
 Worth knowing: it has to be a *per-pixel* baseline. Rescaling the depth numbers as a whole — compressing the frame's min–max into a narrower range, for instance — cannot help, because it shrinks the sand's spread and the hand's clearance by the same factor and leaves their ratio exactly as it was; a threshold picks out precisely the same pixels, just with a different number typed into the box. A tilt is a *positional* effect, so only something that knows the sand's depth *at each pixel* removes it.
 
@@ -506,26 +503,25 @@ If the sand is re-levelled deeply or the camera is bumped, capture the reference
 
 ### Participant Mode (automated pipeline)
 
-The **⧉ Participant Mode popup** replaces the buttons with a **depth trigger**: a participant rakes, pulls their hand out, and the robot retraces — no clicks. Enter a trigger threshold, then switch **Auto ON**. The box carries the same unit as the depth labels beside it, and relabels itself to say which:
+The **⧉ Participant Mode popup** replaces the buttons with a **depth trigger**: a participant rakes, pulls their hand out, and the robot retraces — no clicks. Enter a trigger threshold, then switch **Auto ON**.
 
-- **"Trigger above sand"** (a reference is set) — fires when something rises more than this many mm above the sand. Try **60–120 mm**. Unaffected by camera tilt; use this one.
-- **"Trigger below"** (no reference) — fires when something comes closer to the camera than this. Sand at 900 mm → e.g. 700. Fine on a level camera; on a tilted one see *Tilted cameras* above.
+**"Trigger above sand"** fires when something rises more than this many mm above the sand. Try **60–120 mm**. It is measured against the reference frame, so it is unaffected by camera tilt — and it **needs one**: until **Set Reference** is pressed in Developer Mode the trigger is inactive, and the popup's footer note (and the Auto status) say so. With a reference set, the depth labels beside the box carry the same unit, so a value can be read straight off the picture.
 
-Pressing **Set Reference** switches between the two, so a value tuned in one mode will be wrong in the other — the app says so when you capture a reference while a camera-distance-sized trigger is still in the box. The popup shows only the Developer-Mode crop — the labels and the trigger watch that region too; the crop itself can only be changed in Developer Mode. Statuses appear large in the popup's top-right:
+The popup shows only the Developer-Mode crop — the labels and the trigger watch that region too; the crop itself can only be changed in Developer Mode. Statuses appear large in the popup's top-right:
 
 
 | Status               | Meaning                                                           |
 | -------------------- | ----------------------------------------------------------------- |
 | **Auto Off**         | Toggle off — the popup is just the depth-number viewport.         |
-| **Auto On**          | Armed; nothing in frame is closer than the trigger.               |
-| **Alerted**          | Something closer than the trigger is in frame (a hand raking).    |
+| **Auto On**          | Armed; nothing in frame rises above the trigger height.           |
+| **Alerted**          | Something above the trigger height is in frame (a hand raking).   |
 | **Sensing**          | Frame stayed clear for ~1 s → capturing the averaged depth still. |
 | **Generating Paths** | Extracting strokes and building the toolpath.                     |
 | **Actuating**        | Saving the bundle to `paths/` and running it on the robot.        |
 | **Invalid**          | The drawing was refused — profanity guard, over the Max Total Length, or out of drawing time. Nothing saved, nothing run. |
 
 
-After Actuating it returns to **Auto On**, ready for the next participant. While Auto is **ON**, the manual Capture / Retake / Generate / Run buttons grey out (the server also refuses them) — **Cancel stays active** as the emergency stop. Worth knowing: the automated run reuses the **same pipeline and current settings** as the Developer-Mode buttons (set everything up, then flip Auto ON; the Developer window shows each step live); an empty trigger box can never fire; without a robot the toolpath is still generated and **saved**, only the run is skipped; Auto stays ON server-side even if the popup closes; Sensing deliberately waits ~1 s so the averaged still doesn't contain the hand.
+After Actuating it returns to **Auto On**, ready for the next participant. While Auto is **ON**, the manual Capture / Retake / Generate / Run buttons grey out (the server also refuses them) — **Cancel stays active** as the emergency stop. Worth knowing: the automated run reuses the **same pipeline and current settings** as the Developer-Mode buttons (set everything up, then flip Auto ON; the Developer window shows each step live); an empty trigger box — or a missing reference frame — can never fire; without a robot the toolpath is still generated and **saved**, only the run is skipped; Auto stays ON server-side even if the popup closes; Sensing deliberately waits ~1 s so the averaged still doesn't contain the hand.
 
 #### Max drawing time
 

@@ -2,8 +2,8 @@
 Participant-Mode automation state machine.
 
 Participant Mode lives in the ⧉ popup on the Depth viewport: an Auto toggle
-arms a depth trigger (a distance in mm from the camera). When anything closer
-than the trigger appears in frame the status becomes "Alerted", and once the
+arms a depth trigger (a height in mm above the sand reference). When anything
+rising above the trigger appears in frame the status becomes "Alerted", and once the
 frame stays clear for a debounce period the pipeline runs automatically —
 Sensing (capture) → Generating Paths → Actuating (save + run). While Auto is
 ON the manual Capture/Generate/Run buttons in Developer Mode are locked out.
@@ -22,8 +22,9 @@ optional ``now`` (monotonic seconds), defaulting to ``time.monotonic()``.
 
 Statuses (shown big in the popup, top-right):
   Auto Off          toggle off — popup is just the depth-number viewport
-  Auto On           armed, frame clear, watching for something below trigger
-  Alerted           something is closer than the trigger (the drawing clock runs)
+  Reference         waiting for a clear frame to capture a fresh reference
+  Auto On           armed, frame clear, watching for something above the trigger
+  Alerted           something is above the trigger height (the drawing clock runs)
   Sensing           frame cleared — capturing the averaged depth still
   Generating Paths  extracting strokes + projecting the toolpath
   Actuating         saving the bundle and running it on the robot
@@ -87,7 +88,14 @@ class ParticipantAutomation:
         self.enabled = enabled
         self._reset_clock()
         if not self.busy:
-            self.status = "Auto On" if enabled else "Auto Off"
+            # When Auto is turned on we need a fresh reference before arming.
+            self.status = "Reference" if enabled else "Auto Off"
+            self.message = ""
+
+    def reference_ready(self) -> None:
+        """Fresh reference captured — arm the trigger."""
+        if not self.busy and self.enabled and self.status in ("Reference", "Invalid"):
+            self.status = "Auto On"
             self.message = ""
 
     # ── The drawing clock ────────────────────────────────────────────────────
@@ -194,22 +202,23 @@ class ParticipantAutomation:
         self.message = message
 
     def finish(self, message: str = "") -> None:
-        """Pipeline done (or aborted): re-arm, keeping the outcome message."""
+        """Pipeline done (or aborted): capture a fresh reference, then re-arm."""
         self.busy = False
         self._reset_clock()
-        self.status = "Auto On" if self.enabled else "Auto Off"
+        # After a drawing the sand surface has changed; grab a new reference
+        # before watching for the next participant.
+        self.status = "Reference" if self.enabled else "Auto Off"
         self.message = message
 
     def reject(self, message: str = "") -> None:
         """
         The drawing was refused — by the profanity guard, by the Max Total
         Length, or by the Max Drawing Time running out. Stop before Actuating,
-        so nothing is saved and nothing is sent to the robot.
+        so nothing is saved or sent to the robot.
 
-        Unlike ``finish`` the status stays "Invalid" rather than reverting to
-        "Auto On" — the verdict has to be readable by whoever just drew it. The
-        machine is still armed (see ``_ARMED``), so the next trigger proceeds
-        normally. Toggling Auto off and on also clears it.
+        The status stays "Invalid" so the verdict is readable. The machine is
+        still armed (see ``_ARMED``), and a fresh reference is captured once the
+        frame clears so the next participant starts from the current sand state.
         """
         self.busy = False
         self._reset_clock()

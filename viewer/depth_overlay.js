@@ -29,10 +29,10 @@
   const canvas  = document.getElementById("overlay");
   const ctx     = canvas.getContext("2d");
   let labels = [];
-  // True when the numbers (and the trigger box) are HEIGHTS ABOVE THE SAND,
-  // which is what a reference frame buys: on a tilted camera the raw distance
-  // from the camera varies across the box by more than a hand's clearance, so
-  // no single absolute cutoff can separate the two. Set from the server.
+  // True when a reference frame is set: the numbers are HEIGHTS ABOVE THE
+  // SAND and the trigger is armed. False = no reference — the numbers fall
+  // back to raw camera distance (a setup aid) and the trigger is inert.
+  // Set from the server.
   let labelsRelative = false;
 
   /* ── Layout: keep a stage in the crop's aspect that fits the window ─────── */
@@ -108,23 +108,24 @@
     }, 400);
   });
 
-  /* The trigger box and the overlay numbers measure the same quantity, and
-     which quantity it is depends on whether a reference frame is set. Say so
-     in both places rather than leaving the operator to infer it from the
-     magnitudes — the two modes want values an order of magnitude apart. */
+  /* The trigger is a height above the sand and is inert until a reference
+     frame is set; the overlay numbers switch with the reference too (heights
+     above sand with one, raw camera distances without — still useful while
+     aiming the rig). Say so in both places rather than leaving the operator
+     to wonder why Auto never fires. */
   const trigLabelEl = document.querySelector('label[for="trigger"]');
   const noteEl      = document.getElementById("note");
   function setMeasurementMode(relative) {
     if (relative === labelsRelative && trigLabelEl.dataset.set) return;
     labelsRelative = !!relative;
     trigLabelEl.dataset.set = "1";
-    trigLabelEl.textContent = labelsRelative ? "Trigger above sand" : "Trigger below";
     trigLabelEl.title = labelsRelative
       ? "Fires when something rises more than this many mm ABOVE the sand surface (the reference frame). Unaffected by camera tilt — the same number means the same thing everywhere in the box."
-      : "Fires when something comes closer to the camera than this many mm. No reference frame is set, so this is a raw distance: on a tilted camera the sand's own depth range may leave no value that works. Press Set Reference in Developer Mode to switch to height above the sand.";
+      : "INACTIVE: no reference frame is set, so there is no sand baseline to measure against and the trigger can never fire. Press Set Reference (empty sand) in Developer Mode to arm it.";
     noteEl.textContent = (labelsRelative
       ? "numbers = mm above sand (0 = surface, − = groove)"
-      : "numbers = mm from camera") + " · Auto ON + trigger = automated runs";
+      : "no reference — trigger inactive · numbers = mm from camera")
+      + " · Auto ON + trigger = automated runs";
     draw();
   }
 
@@ -192,8 +193,9 @@
   const chipEl = document.getElementById("status-chip");
   const msgEl  = document.getElementById("status-msg");
   const CHIP_CLASS = {
-    "Auto Off": "off", "Auto On": "watching", "Alerted": "alerted",
-    "Sensing": "sensing", "Generating Paths": "generating", "Actuating": "actuating",
+    "Auto Off": "off", "Reference": "reference", "Auto On": "watching",
+    "Alerted": "alerted", "Sensing": "sensing", "Generating Paths": "generating",
+    "Actuating": "actuating",
     // Sticky verdict from the profanity guard — nothing was saved or run.
     "Invalid": "invalid",
   };

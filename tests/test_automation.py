@@ -6,8 +6,10 @@ from automation import ParticipantAutomation, format_duration
 
 
 def make(clear_ticks: int = 3, max_draw_s=None) -> ParticipantAutomation:
+    """Return an enabled, armed machine (reference already captured)."""
     a = ParticipantAutomation(clear_ticks=clear_ticks, max_draw_s=max_draw_s)
     a.set_enabled(True)
+    a.reference_ready()
     return a
 
 
@@ -19,8 +21,9 @@ class TestArming:
         assert a.tick(True) is False          # disabled: below is ignored
 
     def test_enable_arms_watching(self):
-        a = make()
-        assert a.status == "Auto On"
+        a = ParticipantAutomation()
+        a.set_enabled(True)
+        assert a.status == "Reference"
 
     def test_disable_returns_to_off(self):
         a = make()
@@ -28,6 +31,37 @@ class TestArming:
         a.set_enabled(False)
         assert a.status == "Auto Off"
         assert a.tick(False) is False         # no trigger after disarm
+
+
+class TestReferenceState:
+    """Reference is the pre-arming state: a fresh reference is needed."""
+
+    def test_enable_goes_to_reference(self):
+        a = ParticipantAutomation()
+        a.set_enabled(True)
+        assert a.status == "Reference"
+
+    def test_reference_not_armed(self):
+        """In Reference the trigger is ignored; we are waiting to capture."""
+        a = ParticipantAutomation()
+        a.set_enabled(True)
+        assert a.tick(True) is False
+        assert a.status == "Reference"
+
+    def test_reference_ready_arms_machine(self):
+        a = ParticipantAutomation()
+        a.set_enabled(True)
+        a.reference_ready()
+        assert a.status == "Auto On"
+
+    def test_reference_ready_clears_invalid_verdict(self):
+        a = make(clear_ticks=1)
+        a.tick(True); a.tick(False)
+        a.reject("nope")
+        assert a.status == "Invalid"
+        a.reference_ready()
+        assert a.status == "Auto On"
+        assert a.message == ""
 
 
 class TestTriggerEdge:
@@ -84,8 +118,10 @@ class TestPipelineLifecycle:
         assert a.status == "Generating Paths"
         a.stage("Actuating")
         a.finish("Done.")
-        assert a.status == "Auto On" and not a.busy
+        assert a.status == "Reference" and not a.busy
         assert a.message == "Done."
+        a.reference_ready()
+        assert a.status == "Auto On"
         a.tick(True)
         assert a.tick(False) is True          # ready for the next participant
 
@@ -139,15 +175,15 @@ class TestProfanityRejection:
         a.reject("nope")
         a.set_enabled(False)
         a.set_enabled(True)
-        assert a.status == "Auto On"
+        assert a.status == "Reference"
         assert a.message == ""
 
-    def test_finish_still_returns_to_auto_on(self):
-        """A normal run is unaffected by the new Invalid status."""
+    def test_finish_returns_to_reference(self):
+        """A normal run ends back in Reference, waiting for a fresh reference."""
         a = make(clear_ticks=1)
         a.tick(True); a.tick(False)
         a.finish("Done.")
-        assert a.status == "Auto On"
+        assert a.status == "Reference"
 
 
 class TestMaxDrawingTime:

@@ -33,6 +33,7 @@ import numpy as np
 from config import (
     GROOVE_SMOOTH_SIGMA_PX, GROOVE_DETREND_SIGMA_PX, GROOVE_DEPTH_MM,
     GROOVE_MIN_BLOB_PX, GROOVE_DETECT, GROOVE_NEAR_MARGIN_PX,
+    GROOVE_SURFACE_OPEN_PX,
     DEPTH_COLOR_NEAR_M, DEPTH_COLOR_FAR_M,
     DEPTH_FPS, DEPTH_WIDTH, DEPTH_HEIGHT, DEPTH_AVERAGE_FRAMES,
     DEPTH_LABELS_MIN_AREA_PX, DEPTH_LABELS_MAX, TRIGGER_MIN_AREA_PX,
@@ -97,8 +98,10 @@ class Crop:
 class DepthGrooveParams:
     smooth_sigma_px: float = GROOVE_SMOOTH_SIGMA_PX     # denoise the depth map first
     detrend_sigma_px: float = GROOVE_DETREND_SIGMA_PX   # blur radius for the bare surface
+    surface_open_px: int = GROOVE_SURFACE_OPEN_PX       # opening width removing grooves
+                                                        # from the surface estimate (0 = off)
     groove_depth_mm: float = GROOVE_DEPTH_MM            # mm deeper than surface = a groove
-    detect: str = GROOVE_DETECT                         # "valley" | "ridge" | "band"
+    detect: str = GROOVE_DETECT                         # "valley" | "ridge" | "band" | "relative"
     band_center_mm: float = 0.0      # for detect="band": target depth below surface
     band_width_mm: float = 1.0       # for detect="band": half-width of the accepted band
     min_blob_px: int = GROOVE_MIN_BLOB_PX              # discard specks smaller than this
@@ -110,8 +113,9 @@ class DepthGrooveParams:
     min_width_mm: float = 0.0        # drop strokes narrower than this (needs mm_per_px)
     max_width_mm: float = 0.0        # drop strokes wider than this (0 = no upper limit)
     min_length_mm: float = 0.0       # drop strokes shorter than this (needs mm_per_px)
-    ignore_closer_mm: float = 0.0    # drop mask blobs touching anything nearer the camera
-                                     # than this ABSOLUTE distance (hand/body; 0 = off)
+    ignore_closer_mm: float = 0.0    # drop mask blobs touching anything more than this
+                                     # many mm ABOVE the sand reference (hand/body;
+                                     # 0 = off; inert until a reference is set)
 
     @classmethod
     def from_dict(cls, d: dict | None) -> "DepthGrooveParams":
@@ -130,12 +134,13 @@ class DepthGrooveParams:
                 return default
 
         detect = str(d.get("detect", GROOVE_DETECT))
-        if detect not in ("valley", "ridge", "band"):
+        if detect not in ("valley", "ridge", "band", "relative"):
             detect = "valley"
 
         return cls(
             smooth_sigma_px=_f("smooth_sigma_px", GROOVE_SMOOTH_SIGMA_PX, 0.0, 10.0),
             detrend_sigma_px=_f("detrend_sigma_px", GROOVE_DETREND_SIGMA_PX, 1.0, 200.0),
+            surface_open_px=_i("surface_open_px", GROOVE_SURFACE_OPEN_PX, 0, 200),
             groove_depth_mm=_f("groove_depth_mm", GROOVE_DEPTH_MM, 0.1, 30.0),
             detect=detect,
             band_center_mm=_f("band_center_mm", 0.0, -50.0, 50.0),
@@ -150,6 +155,38 @@ class DepthGrooveParams:
             min_length_mm=_f("min_length_mm", 0.0, 0.0, 500.0),
             ignore_closer_mm=_f("ignore_closer_mm", 0.0, 0.0, 5000.0),
         )
+
+
+def near_object_mask(
+    depth_m: np.ndarray,
+    valid: np.ndarray | None,
+    reference: np.ndarray | None,
+    ignore_closer_mm: float,
+) -> np.ndarray | None:
+    """
+    Which pixels are something standing proud of the sand — a hand raking, an
+    arm leaning in. ``None`` when the filter is off or there is no usable
+    baseline to measure height against.
+
+    Exposed separately from detection because WHICH FRAME this is measured on
+    matters. It must be the RAW frame, not a time-averaged one: a still object
+    settles into a running average and reads its true height, but a MOVING one
+    only pulls each pixel part of the way before it has moved on, so it never
+    reaches the cutoff and is never rejected — which is a hand raking, i.e.
+    exactly the case the filter exists for. The live loop therefore computes
+    this once, from the raw canvas, and hands the answer to everything that
+    needs it.
+    """
+    if ignore_closer_mm <= 0:
+        return None
+    if valid is None:
+        d = np.asarray(depth_m, dtype=np.float32)
+        valid = np.isfinite(d) & (d > 0)
+    relative = surface_height_mm(depth_m, valid, reference)
+    if relative is None:
+        return None
+    height_mm, ok_ref = relative
+    return ok_ref & (height_mm > float(ignore_closer_mm))
 
 
 def _threshold_relief(
@@ -167,7 +204,8 @@ def _threshold_relief(
     if params.detect == "band":
         half = params.band_width_mm / s
         return np.abs(relief_mm - params.band_center_mm) <= half
-    return relief_mm > params.groove_depth_mm * s      # "valley" (default)
+    # "valley" and "relative" both treat positive relief as a depression.
+    return relief_mm > params.groove_depth_mm * s
 
 
 def _relief_and_base_mask(
@@ -177,12 +215,26 @@ def _relief_and_base_mask(
     reference: np.ndarray | None,
     prev_mask: np.ndarray | None = None,
     hysteresis: float = 1.0,
+    near: np.ndarray | None = None,
     timer: StageTimer = NULL_TIMER,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Shared front-end: optional reference subtraction → detrend → threshold →
-    morphological close → small-blob removal. Returns (relief_mm, base_mask_u8,
-    valid). The per-stroke consistency/length filters run on top of this.
+    Shared front-end: compute relief → threshold → morphological close →
+    small-blob removal. Returns (relief_mm, base_mask_u8, valid).
+    The per-stroke consistency/length filters run on top of this.
+
+    Two relief models are supported:
+      * detrend (valley/ridge/band): estimate a bare-sand surface from the
+        current frame and threshold the local deviation from it.
+      * relative: subtract a reference frame of the empty sand and threshold
+        the depth change directly. This is simpler and naturally cancels a
+        tilted camera, but requires a fresh reference.
+
+    ``near`` is a ready-made near-object mask (see `near_object_mask`). Pass it
+    when ``depth_m`` is NOT the frame the near test should be judged on — which
+    is the live loop's case, where detection runs on a time-averaged canvas but
+    a hand has to be found in the raw one. Omit it and the test is computed
+    from ``depth_m``, as the captured still wants.
 
     ``prev_mask`` + ``hysteresis`` add a thermostat-style deadband for the LIVE
     preview: a pixel that was already lit stays lit while its relief holds above
@@ -201,29 +253,64 @@ def _relief_and_base_mask(
         if valid is None:
             valid = np.isfinite(d) & (d > 0)
 
-        # Reference (background) subtraction: cancel pre-existing natural grooves by
-        # subtracting a baseline frame of the undrawn sand. ref_strength blends it in
-        # (0 = off, 1 = full) so its effect can be compared. The detrend below removes
-        # any constant offset this introduces, so only the spatial ripple cancels.
-        if reference is not None and params.ref_strength > 0:
+        if params.detect == "relative":
+            # Relative mode: relief = how much deeper the current frame is than
+            # the reference frame of the empty sand. Positive = a groove.
+            # A tilted camera cancels because the reference contains the same tilt.
+            if reference is None:
+                empty = np.zeros_like(d, dtype=np.uint8)
+                return np.zeros_like(d, dtype=np.float32), empty, valid
             ref = np.asarray(reference, dtype=np.float32)
-            if ref.shape == d.shape:
-                both = valid & np.isfinite(ref) & (ref > 0)
-                d[both] = d[both] - params.ref_strength * ref[both]
+            if ref.shape != d.shape:
+                empty = np.zeros_like(d, dtype=np.uint8)
+                return np.zeros_like(d, dtype=np.float32), empty, valid
+            ok = valid & np.isfinite(ref) & (ref > 0)
+            relief_mm = np.zeros_like(d, dtype=np.float32)
+            # Positive relief = current frame is deeper than the reference = a groove.
+            relief_mm[ok] = (d[ok] - ref[ok]) * 1000.0
+        else:
+            # Reference (background) subtraction: cancel pre-existing natural grooves by
+            # subtracting a baseline frame of the undrawn sand. ref_strength blends it in
+            # (0 = off, 1 = full) so its effect can be compared. The detrend below removes
+            # any constant offset this introduces, so only the spatial ripple cancels.
+            if reference is not None and params.ref_strength > 0:
+                ref = np.asarray(reference, dtype=np.float32)
+                if ref.shape == d.shape:
+                    both = valid & np.isfinite(ref) & (ref > 0)
+                    d[both] = d[both] - params.ref_strength * ref[both]
 
-        d[~valid] = np.nan
+            d[~valid] = np.nan
 
-        # Fill gaps so blurring doesn't bleed invalid pixels into the surface estimate.
-        d_filled = _fill_invalid(d)
+            # Fill gaps so blurring doesn't bleed invalid pixels into the surface estimate.
+            d_filled = _fill_invalid(d)
 
     with timer.stage("detect.blur"):
         if params.smooth_sigma_px > 0:
-            d_filled = cv2.GaussianBlur(d_filled, (0, 0), params.smooth_sigma_px)
+            if params.detect == "relative":
+                relief_mm = cv2.GaussianBlur(relief_mm, (0, 0), params.smooth_sigma_px)
+            else:
+                d_filled = cv2.GaussianBlur(d_filled, (0, 0), params.smooth_sigma_px)
 
-        # Bare-sand surface = low-frequency component. Subtract → local relief in mm.
-        # Positive = farther from the (top-down) camera = a depression = a groove.
-        surface = cv2.GaussianBlur(d_filled, (0, 0), params.detrend_sigma_px)
-        relief_mm = (d_filled - surface) * 1000.0
+        if params.detect != "relative":
+            # Bare-sand surface = low-frequency component. Subtract → local relief in mm.
+            # Positive = farther from the (top-down) camera = a depression = a groove.
+            #
+            # The surface estimate must not include the grooves themselves: a plain
+            # blur of the raw depth sinks toward the groove bottoms wherever raking
+            # is dense, so grooves there lose relief and drop under threshold even
+            # at the same physical depth as detected ones in clean sand. A grayscale
+            # OPENING (min-then-max filter) wider than a groove erases the grooves
+            # — narrow far-side excursions — before the blur, so the blur only ever
+            # sees bare sand. Ridge mode mirrors it with a CLOSING, since ridges
+            # are narrow near-side excursions.
+            base = d_filled
+            k = int(params.surface_open_px)
+            if k >= 3:
+                kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+                op = cv2.MORPH_CLOSE if params.detect == "ridge" else cv2.MORPH_OPEN
+                base = cv2.morphologyEx(d_filled, op, kern)
+            surface = cv2.GaussianBlur(base, (0, 0), params.detrend_sigma_px)
+            relief_mm = (d_filled - surface) * 1000.0
 
     with timer.stage("detect.threshold"):
         mask = _threshold_relief(relief_mm, params)
@@ -248,26 +335,25 @@ def _relief_and_base_mask(
     # detrend paints around it must not become grooves. Grows the region by a
     # safety margin, then drops every mask blob touching it.
     #
-    # With a reference the cutoff is a HEIGHT ABOVE THE SAND, which is what makes
-    # it usable on a tilted camera — an absolute distance there would reject one
-    # end of the box and nothing at the other. Without one it stays an absolute
-    # distance, as before. Either way it reads the RAW depth, never `d`, which
-    # the ref_strength blend above has already shifted.
-    if params.ignore_closer_mm > 0:
+    # The cutoff is a HEIGHT ABOVE THE SAND, measured against the reference
+    # frame — that is what makes it usable on a tilted camera, where an absolute
+    # distance would reject one end of the box and nothing at the other. Without
+    # a reference there is no sand baseline to measure against, so the filter is
+    # inert (press Set Reference to arm it). It reads the RAW depth, never `d`,
+    # which the ref_strength blend above has already shifted — and never a
+    # time-averaged one either, which is why `near` can be supplied (a moving
+    # hand never settles into an average, so it would never clear the cutoff).
+    if near is None and params.ignore_closer_mm > 0:
         with timer.stage("detect.near"):
-            relative = surface_height_mm(depth_m, valid, reference)
-            if relative is not None:
-                height_mm, ok_ref = relative
-                near = ok_ref & (height_mm > params.ignore_closer_mm)
-            else:
-                near = valid & (np.asarray(depth_m, np.float32)
-                                < params.ignore_closer_mm / 1000.0)
-            if near.any():
-                k = 2 * GROOVE_NEAR_MARGIN_PX + 1
-                near_u8 = cv2.dilate(
-                    near.astype(np.uint8),
-                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-                mask_u8 = _remove_touching(mask_u8, near_u8)
+            near = near_object_mask(depth_m, valid, reference,
+                                    params.ignore_closer_mm)
+    if near is not None and near.shape == mask_u8.shape and near.any():
+        with timer.stage("detect.near"):
+            k = 2 * GROOVE_NEAR_MARGIN_PX + 1
+            near_u8 = cv2.dilate(
+                near.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+            mask_u8 = _remove_touching(mask_u8, near_u8)
 
     return relief_mm, mask_u8, valid
 
@@ -335,6 +421,7 @@ def grooves_and_mask(
     mm_per_px: float | None = None,
     prev_mask: np.ndarray | None = None,
     hysteresis: float = 1.0,
+    near: np.ndarray | None = None,
     timer: StageTimer = NULL_TIMER,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -345,11 +432,13 @@ def grooves_and_mask(
 
     ``prev_mask`` + ``hysteresis`` are the live preview's anti-flicker deadband
     (see `_relief_and_base_mask`); both default to off, so a Capture is judged
-    on its own frame alone. ``timer`` is diagnostic only, and records under
+    on its own frame alone. ``near`` is a ready-made near-object mask for the
+    same reason — the live loop finds hands in the raw frame, not in the
+    averaged one it detects on. ``timer`` is diagnostic only, and records under
     "detect.*" so the report nests it inside the caller's own `detect` stage.
     """
     relief_mm, base, _valid = _relief_and_base_mask(
-        depth_m, valid, params, reference, prev_mask, hysteresis, timer)
+        depth_m, valid, params, reference, prev_mask, hysteresis, near, timer)
     with timer.stage("detect.skeleton"):
         skel = _skeletonize(base)
     with timer.stage("detect.filters"):
@@ -439,10 +528,11 @@ def surface_height_mm(
     threshold test, exactly where it was.
 
     None means "no usable baseline" (no reference captured, or one whose shape
-    no longer matches because the canvas was turned or re-frozen). Every caller
-    treats that as "fall back to absolute distance" — the behaviour before a
-    reference existed. A tilted rig without a reference is a worse trigger,
-    never a broken one.
+    no longer matches because the canvas was turned or re-frozen). The presence
+    trigger and the near-object filter treat that as "inert" — both thresholds
+    are heights above the sand and mean nothing without one — while the display
+    labels (`depth_region_labels`) fall back to absolute camera distance, which
+    is still readable during setup.
     """
     if reference is None:
         return None
@@ -470,25 +560,19 @@ def presence_trigger(
     pixels read as "something is there". The area minimum keeps sensor speckle
     from firing.
 
-    Two modes, and which one runs depends only on whether a reference frame is
-    available (see ``surface_height_mm``):
-
-      * WITH a reference — ``threshold_mm`` is a height ABOVE THE SAND. Immune
-        to camera tilt, and the number means the same thing everywhere in the
-        box. This is the mode to use.
-      * without one — ``threshold_mm`` is an absolute distance from the camera,
-        as before. Works on a level rig; on a tilted one the sand's own depth
-        range eats the margin a hand would have provided.
+    ``threshold_mm`` is a height ABOVE THE SAND, measured against the reference
+    frame (see ``surface_height_mm``) — immune to camera tilt, and the number
+    means the same thing everywhere in the box. Without a usable reference
+    there is no sand baseline to measure against, so the trigger never fires:
+    capture one with Set Reference before arming Participant Mode.
     """
     if threshold_mm is None or threshold_mm <= 0:
         return False
     relative = surface_height_mm(depth_m, valid, reference)
-    if relative is not None:
-        height_mm, ok = relative
-        hit = ok & (height_mm > threshold_mm)
-    else:
-        hit = (np.asarray(valid, dtype=bool)
-               & (np.asarray(depth_m, dtype=np.float32) < threshold_mm / 1000.0))
+    if relative is None:
+        return False
+    height_mm, ok = relative
+    hit = ok & (height_mm > threshold_mm)
     return int(np.count_nonzero(hit)) >= int(min_px)
 
 
@@ -507,14 +591,15 @@ def depth_region_labels(
     ``depth_m`` array — the caller passes the cropped region, so labels are
     crop-relative).
 
-    What ``mm`` measures follows the trigger, so the operator reads the numbers
-    in the same units they type into the trigger box:
+    What ``mm`` measures:
 
-      * WITH a reference — height above the sand: ~0 on untouched sand,
-        negative in a groove, strongly positive on a hand. On a tilted rig this
-        is the only readable version, since absolute distance would just paint
-        the camera's tilt across the picture.
-      * without one — distance from the camera, as before.
+      * WITH a reference — height above the sand, the same unit the trigger
+        box uses: ~0 on untouched sand, negative in a groove, strongly
+        positive on a hand. On a tilted rig this is the only readable version,
+        since absolute distance would just paint the camera's tilt across the
+        picture.
+      * without one — distance from the camera. The trigger is inert in that
+        state, but raw distances are still useful while aiming the rig.
 
     Reference display only — never feeds path generation. Runs at half
     resolution for speed; regions smaller than ``min_area_px`` (half-res px)

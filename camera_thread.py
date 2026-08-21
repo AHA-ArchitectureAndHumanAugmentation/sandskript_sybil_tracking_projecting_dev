@@ -8,16 +8,17 @@ import numpy as np
 
 from config import (
     CAMERA_LIMIT, CAMERA_POLL_IDLE_S, CAPTURE_REFILL_MAX_S,
-    DEPTH_AVERAGE_FRAMES, DEPTH_FPS, DEPTH_LABELS_EVERY,
-    DEPTH_LABELS_INTERVAL_MM,
+    DEPTH_AVERAGE_FRAMES, DEPTH_COLOR_RANGE_ALPHA, DEPTH_FPS,
+    DEPTH_LABELS_EVERY, DEPTH_LABELS_INTERVAL_MM,
     LIVE_DEPTH_EMA_ALPHA, LIVE_DEPTH_HOLD_CYCLES, LIVE_GROOVE_EVERY,
-    LIVE_MASK_HYSTERESIS, PROFILE_EVERY_S, PROFILE_PIPELINE,
+    LIVE_MASK_HYSTERESIS, LIVE_MASK_LATCH_OFF, LIVE_MASK_LATCH_ON,
+    PROFILE_EVERY_S, PROFILE_PIPELINE,
     PROJECTION_CHANGE_PX, PROJECTION_EVERY_S, PROJECTION_KEEPALIVE_S,
     STITCH_MAIN_BIND_TIMEOUT_S, STITCH_MAIN_EVERY_S, STITCH_MAX_CAMERAS,
 )
 from depth_extractor import (
     Crop, DepthGrooveParams, colorize_depth, depth_region_labels,
-    grooves_and_mask, encode_jpeg, presence_trigger,
+    grooves_and_mask, encode_jpeg, near_object_mask, presence_trigger,
 )
 from profiling import StageTimer
 import realsense_source
@@ -35,6 +36,9 @@ _LIVE_GROOVE_EVERY = max(int(LIVE_GROOVE_EVERY), 1)
 _EMA_ALPHA = min(max(float(LIVE_DEPTH_EMA_ALPHA), 0.0), 1.0)
 _HOLD_CYCLES = max(int(LIVE_DEPTH_HOLD_CYCLES), 0)
 _HYSTERESIS = min(max(float(LIVE_MASK_HYSTERESIS), 0.0), 1.0)
+_LATCH_ON = max(int(LIVE_MASK_LATCH_ON), 0)
+_LATCH_OFF = max(int(LIVE_MASK_LATCH_OFF), 1)
+_RANGE_ALPHA = min(max(float(DEPTH_COLOR_RANGE_ALPHA), 0.0), 1.0)
 _PROJ_EVERY_S = max(float(PROJECTION_EVERY_S), 0.0)
 _PROJ_CHANGE_PX = max(int(PROJECTION_CHANGE_PX), 0)
 # How many cameras to open. config.CAMERA_LIMIT is a diagnostic cap (0 = all),
@@ -130,6 +134,16 @@ class DepthCameraThread:
         self._ok_avg: Optional[np.ndarray] = None
         self._stale: Optional[np.ndarray] = None
         self._prev_mask: Optional[np.ndarray] = None
+        # The latch (config.LIVE_MASK_LATCH_*): per-pixel counts of consecutive
+        # detected / undetected canvases, and which pixels are currently held
+        # lit. Third damper on the projected mask, after the EMA and the
+        # hysteresis — and like them live-only.
+        self._lit: Optional[np.ndarray] = None
+        self._unlit: Optional[np.ndarray] = None
+        self._latched: Optional[np.ndarray] = None
+        # Smoothed auto colormap range (near_m, far_m) so the depth view's
+        # colours stop breathing with per-frame noise when the range is auto.
+        self._auto_range: Optional[tuple[float, float]] = None
         # The last PICTURE actually encoded for each mask-family stream, with
         # when it went out — so a view that is holding still is encoded once and
         # then left alone instead of being rebuilt every canvas.
@@ -198,8 +212,12 @@ class DepthCameraThread:
         reference — so a slider takes effect on the very next frame instead of
         being argued with by a mask holding on to the old answer, and so the
         first frame after the change is always encoded and pushed.
+
+        The latch counts go with it: pixels held lit under the OLD parameters
+        must not survive into the new ones.
         """
         self._prev_mask = None
+        self._lit = self._unlit = self._latched = None
         self._sent = {}
 
     def set_live_params(self, params: DepthGrooveParams) -> None:
@@ -226,7 +244,7 @@ class DepthCameraThread:
         self._label_interval_mm = interval_mm
 
     def set_trigger_threshold(self, mm: Optional[float]) -> None:
-        """Participant-Mode trigger distance (mm from camera); None disables."""
+        """Participant-Mode trigger height (mm above the sand reference); None disables."""
         self._trigger_mm = mm
 
     def set_view_rotation(self, deg) -> int:
@@ -406,6 +424,7 @@ class DepthCameraThread:
         self._calib = StitchCalib()
         self._cached = (None, None, None)
         self._z_avg = self._ok_avg = self._stale = None
+        self._auto_range = None
         self._forget_live_mask()
         self._frames_read = 0
         with self._frame_lock:
@@ -458,9 +477,17 @@ class DepthCameraThread:
 
                 if self._grid is None:
                     self._bind_calib(frames)
+                # Place the colour images only when something is looking at
+                # them: the colour warp is the single most expensive step of
+                # the whole cycle (about a third of it, profiled), and grooves
+                # are detected from depth alone. `_mjpeg_stream` counts the
+                # /rgb view's clients in shared state; Capture stitches its own
+                # frames and always gets colour.
+                with self._state_lock:
+                    rgb_on = self._state.get("last_rgb_jpg_clients", 0) > 0
                 with self._timer.stage("stitch"):
                     result = stitch(frames, self._calib, grid=self._grid,
-                                    timer=self._timer)
+                                    want_rgb=rgb_on, timer=self._timer)
                 if self._grid is None:
                     self._grid = CanvasGrid.from_result(result)
                     gh, gw = result.depth_m.shape[:2]
@@ -517,7 +544,8 @@ class DepthCameraThread:
                 for key in ("last_depth_color_jpg", "last_depth_crop_jpg", "last_rgb_jpg",
                             "last_groove_jpg", "last_mask_jpg", "last_mask_full_jpg",
                             "depth_labels", "depth_labels_size",
-                            "depth_labels_relative", "trigger_below"):
+                            "depth_labels_relative", "reference_active",
+                            "trigger_below"):
                     self._state[key] = None
             with self._frame_lock:
                 self._buffers = []
@@ -527,7 +555,8 @@ class DepthCameraThread:
             self._forget_live_mask()
             print("[depth] stopped")
 
-    def _steady_depth(self, z: np.ndarray, ok: np.ndarray
+    def _steady_depth(self, z: np.ndarray, ok: np.ndarray,
+                      hold: Optional[np.ndarray] = None
                       ) -> tuple[np.ndarray, np.ndarray]:
         """
         A running average of the canvas depth, for DETECTION only.
@@ -546,6 +575,14 @@ class DepthCameraThread:
         A pixel the sensor drops keeps its last value for a few cycles instead
         of punching a hole in the mask — but only a few, so a camera that dies
         still blanks its part of the canvas rather than showing a fossil.
+
+        ``hold`` marks pixels where something is standing above the sand (a
+        hand). Those are frozen: the average keeps the last SAND value it had
+        rather than blending the hand into it. Without this a hand sweeping
+        across drags every pixel it crosses part of the way toward itself,
+        which both paints phantom relief where there is no groove and leaves a
+        trail behind the hand for as long as the average takes to recover.
+        Occlusion is not a reading, so it is not averaged in.
         """
         # 1.0 = off. 0 would mean "never take a new reading", which is not a
         # smoother but a freeze, so it is treated as off too.
@@ -558,18 +595,102 @@ class DepthCameraThread:
             self._stale = np.zeros(z.shape, np.uint8)
             return self._z_avg, self._ok_avg
 
-        both = ok & prev_ok
+        # A held pixel contributes nothing this cycle: not blended, not seeded,
+        # and not counted as missing either — we know why we cannot see it.
+        fed = ok if (hold is None or hold.shape != z.shape) else (ok & ~hold)
+
+        both = fed & prev_ok
         prev[both] += _EMA_ALPHA * (z[both] - prev[both])
-        fresh = ok & ~prev_ok
+        fresh = fed & ~prev_ok
         prev[fresh] = z[fresh]                 # nothing to blend with yet
 
         # Count how long each pixel has been missing, saturating rather than
         # wrapping — a uint8 rolling 255 → 0 would resurrect a dead camera.
-        stale[ok] = 0
-        grew = ~ok & (stale < 255)
+        seen = fed if hold is None or hold.shape != z.shape else (fed | hold)
+        stale[seen] = 0
+        grew = ~seen & (stale < 255)
         stale[grew] += 1
-        self._ok_avg = (prev_ok | ok) & (stale <= _HOLD_CYCLES)
+        self._ok_avg = (prev_ok | fed) & (stale <= _HOLD_CYCLES)
         return prev, self._ok_avg
+
+    def _latch_mask(self, raw: np.ndarray,
+                    near: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Third steadiness damper (config.LIVE_MASK_LATCH_*), after the depth EMA
+        and the hysteresis: a pixel detected for LATCH_ON consecutive canvases
+        is held lit until it has been UNdetected for LATCH_OFF consecutive
+        canvases. A raked groove cannot un-rake itself between robot passes, so
+        a region that has settled is provably static — which is also what lets
+        the projector's change-gate hold its frame instead of re-sending edge
+        noise. Sand that really is smoothed over still clears, LATCH_OFF
+        canvases late.
+
+        Returns the mask to PUBLISH. The hysteresis keeps feeding on the raw
+        mask (the caller stores that separately), so the two dampers cannot
+        feed back into each other. `_forget_live_mask` drops the counts on
+        every parameter/crop/reference change, and `capture_frame` never comes
+        through here — the captured still is judged on its own frame alone.
+
+        ``near`` marks pixels a hand is standing over. Their counts are FROZEN
+        rather than advanced: the sand under a hand is unknown, so it must not
+        latch (a hand is not a groove) and must not release either (a groove
+        the hand happens to cross would otherwise blink out and have to earn
+        its latch back once the hand passed). Nothing under a near object is
+        published, so the projector never paints on a participant's arm — and
+        the groove reappears the instant the hand moves off it.
+        """
+        if _LATCH_ON <= 0:
+            return raw if near is None else np.where(
+                (raw > 0) & ~near, np.uint8(255), np.uint8(0))
+        on = raw > 0
+        if self._lit is None or self._lit.shape != on.shape:
+            # uint32: an installation runs all day, and a uint16 lit-counter
+            # would wrap after ~1.8 h of one pixel staying detected at 10 Hz.
+            self._lit = np.zeros(on.shape, np.uint32)
+            self._unlit = np.zeros(on.shape, np.uint32)
+            self._latched = np.zeros(on.shape, bool)
+        lit, unlit, latched = self._lit, self._unlit, self._latched
+        frozen = near if (near is not None and near.shape == on.shape) else None
+        live = np.ones(on.shape, bool) if frozen is None else ~frozen
+
+        rising, falling = on & live, ~on & live
+        lit[rising] += 1
+        lit[falling] = 0
+        unlit[falling] += 1
+        unlit[rising] = 0
+        latched |= (lit >= _LATCH_ON) & live
+        latched &= ~((unlit >= _LATCH_OFF) & live)
+        out = latched | on
+        if frozen is not None:
+            out = out & ~frozen
+        return np.where(out, np.uint8(255), np.uint8(0))
+
+    def _smoothed_range(self, z: np.ndarray, ok: np.ndarray
+                        ) -> tuple[float, float]:
+        """
+        The auto colormap range (2nd-98th percentile of valid depth), smoothed
+        over canvases. Recomputing it per frame made the whole depth view
+        breathe with sensor noise and re-colour itself the moment a hand
+        entered; the EMA keeps the ramp steady while still tracking a real
+        scene change within a couple of seconds. Explicit near/far params
+        bypass this entirely.
+        """
+        vals = z[ok]
+        if vals.size:
+            near = float(np.percentile(vals, 2.0))
+            far = float(np.percentile(vals, 98.0))
+        elif self._auto_range is not None:
+            return self._auto_range
+        else:
+            return 0.0, 1.0
+        prev = self._auto_range
+        if prev is not None and 0.0 < _RANGE_ALPHA < 1.0:
+            near = prev[0] + _RANGE_ALPHA * (near - prev[0])
+            far = prev[1] + _RANGE_ALPHA * (far - prev[1])
+        if far <= near:
+            far = near + 1e-3
+        self._auto_range = (near, far)
+        return near, far
 
     def _needs_resend(self, key: str, picture: np.ndarray, now: float,
                       min_interval: float = 0.0, tol_px: int = 0) -> bool:
@@ -630,16 +751,38 @@ class DepthCameraThread:
 
         # The baseline sand, cropped to match — the ONE thing that lets the
         # trigger, the depth labels and near-object rejection all speak in
-        # height above the sand instead of distance from the camera, which is
-        # what a tilted rig needs. None (no reference, or a stale shape after a
-        # view rotation) simply means every one of them falls back to absolute.
+        # height above the sand, which is what a tilted rig needs. None (no
+        # reference, or a stale shape after a view rotation) means the trigger
+        # and near-object rejection are inert; only the depth labels fall back
+        # to absolute distance, as a setup aid.
         ref = self._reference
-        ref_sub = (ref[y0:y1, x0:x1]
-                   if (ref is not None and ref.shape == z.shape) else None)
+        ref_full = ref if (ref is not None and ref.shape == z.shape) else None
+        ref_sub = None if ref_full is None else ref_full[y0:y1, x0:x1]
+        # Whether height-above-sand is actually in force, for the UIs: a
+        # reference of the WRONG SHAPE (the canvas was re-frozen at a new size
+        # under it) is no reference at all, and silently reading as absolute
+        # distance is exactly the confusion this flag exists to prevent.
+        with self._state_lock:
+            self._state["reference_active"] = ref_full is not None
+
+        # Where is something standing above the sand? Found in the RAW canvas,
+        # once, and reused by everything below. It must not come from the
+        # steadied depth: a still object settles into that average and reads
+        # its true height, but a MOVING one — a hand raking, the case the
+        # filter exists for — never gets there before it has moved on.
+        with self._timer.stage("near"):
+            near_full = near_object_mask(z, ok, ref_full,
+                                         params.ignore_closer_mm)
 
         # Colorized depth (FULL canvas — the crop box overlays it client-side).
+        # Always produced: it is the operator's ground truth, and its presence
+        # in shared state is what /status reports as camera_streaming. When the
+        # range is auto, use the SMOOTHED percentiles so the ramp holds still.
         with self._timer.stage("colorize"):
-            color = colorize_depth(z, ok, params.near_m, params.far_m)
+            near, far = params.near_m, params.far_m
+            if near <= 0.0 or far <= 0.0:
+                near, far = self._smoothed_range(z, ok)
+            color = colorize_depth(z, ok, near, far)
         with self._timer.stage("encode_depth"):
             ok_color, color_jpg = cv2.imencode(
                 ".jpg", color, [cv2.IMWRITE_JPEG_QUALITY, 80])
@@ -668,15 +811,21 @@ class DepthCameraThread:
             # Detection alone runs on the STEADIED depth and remembers the last
             # mask, the two dampers that stop the projected picture shimmering.
             # Both are live-only: nothing here reaches `capture_frame`.
+            near_sub = None if near_full is None else near_full[y0:y1, x0:x1]
             with self._timer.stage("steady"):
-                z_det, ok_det = self._steady_depth(z, ok)
+                z_det, ok_det = self._steady_depth(z, ok, near_full)
             with self._timer.stage("detect"):
                 mask, skel = grooves_and_mask(
                     z_det[y0:y1, x0:x1], ok_det[y0:y1, x0:x1], params, ref_sub,
                     self._mm_per_px, self._prev_mask, _HYSTERESIS,
-                    timer=self._timer,
+                    near=near_sub, timer=self._timer,
                 )
+            # Hysteresis feeds on the RAW detection; the latch sits on top and
+            # is what the Mask view and the projector actually show. The
+            # skeleton stays raw — it is diagnostic, and the robot's path never
+            # comes from the live loop anyway.
             self._prev_mask = mask
+            mask = self._latch_mask(mask, near_sub)
 
             # Encode only what actually changed. Leaving the cached JPEG in
             # place is the whole mechanism: `_mjpeg_stream` compares the object,
@@ -749,9 +898,8 @@ class DepthCameraThread:
 
         # Participant-Mode trigger: is anything there? One vectorized compare per
         # canvas. Watches ONLY the cropped region — the popup shows just the
-        # crop, so motion outside it must not arm/hold it. With a reference the
-        # threshold is a height above the sand (tilt-proof); without one it is
-        # the old absolute distance from the camera.
+        # crop, so motion outside it must not arm/hold it. The threshold is a
+        # height above the sand (tilt-proof); without a reference it never fires.
         thr = self._trigger_mm
         with self._timer.stage("trigger"):
             trigger_below = (presence_trigger(z[y0:y1, x0:x1], ok[y0:y1, x0:x1], thr,

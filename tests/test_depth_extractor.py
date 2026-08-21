@@ -93,6 +93,49 @@ class TestGroovesFromDepth:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# detect="relative" mode
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRelativeMode:
+    """Relative mode subtracts a reference frame instead of estimating a surface."""
+
+    def test_relative_detects_groove_against_reference(self, depth_with_groove, flat_depth):
+        params = DepthGrooveParams(detect="relative", groove_depth_mm=1.0)
+        out = grooves_from_depth(depth_with_groove, params=params, reference=flat_depth)
+        assert out.max() == 255
+        ys = np.where(out > 0)[0]
+        assert 230 <= ys.mean() <= 250
+
+    def test_relative_no_groove_when_current_matches_reference(self, flat_depth):
+        params = DepthGrooveParams(detect="relative")
+        out = grooves_from_depth(flat_depth, params=params, reference=flat_depth)
+        assert int(out.sum()) == 0
+
+    def test_relative_no_groove_without_reference(self, depth_with_groove):
+        params = DepthGrooveParams(detect="relative")
+        out = grooves_from_depth(depth_with_groove, params=params, reference=None)
+        assert int(out.sum()) == 0
+
+    def test_relative_cancels_tilted_camera(self):
+        # Sand surface ramps from 0.70 m to 0.90 m across the frame.
+        h, w = 480, 640
+        ref = np.tile(np.linspace(0.70, 0.90, w, dtype=np.float32), (h, 1))
+        cur = ref.copy()
+        # Carve a 3 mm deep groove relative to the sloped reference.
+        cur[235:245, 100:500] = ref[235:245, 100:500] + 0.003
+        params = DepthGrooveParams(detect="relative", groove_depth_mm=1.0)
+        out = grooves_from_depth(cur, params=params, reference=ref)
+        assert out.max() == 255
+        ys = np.where(out > 0)[0]
+        assert 230 <= ys.mean() <= 250
+
+    def test_relative_from_dict(self):
+        p = DepthGrooveParams.from_dict({"detect": "relative", "groove_depth_mm": 2.0})
+        assert p.detect == "relative"
+        assert p.groove_depth_mm == 2.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # colorize_depth
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -265,30 +308,44 @@ class TestNaturalGrooveRejection:
         assert DepthGrooveParams.from_dict(
             {"ignore_closer_mm": 280}).ignore_closer_mm == 280.0
 
-    def test_ignore_closer_drops_blobs_touching_near_object(self):
-        # Sand at 0.30 m with two grooves; a hand-like object hovers at 0.25 m
-        # over the left groove. The phantom relief the object creates — and the
-        # groove it touches — must vanish; the far groove must survive.
-        d = np.full((480, 640), 0.30, dtype=np.float32)
+    def test_ignore_above_drops_blobs_touching_near_object(self):
+        # Sand at 0.30 m with two grooves; a hand-like object hovers 50 mm
+        # above the sand over the left groove. The phantom relief the object
+        # creates — and the groove it touches — must vanish; the far groove
+        # must survive.
+        sand = np.full((480, 640), 0.30, dtype=np.float32)
+        d = sand.copy()
         cv2.line(d, (60, 100), (300, 100), 0.303, 4)     # groove under the hand
         cv2.line(d, (100, 350), (500, 350), 0.303, 4)    # groove far from it
-        cv2.rectangle(d, (140, 60), (220, 130), 0.25, -1)  # object 50 mm closer
+        cv2.rectangle(d, (140, 60), (220, 130), 0.25, -1)  # object 50 mm above
 
         p_off = DepthGrooveParams()
-        base = grooves_from_depth(d, params=p_off)
+        base = grooves_from_depth(d, params=p_off, reference=sand)
         assert _has_row(base, 100) and _has_row(base, 350)
 
-        p_on = DepthGrooveParams(ignore_closer_mm=280.0)   # sand 300 > 280 > hand 250
-        filt = grooves_from_depth(d, params=p_on)
+        p_on = DepthGrooveParams(ignore_closer_mm=40.0)    # hand is 50 mm up
+        filt = grooves_from_depth(d, params=p_on, reference=sand)
         assert not _has_row(filt, 100)                    # touched groove removed
         assert _has_row(filt, 350)                        # distant groove kept
 
-    def test_ignore_closer_ignores_scene_beyond_cutoff(self):
-        # Cutoff nearer than everything in frame → no effect at all.
-        d = np.full((480, 640), 0.30, dtype=np.float32)
+    def test_ignore_above_ignores_scene_below_cutoff(self):
+        # Nothing rises above the cutoff → no effect at all.
+        sand = np.full((480, 640), 0.30, dtype=np.float32)
+        d = sand.copy()
         cv2.line(d, (100, 240), (500, 240), 0.303, 4)
+        a = grooves_from_depth(d, params=DepthGrooveParams(), reference=sand)
+        b = grooves_from_depth(d, params=DepthGrooveParams(ignore_closer_mm=40.0),
+                               reference=sand)
+        assert (a == b).all()
+
+    def test_ignore_above_is_inert_without_a_reference(self):
+        # No reference → no sand baseline → the filter must do nothing, even
+        # with an object plainly hovering in frame.
+        d = np.full((480, 640), 0.30, dtype=np.float32)
+        cv2.line(d, (60, 100), (300, 100), 0.303, 4)
+        cv2.rectangle(d, (140, 60), (220, 130), 0.25, -1)  # 50 mm above sand
         a = grooves_from_depth(d, params=DepthGrooveParams())
-        b = grooves_from_depth(d, params=DepthGrooveParams(ignore_closer_mm=200.0))
+        b = grooves_from_depth(d, params=DepthGrooveParams(ignore_closer_mm=40.0))
         assert (a == b).all()
 
 
@@ -382,26 +439,20 @@ class TestTiltedCameraTrigger:
     The failure that motivated height-above-sand triggering, and its fix.
 
     With a tilted camera the sand spans more depth than a hand does, so an
-    absolute cutoff either fires on the near end of the SAND or misses a hand
-    over the far end. Measuring against a reference frame removes the ramp,
-    because the reference contains it.
+    absolute distance-from-camera cutoff could never separate the two.
+    The trigger therefore measures against a reference frame only — and is
+    deliberately inert without one.
     """
 
-    def test_absolute_trigger_fires_on_the_bare_tilted_sand(self):
-        sand = _tilted_sand()
-        ok = np.ones_like(sand, bool)
-        # High enough to see a hand at the far (900 mm) end…
-        assert presence_trigger(sand, ok, threshold_mm=850.0) is True  # …and the sand fires
-
-    def test_absolute_trigger_misses_a_hand_at_the_far_end(self):
+    def test_no_reference_means_no_trigger(self):
         sand = _tilted_sand()
         frame = sand.copy()
         frame[100:300, 500:600] -= 0.08          # a hand 80 mm above the far sand
         ok = np.ones_like(frame, bool)
-        # Low enough not to fire on the bare sand (nearest sand is 700 mm)…
-        assert presence_trigger(sand, ok, threshold_mm=690.0) is False
-        # …but then the hand at the far end is invisible too. No value works.
-        assert presence_trigger(frame, ok, threshold_mm=690.0) is False
+        # Without a baseline there is nothing to measure heights against, so
+        # neither the bare sand nor the hand may ever fire the trigger.
+        assert presence_trigger(sand, ok, threshold_mm=40.0) is False
+        assert presence_trigger(frame, ok, threshold_mm=40.0) is False
 
     def test_reference_relative_trigger_sees_the_hand_and_ignores_the_sand(self):
         sand = _tilted_sand()
@@ -430,17 +481,16 @@ class TestTiltedCameraTrigger:
         ok = np.ones_like(frame, bool)
         assert presence_trigger(frame, ok, threshold_mm=40.0, reference=sand) is False
 
-    def test_a_mismatched_reference_falls_back_to_absolute(self):
+    def test_a_mismatched_reference_disables_the_trigger(self):
         """
-        A stale reference (wrong shape after a view rotation) must not disable
-        the trigger — it drops back to the absolute test it used before.
+        A stale reference (wrong shape after a view rotation) is no baseline
+        at all — the trigger must go inert rather than fire on bad numbers.
         """
         z = np.full((480, 640), 0.9, np.float32)
-        z[100:200, 100:200] = 0.5
+        z[100:200, 100:200] = 0.5                # a "hand" 400 mm up
         ok = np.ones_like(z, bool)
         stale = np.full((640, 480), 0.9, np.float32)
-        assert presence_trigger(z, ok, threshold_mm=700.0, reference=stale) is True
-        assert presence_trigger(z, ok, threshold_mm=400.0, reference=stale) is False
+        assert presence_trigger(z, ok, threshold_mm=100.0, reference=stale) is False
 
 
 class TestSurfaceHeight:
@@ -536,26 +586,30 @@ class TestIgnoreCloserRelative:
         assert not mask[100:300, 500:600].any()
 
     def test_hand_in_frame_triggers(self):
-        z = np.full((480, 640), 0.9, np.float32)           # sand at 900 mm
-        z[100:200, 100:200] = 0.5                          # hand at 500 mm
+        sand = np.full((480, 640), 0.9, np.float32)        # sand at 900 mm
+        z = sand.copy()
+        z[100:200, 100:200] = 0.5                          # hand 400 mm above it
         ok = np.ones_like(z, bool)
-        assert presence_trigger(z, ok, threshold_mm=700.0) is True
+        assert presence_trigger(z, ok, threshold_mm=100.0, reference=sand) is True
 
     def test_clear_frame_does_not_trigger(self):
-        z = np.full((480, 640), 0.9, np.float32)
-        ok = np.ones_like(z, bool)
-        assert presence_trigger(z, ok, threshold_mm=700.0) is False
+        sand = np.full((480, 640), 0.9, np.float32)
+        ok = np.ones_like(sand, bool)
+        assert presence_trigger(sand, ok, threshold_mm=100.0, reference=sand) is False
 
     def test_speckle_below_min_area_ignored(self):
-        z = np.full((480, 640), 0.9, np.float32)
+        sand = np.full((480, 640), 0.9, np.float32)
+        z = sand.copy()
         z[0:5, 0:5] = 0.3                                  # 25 px of near noise
         ok = np.ones_like(z, bool)
-        assert presence_trigger(z, ok, threshold_mm=700.0, min_px=150) is False
+        assert presence_trigger(z, ok, threshold_mm=100.0, min_px=150,
+                                reference=sand) is False
 
     def test_invalid_pixels_do_not_count(self):
-        z = np.zeros((480, 640), np.float32)               # 0 m would read as "near"
+        sand = np.full((480, 640), 0.9, np.float32)
+        z = np.zeros((480, 640), np.float32)               # 0 m would read as "high"
         ok = np.zeros_like(z, bool)                        # …but nothing is valid
-        assert presence_trigger(z, ok, threshold_mm=700.0) is False
+        assert presence_trigger(z, ok, threshold_mm=100.0, reference=sand) is False
 
     def test_disabled_threshold(self):
         z = np.full((480, 640), 0.1, np.float32)

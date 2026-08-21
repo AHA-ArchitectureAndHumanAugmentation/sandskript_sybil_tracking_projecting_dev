@@ -545,6 +545,7 @@ function restoreSessionSettings(data) {
   // The canvas turn is a rig property restored from settings.json, not a
   // per-window one — show the angle the pipeline is actually using.
   showViewRotation(data.view_rotation);
+  applyDetectModeVisibility();
 }
 
 function applyWorkspace(ws) {
@@ -1112,7 +1113,11 @@ function initAdjustControls() {
     updateAdjVal(row);
     input.addEventListener("input", () => { updateAdjVal(row); requestAdjust(); });
   });
-  document.getElementById("detect-mode").addEventListener("change", () => requestAdjust(true));
+  document.getElementById("detect-mode").addEventListener("change", () => {
+    applyDetectModeVisibility();
+    requestAdjust(true);
+  });
+  applyDetectModeVisibility();
 }
 
 function updateAdjVal(row) {
@@ -1121,6 +1126,18 @@ function updateAdjVal(row) {
   const input = row.querySelector("input");
   const step  = parseFloat(row.dataset.step);
   span.textContent = step < 1 ? parseFloat(input.value).toFixed(2) : input.value;
+}
+
+/* Show/hide detection-parameter rows, notes and group titles based on the
+   selected detection mode. Rows without a data-modes attribute (Mode itself,
+   Set/Clear Reference buttons, Depth view range, Crop, Surface) stay visible
+   for every mode. */
+function applyDetectModeVisibility() {
+  const mode = document.getElementById("detect-mode").value;
+  document.querySelectorAll(".adj-row[data-modes], .adj-note[data-modes], .adj-group-title[data-modes]").forEach(el => {
+    const modes = el.dataset.modes.split(/\s+/);
+    el.style.display = (modes.includes("all") || modes.includes(mode)) ? "" : "none";
+  });
 }
 
 function readAdjustments() {
@@ -1163,6 +1180,7 @@ document.getElementById("btn-reset-adjust").addEventListener("click", () => {
     updateAdjVal(row);
   });
   document.getElementById("detect-mode").value = "valley";
+  applyDetectModeVisibility();
   requestAdjust(true);
 });
 
@@ -1249,6 +1267,7 @@ async function applyPreset(name) {
       }
     });
     if (p.detect) document.getElementById("detect-mode").value = p.detect;
+    applyDetectModeVisibility();
     applyExecSettings(p.exec);
     requestAdjust(true);
     // The bar is now this window's, but the server holds the copy Participant
@@ -1294,23 +1313,20 @@ function handleReferenceStatus(data) {
   requestAdjust(true);
 }
 
-/* A reference frame is a picture of the empty sand, so it CONTAINS the camera's
-   tilt — subtracting it turns "distance from the camera" into "height above the
-   sand", per pixel. That flips what the near-object cutoff measures, and the
-   two readings differ by an order of magnitude (tens of mm above the sand vs
-   hundreds from the camera), so the box has to say which one it wants. Driven
-   off `state`, so it is right in a window opened at any moment. */
+/* The near-object cutoff is a height ABOVE THE SAND, measured against the
+   reference frame (a picture of the empty sand, which contains the camera's
+   tilt). Without a reference there is no baseline, so the filter is inert —
+   the title says so instead of silently doing nothing. Driven off `state`, so
+   it is right in a window opened at any moment. */
 let refModeShown = null;
 function showReferenceMode(active) {
   if (typeof active !== "boolean" || active === refModeShown) return;
   refModeShown = active;
   const row = document.getElementById("mask-ignore");
-  const label = document.getElementById("ignore-closer-label");
-  if (!row || !label) return;
-  label.textContent = active ? "Ignore above sand" : "Ignore closer than";
+  if (!row) return;
   row.title = active
     ? "Near-object filter: anything standing more than this many mm ABOVE the sand surface (a hand raking, a person leaning over) — and every mask blob touching it — is left out of the mask and the live projection. Measured against the reference frame, so it is unaffected by camera tilt. 0 or empty = off."
-    : "Near-object filter: anything closer to the depth camera than this absolute distance (a hand raking, a person leaning over the sand) — and every mask blob touching it — is left out of the mask and the live projection. No reference frame is set, so on a tilted camera one value may not suit the whole sandbox — press Set Reference to switch to height above the sand. 0 or empty = off.";
+    : "Near-object filter: anything standing more than this many mm ABOVE the sand surface — and every mask blob touching it — is left out of the mask and the live projection. INACTIVE right now: no reference frame is set, so there is no sand baseline to measure against. Press Set Reference (empty sand) to arm it. 0 or empty = off.";
 }
 
 /* ── Register Corner → TCP (touch-off surface placement) ──────────────────

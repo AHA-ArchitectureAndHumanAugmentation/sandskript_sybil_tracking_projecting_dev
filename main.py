@@ -18,6 +18,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 from config import (
     HTTP_HOST, HTTP_PORT, CONTOUR_MIN_PIXELS,
+    AUTO_REFERENCE_ON_START, AUTO_REFERENCE_TIMEOUT_S,
     DEPTH_LABELS_INTERVAL_MM,
     SURFACE_DIR,
     DRAW_SPEED, TRAVEL_Z, MAX_TCP_SPEED,
@@ -65,8 +66,8 @@ shared_state: dict = {
     "depth_labels":        None,     # [[u, v, mm], ...] for the depth-number overlay
     "depth_labels_size":   None,     # [w, h] px of the crop the labels cover
     # True when those mm are HEIGHT ABOVE THE SAND (a reference is set) rather
-    # than distance from the camera. Same switch the trigger uses, so the popup
-    # can name the units the operator is typing into the trigger box.
+    # than distance from the camera. The trigger only works in the relative
+    # state, so the popup uses this to show its set-reference hint too.
     "depth_labels_relative": False,
     "last_depth_crop_jpg": None,     # cropped colorized depth for the popup
     # Size of the COMBINED camera canvas (every view is the stitched rig) and
@@ -86,6 +87,10 @@ shared_state: dict = {
     "phase":               "idle",     # idle|previewing|editing|captured|executing|done|error
     "captured_still":      None,       # (depth_m, valid, rgb) — frozen averaged depth + colour
     "reference_depth":     None,       # baseline depth frame for background subtraction
+    "reference_active":    False,      # is that baseline actually IN USE (shape matches
+                                       # the canvas)? Published by the camera thread —
+                                       # a stale one reads as absolute distance, silently
+    "auto_reference":      AUTO_REFERENCE_ON_START,
     "surface_model":       None,       # SurfaceModel | None — target mesh for 3D projection
     "surface_info":        None,       # dict for the browser (name/faces/bbox)
     "surface_pose":        SurfacePose().to_dict(),   # placement in robot base frame
@@ -111,8 +116,8 @@ shared_state: dict = {
     "progress":            0.0,
     # ── Participant Mode (automated pipeline) ──
     "auto_on":             False,      # Participant popup Auto toggle
-    "trigger_mm":          None,       # trigger distance (mm from camera); None = off
-    "trigger_below":       None,       # camera thread: something closer than trigger_mm?
+    "trigger_mm":          None,       # trigger height (mm above the sand); None = off
+    "trigger_below":       None,       # camera thread: something above trigger_mm?
     # Max Drawing Time: minutes one participant may occupy the sand (hand in →
     # hand out). None = off. remaining_s is what the popup counts down.
     "max_draw_min":        PARTICIPANT_MAX_DRAW_MIN or None,
@@ -194,8 +199,9 @@ async def on_simulate_workspace() -> None:
 
 
 # A trigger above this many mm was almost certainly typed as a distance from the
-# camera: no hand hovers half a metre over the sand. Used only to warn when a
-# reference is captured and the number's meaning changes under it.
+# camera (a habit from the old absolute mode): no hand hovers half a metre over
+# the sand. Used only to warn when a reference is captured with such a value
+# still in the box.
 _ABSOLUTE_LOOKING_MM = 300.0
 
 
@@ -251,11 +257,10 @@ async def on_set_reference(ws) -> None:
 
     The reference does two jobs. It cancels pre-existing natural grooves for
     detection (`ref_strength`), and — because a picture of the empty sand
-    CONTAINS the camera's tilt — it turns "distance from the camera" into
-    "height above the sand" for the Participant trigger and the near-object
-    cutoff. That second job is what makes a tilted rig workable at all, so
-    setting one silently changes what those two numbers mean; say so, and warn
-    when the existing trigger value was plainly tuned as a camera distance.
+    CONTAINS the camera's tilt — it is the baseline that gives "height above
+    the sand" its meaning for the Participant trigger and the near-object
+    cutoff. Both are inert until one is captured, so say so, and warn when the
+    existing trigger value was plainly typed as a camera distance.
     """
     captured = camera_thread.capture_frame()
     if captured is None:
@@ -267,27 +272,134 @@ async def on_set_reference(ws) -> None:
         trigger_mm = shared_state.get("trigger_mm")
     camera_thread.set_reference(depth_m)
     msg = ("Reference captured — natural grooves can be subtracted, and the "
-           "Participant trigger + near-object cutoff now measure HEIGHT ABOVE "
-           "THE SAND (tilt-proof) instead of distance from the camera.")
+           "Participant trigger + near-object cutoff are now armed: both "
+           "measure HEIGHT ABOVE THE SAND (tilt-proof).")
     if trigger_mm is not None and trigger_mm > _ABSOLUTE_LOOKING_MM:
-        msg += (f" Your trigger is still {trigger_mm:.0f} mm — that reads as a "
+        msg += (f" Your trigger is {trigger_mm:.0f} mm — that reads as a "
                 "camera distance; as a height above the sand try something "
                 "like 60–120 mm.")
+    _update_trigger_hint()
+    _sync_participant_state()
     await server.send_reference_status(ws, True, msg)
     module_trace.log("reference",
                      "Reference depth captured — background subtraction on, "
                      "trigger + near-object cutoff now relative to the sand.")
 
 
+async def _auto_reference() -> None:
+    """
+    Capture the empty sand as the baseline once, at start-up.
+
+    Everything that speaks in "height above the sand" needs this frame: the
+    depth-number overlay the participant popup draws (0 = the surface,
+    negative in a groove), the Participant trigger, and the near-object filter
+    that keeps a hand out of the mask. Without one they do not fail loudly —
+    the overlay quietly falls back to raw distance from the camera, so sand
+    reads ~1200 mm instead of 0, and the other two are simply inert.
+
+    Requiring someone to press Set Reference in Developer Mode before any of
+    that worked was a trap, and start-up is exactly when the sand is empty. So
+    take it here, after the canvas geometry has settled and the rolling
+    buffers hold a full window (the baseline is then averaged as heavily as a
+    Capture, not read off one noisy frame). Set Reference still overrides it
+    at any time — which is what to press if the sand was NOT empty at
+    start-up.
+    """
+    if not AUTO_REFERENCE_ON_START:
+        return
+    waited = 0.0
+    while camera_thread.frame_size is None:
+        if waited >= AUTO_REFERENCE_TIMEOUT_S:
+            module_trace.log(
+                "reference",
+                f"[reference] auto-capture skipped — no canvas after "
+                f"{AUTO_REFERENCE_TIMEOUT_S:.0f} s; press Set Reference once "
+                "the cameras are up")
+            return
+        await asyncio.sleep(0.25)
+        waited += 0.25
+    await asyncio.sleep(camera_thread.refill_seconds())
+
+    with state_lock:
+        if shared_state.get("reference_depth") is not None:
+            return              # someone pressed Set Reference while we waited
+    captured = camera_thread.capture_frame()
+    if captured is None:
+        module_trace.log("reference",
+                         "[reference] auto-capture skipped — no depth frame")
+        return
+    depth_m = captured[0]
+    with state_lock:
+        shared_state["reference_depth"] = depth_m
+    camera_thread.set_reference(depth_m)
+    _update_trigger_hint()
+    _sync_participant_state()
+    module_trace.log(
+        "reference",
+        "[reference] baseline captured automatically from the empty sand — "
+        "depth numbers now read mm ABOVE THE SAND (0 = surface, − = groove) "
+        "and the trigger + near-object filter are armed. Press Set Reference "
+        "to redo it if the sand was not empty at start-up.")
+
+
+def _drop_stale_reference() -> None:
+    """
+    A reference whose shape no longer matches the canvas is not a reference.
+
+    Every consumer checks the shape and silently falls back to absolute
+    distance when it disagrees — so the overlay starts reading ~1200 mm on
+    sand while the UI, which only checks that SOMETHING is stored, still
+    reports a baseline is set. That disagreement is the whole bug: the two
+    must never be able to say different things. It happens when the camera
+    thread re-freezes the canvas at a new size under a reference captured
+    against the old one (a camera unplugged and replugged, the grid resolution
+    changed). Drop it, and say why.
+    """
+    with state_lock:
+        ref = shared_state.get("reference_depth")
+    size = camera_thread.frame_size
+    if ref is None or size is None or ref.shape[:2] == (size[1], size[0]):
+        return
+    with state_lock:
+        shared_state["reference_depth"] = None
+    camera_thread.set_reference(None)
+    _update_trigger_hint()
+    _sync_participant_state()
+    module_trace.log(
+        "reference",
+        f"[reference] dropped — captured against a {ref.shape[1]}×{ref.shape[0]} px "
+        f"canvas but the canvas is now {size[0]}×{size[1]}. The trigger, the "
+        "near-object filter and the mm-above-sand numbers are inactive until "
+        "you press Set Reference again.")
+
+
 async def on_clear_reference(ws) -> None:
     with state_lock:
         shared_state["reference_depth"] = None
     camera_thread.set_reference(None)
+    _update_trigger_hint()
+    _sync_participant_state()
     await server.send_reference_status(
         ws, False,
-        "Reference cleared — the trigger and near-object cutoff are absolute "
-        "distances from the camera again.")
+        "Reference cleared — the trigger and near-object cutoff are INACTIVE "
+        "until a new reference is captured.")
     module_trace.log("reference", "Reference depth cleared.")
+
+
+async def _capture_participant_reference() -> bool:
+    """Capture a fresh reference frame for Participant Mode (no UI prompt)."""
+    captured = camera_thread.capture_frame()
+    if captured is None:
+        module_trace.log("reference", "[participant] reference capture failed — no frame")
+        return False
+    depth_m, _valid, _rgb = captured
+    with state_lock:
+        shared_state["reference_depth"] = depth_m
+    camera_thread.set_reference(depth_m)
+    _update_trigger_hint()
+    _sync_participant_state()
+    module_trace.log("reference", "[participant] reference captured")
+    return True
 
 
 # ── Target surface (3D projection) callbacks ─────────────────────────────────
@@ -1012,7 +1124,7 @@ async def on_save_path(ws, params: dict) -> None:
 
 # ── Participant Mode (automated pipeline) ────────────────────────────────────
 # The Auto toggle + trigger threshold come from the ⧉ Participant popup; the
-# camera thread flags frames with anything closer than the trigger
+# camera thread flags frames with anything above the trigger height
 # (shared_state["trigger_below"]). The loop below feeds that flag to the state
 # machine; on an Alerted→clear edge the pipeline runs, reusing the SAME
 # handlers as the Developer-Mode buttons via server.broadcast_ws() — open
@@ -1024,19 +1136,24 @@ def _sync_participant_state() -> None:
         shared_state["participant_msg"] = automation.message
 
 
-_TRIGGER_HINT = "Enter a trigger distance (mm) to arm."
+_TRIGGER_HINT = "Enter a trigger height (mm above sand) to arm."
+_REFERENCE_HINT = "Press Set Reference in Developer Mode to arm the trigger."
 
 
 def _update_trigger_hint() -> None:
-    """Auto ON without a trigger distance can never fire — say so in the popup.
-    Only ever writes/clears the hint, so pipeline outcome messages survive."""
+    """Auto ON without a trigger height — or without the reference frame that
+    gives the height its meaning — can never fire; say so in the popup. Only
+    ever writes/clears the hints, so pipeline outcome messages survive."""
     if automation.busy:
         return
     with state_lock:
         mm = shared_state.get("trigger_mm")
+        ref_set = shared_state.get("reference_depth") is not None
     if automation.enabled and mm is None:
         automation.message = _TRIGGER_HINT
-    elif automation.message == _TRIGGER_HINT:
+    elif automation.enabled and not ref_set:
+        automation.message = _REFERENCE_HINT
+    elif automation.message in (_TRIGGER_HINT, _REFERENCE_HINT):
         automation.message = ""
 
 
@@ -1056,6 +1173,13 @@ async def on_set_automation(params: dict) -> None:
     on = bool((params or {}).get("on"))
     with state_lock:
         shared_state["auto_on"] = on
+        if on:
+            # Participant Mode uses the simpler relative-depth detection by default.
+            gen_params = dict(shared_state.get("participant_gen_params") or {})
+            adjustments = dict(gen_params.get("adjustments") or {})
+            adjustments["detect"] = "relative"
+            gen_params["adjustments"] = adjustments
+            shared_state["participant_gen_params"] = gen_params
     automation.set_enabled(on)
     _update_trigger_hint()
     _sync_participant_state()
@@ -1108,10 +1232,9 @@ async def on_set_trigger(params: dict) -> None:
     """
     Set (or clear with null/empty) the Participant-Mode trigger threshold.
 
-    The number is a height ABOVE THE SAND when a reference frame is set, and a
-    raw distance from the camera when there is none — the camera thread picks
-    the mode per frame, so nothing here has to know which is in force. One
-    range spans both, hence the low floor.
+    The number is a height ABOVE THE SAND (mm); without a reference frame the
+    trigger stays inert regardless of the value, and the camera thread simply
+    never reports a hit.
     """
     raw = (params or {}).get("threshold_mm")
     mm = None
@@ -1265,8 +1388,14 @@ async def _participant_pipeline() -> None:
 
 async def _participant_loop() -> None:
     """Poll the camera trigger flag and drive the automation state machine."""
+    ref_clear_ticks = 0
+    REF_CLEAR_TICKS_NEEDED = max(1, round(PARTICIPANT_CLEAR_S / PARTICIPANT_TICK_S))
     while True:
         await asyncio.sleep(PARTICIPANT_TICK_S)
+        # Cheap shape compare, but it has to run somewhere: it is what keeps
+        # "a reference is set" and "heights above the sand are in force" from
+        # ever disagreeing in the UI.
+        _drop_stale_reference()
         with state_lock:
             below = shared_state.get("trigger_below")
             executing = shared_state.get("executing", False)
@@ -1277,7 +1406,24 @@ async def _participant_loop() -> None:
         # A manually-started run owns the robot — don't trigger on top of it.
         if executing and not automation.busy:
             continue
+
+        # Capture a fresh reference whenever the state machine asks for one and
+        # the frame has stayed clear long enough. This is the participant-mode
+        # replacement for the static start-up reference.
         prev = (automation.status, automation.message)
+        if automation.enabled and not automation.busy \
+                and automation.status in ("Reference", "Invalid"):
+            if below is False:
+                ref_clear_ticks += 1
+                if ref_clear_ticks >= REF_CLEAR_TICKS_NEEDED:
+                    if await _capture_participant_reference():
+                        automation.reference_ready()
+                    ref_clear_ticks = 0
+            else:
+                ref_clear_ticks = 0
+        else:
+            ref_clear_ticks = 0
+
         if automation.tick(below):
             asyncio.create_task(_participant_pipeline())
         if (automation.status, automation.message) != prev:
@@ -1344,6 +1490,7 @@ async def _main() -> None:
     module_trace.print_banner()
     asyncio.create_task(_open_browser())
     asyncio.create_task(_participant_loop())
+    asyncio.create_task(_auto_reference())
     asyncio.create_task(_tile_switch_watcher())
     await server.start()
 
