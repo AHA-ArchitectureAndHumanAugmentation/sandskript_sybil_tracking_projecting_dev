@@ -23,7 +23,41 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+
+# ==========================================================================
+# SETTINGS
+# ==========================================================================
+
 PROTOCOL_VERSION = 1
+# Guards against the two repos drifting apart.
+#
+# This file must be IDENTICAL in both repos. If you change the SHAPE of any
+# message — add a field, remove one, rename one — raise this number by 1 and
+# copy the file across.
+#
+# Both sides check it on every message. If the numbers differ the message is
+# refused with a clear error, instead of quietly arriving with missing or
+# misnamed fields. That turns "something is behaving oddly and I have lost an
+# hour" into "the file is out of sync, copy it across".
+#
+# Do not raise it for comment or formatting changes.
+
+DEFAULT_INTERACTIONS_CAP = 4
+# How many visitors may draw in one 30-minute interaction window.
+# Raise it and more people get to draw, but each has less time and the
+# maintenance window afterwards has more work to fit in. Lower it and the
+# day is calmer with more slack. Four is what the exhibition schedule
+# assumes. This is only the fallback — the exhibition script sets it.
+
+DEFAULT_JOB_TTL_S = 120.0
+# How many seconds a job stays valid after it was created.
+# If the two programs lose contact and a job arrives very late, the visitor
+# who drew it has long gone and the tile may have been used since. Rather
+# than spray something stale, the job is thrown away and a new one asked
+# for. Longer = more tolerant of slow links. Shorter = fresher, but more
+# discarded jobs if the network hiccups.
+
+# ==========================================================================
 
 
 # --------------------------------------------------------------------------
@@ -31,11 +65,14 @@ PROTOCOL_VERSION = 1
 # --------------------------------------------------------------------------
 
 class TileClass(str, Enum):
+    """Which kind of tile. Set once per tile in config, never changes."""
     A = "A"          # visitor drawings, substrate + water
     B = "B"          # pre-drawn GH paths, water only once the show opens
 
 
 class Material(str, Enum):
+    """What comes out of the nozzle. Decides speed, standoff, air setting
+    and how long the tile needs before it can be sprayed again."""
     SUBSTRATE = "substrate"
     WATER = "water"
 
@@ -59,19 +96,31 @@ class PathSource(str, Enum):
 
 
 class State(str, Enum):
-    IDLE = "idle"                # capture armed
-    AWAITING_JOB = "awaiting_job"
-    EXECUTING = "executing"      # capture disarmed
-    HOLDING = "holding"          # no tile available; capture stays armed
-    FAULT = "fault"              # capture disarmed
+    """What the robot is doing right now.
+
+    RRC broadcasts this so tracking knows whether to accept a drawing.
+    A visitor cannot draw while the arm is moving — see capture_armed
+    near the bottom of this file.
+    """
+    IDLE = "idle"                 # at home, doing nothing. Visitor may draw.
+    AWAITING_JOB = "awaiting_job" # asked for a path, waiting for it to arrive
+    EXECUTING = "executing"       # arm is moving. Drawings are NOT saved.
+    HOLDING = "holding"           # no tile free yet. Visitor may still draw.
+    FAULT = "fault"               # something went wrong. Needs a person.
 
 
 class AbortReason(str, Enum):
-    NO_GEOMETRY = "no_geometry"
-    UNREACHABLE = "unreachable"
-    FAULT = "fault"
-    STALE = "stale"
-    WINDOW_ENDED = "window_ended"
+    """Why a job ended early. Always sent with DONE, never left blank.
+
+    If a failed job does not send DONE, the loop deadlocks: tracking waits
+    forever for a completion that never arrives, and the robot sits at home
+    while the window burns.
+    """
+    NO_GEOMETRY = "no_geometry"   # nothing left after clipping to the tile
+    UNREACHABLE = "unreachable"   # the arm cannot reach one of the frames
+    FAULT = "fault"               # E-stop, or the robot reported an error
+    STALE = "stale"               # sat around too long to still be worth doing
+    WINDOW_ENDED = "window_ended" # the clock ran out mid-job
 
 
 # --------------------------------------------------------------------------
@@ -178,7 +227,7 @@ class Job(Message):
     frames: List[List[float]] = field(default_factory=list)
     timestamp: str = field(default_factory=now_iso)
 
-    def is_stale(self, ttl_seconds: float) -> bool:
+    def is_stale(self, ttl_seconds: float = DEFAULT_JOB_TTL_S) -> bool:
         return age_seconds(self.timestamp) > ttl_seconds
 
 
@@ -208,7 +257,7 @@ class StateMsg(Message):
     session: Optional[str] = None
     window: Optional[int] = None
     interactions_used: int = 0
-    interactions_cap: int = 4
+    interactions_cap: int = DEFAULT_INTERACTIONS_CAP
     tile_id: Optional[str] = None
     layer: Optional[int] = None
     timestamp: str = field(default_factory=now_iso)
